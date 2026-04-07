@@ -52,6 +52,7 @@ pub struct ScanConfig {
     #[serde(with = "duration_serde")]
     pub request_timeout: Duration,
     pub exclude_spent: bool,
+    pub exclude_inputs: bool,
 }
 
 impl Default for ScanConfig {
@@ -62,6 +63,7 @@ impl Default for ScanConfig {
             batch_size: Some(100),
             request_timeout: Duration::from_secs(30),
             exclude_spent: false,
+            exclude_inputs: false,
         }
     }
 }
@@ -89,6 +91,18 @@ impl ScanConfig {
     #[must_use]
     pub const fn with_batch_size(mut self, batch_size: u64) -> Self {
         self.batch_size = Some(batch_size);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_exclude_spent(mut self, exclude_spent: bool) -> Self {
+        self.exclude_spent = exclude_spent;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_exclude_inputs(mut self, exclude_inputs: bool) -> Self {
+        self.exclude_inputs = exclude_inputs;
         self
     }
 }

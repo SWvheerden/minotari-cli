@@ -88,6 +88,26 @@ pub fn insert_balance_change(conn: &Connection, change: &BalanceChange) -> Walle
     Ok(id)
 }
 
+/// Inserts a balance change only if one does not already exist for the given output or input.
+/// Used during backfill to avoid duplicate balance entries (balance_changes has no unique constraint).
+/// Returns `Some(id)` if inserted, `None` if a matching record already existed.
+pub fn insert_balance_change_if_not_exists(conn: &Connection, change: &BalanceChange) -> WalletDbResult<Option<i64>> {
+    // Check by output_id or input_id to see if this balance change was already recorded
+    if let Some(output_id) = change.caused_by_output_id
+        && get_balance_change_id_by_output(conn, output_id)?.is_some()
+    {
+        return Ok(None);
+    }
+    if let Some(input_id) = change.caused_by_input_id
+        && get_balance_change_id_by_input(conn, input_id)?.is_some()
+    {
+        return Ok(None);
+    }
+
+    let id = insert_balance_change(conn, change)?;
+    Ok(Some(id))
+}
+
 pub fn get_all_balance_changes_by_account_id(conn: &Connection, account_id: i64) -> WalletDbResult<Vec<BalanceChange>> {
     debug!(
         account_id = account_id;

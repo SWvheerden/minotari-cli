@@ -36,7 +36,8 @@ use log::{debug, info, warn};
 use reqwest::Method;
 use tari_transaction_components::MicroMinotari;
 use tari_transaction_components::rpc::models::{
-    FeePerGramStat, TipInfoResponse, TxQueryResponse, TxSubmissionResponse,
+    FeePerGramStat, GetUtxosDeletedInfoRequest, GetUtxosDeletedInfoResponse, TipInfoResponse, TxQueryResponse,
+    TxSubmissionResponse,
 };
 use tari_transaction_components::transaction_components::Transaction;
 use tari_utilities::hex::to_hex;
@@ -511,5 +512,33 @@ impl WalletHttpClient {
             .collect();
 
         Ok(stats)
+    }
+
+    /// Queries the base node for the spent/unspent status of specific UTXOs.
+    ///
+    /// For each output hash, the response indicates whether the output was found on chain
+    /// and whether it has been spent. Used during fast sync to verify `SpentUnconfirmed` outputs.
+    pub async fn get_utxos_deleted_info(
+        &self,
+        output_hashes: Vec<Vec<u8>>,
+    ) -> Result<GetUtxosDeletedInfoResponse, anyhow::Error> {
+        debug!(
+            count = output_hashes.len();
+            "HTTP: Querying deleted info for UTXOs"
+        );
+
+        let request = GetUtxosDeletedInfoRequest {
+            hashes: output_hashes,
+            must_include_header: Vec::new(),
+        };
+
+        let body = serde_json::to_value(request)?;
+
+        let response = self
+            .http_client
+            .send_request(Method::POST, "/get_utxos_deleted_info", Some(body))
+            .await?;
+
+        Ok(response)
     }
 }

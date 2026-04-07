@@ -111,6 +111,95 @@ pub fn insert_output(
     Ok(conn.last_insert_rowid())
 }
 
+/// Inserts an output with `SpentUnconfirmed` status using `INSERT OR IGNORE`.
+/// Used during backfill to avoid duplicate outputs in a single atomic statement.
+/// Returns `Some(id)` if inserted, `None` if the output already existed.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_spent_output_if_not_exists(
+    conn: &Connection,
+    account_id: i64,
+    account_view_key: &PrivateKey,
+    output_hash: Vec<u8>,
+    output: &WalletOutput,
+    block_height: u64,
+    block_hash: &FixedHash,
+    mined_timestamp: u64,
+    memo_parsed: Option<String>,
+    memo_hex: Option<String>,
+    payment_reference: PaymentReference,
+    is_burn: bool,
+) -> WalletDbResult<Option<i64>> {
+    let tx_id = TxId::new_deterministic(account_view_key.as_bytes(), &output.output_hash()).as_i64_wrapped();
+    let output_json = serde_json::to_string(&output)?;
+
+    #[allow(clippy::cast_possible_wrap)]
+    let mined_timestamp_dt = DateTime::<Utc>::from_timestamp(mined_timestamp as i64, 0)
+        .ok_or_else(|| WalletDbError::Decoding(format!("Invalid mined timestamp: {}", mined_timestamp)))?;
+
+    #[allow(clippy::cast_possible_wrap)]
+    let block_height = block_height as i64;
+    #[allow(clippy::cast_possible_wrap)]
+    let value = output.value().as_u64() as i64;
+    let payment_reference_hex = hex::encode(payment_reference.as_slice());
+    let status = OutputStatus::SpentUnconfirmed.to_string();
+
+    conn.execute(
+        r#"
+       INSERT OR IGNORE INTO outputs (
+            account_id,
+            tx_id,
+            output_hash,
+            mined_in_block_height,
+            mined_in_block_hash,
+            value,
+            mined_timestamp,
+            wallet_output_json,
+            memo_parsed,
+            memo_hex,
+            payment_reference,
+            is_burn,
+            status
+       )
+       VALUES (
+            :account_id,
+            :tx_id,
+            :output_hash,
+            :block_height,
+            :block_hash,
+            :value,
+            :mined_timestamp,
+            :output_json,
+            :memo_parsed,
+            :memo_hex,
+            :payment_reference,
+            :is_burn,
+            :status
+       )
+        "#,
+        named_params! {
+            ":account_id": account_id,
+            ":tx_id": tx_id,
+            ":output_hash": output_hash,
+            ":block_height": block_height,
+            ":block_hash": block_hash.as_slice(),
+            ":value": value,
+            ":mined_timestamp": mined_timestamp_dt,
+            ":output_json": output_json,
+            ":memo_parsed": memo_parsed,
+            ":memo_hex": memo_hex,
+            ":payment_reference": payment_reference_hex,
+            ":is_burn": is_burn,
+            ":status": status,
+        },
+    )?;
+
+    if conn.changes() == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(conn.last_insert_rowid()))
+    }
+}
+
 pub fn get_output_info_by_hash(
     conn: &Connection,
     output_hash: &FixedHash,
@@ -314,6 +403,90 @@ pub fn soft_delete_outputs_from_height(conn: &Connection, account_id: i64, heigh
     )?;
 
     Ok(())
+}
+
+/// Marks `SpentUnconfirmed` outputs that have a matching input as `Spent`.
+/// Returns the number of outputs marked as spent.
+pub fn resolve_spent_unconfirmed_with_inputs(conn: &Connection, account_id: i64) -> WalletDbResult<u64> {
+    let spent_unconfirmed = OutputStatus::SpentUnconfirmed.to_string();
+    let spent = OutputStatus::Spent.to_string();
+
+    let marked_spent = conn.execute(
+        r#"
+        UPDATE outputs
+        SET status = :spent_status
+        WHERE account_id = :account_id
+          AND status = :spent_unconfirmed_status
+          AND deleted_at IS NULL
+          AND id IN (
+              SELECT output_id FROM inputs WHERE deleted_at IS NULL
+          )
+        "#,
+        named_params! {
+            ":spent_status": spent,
+            ":account_id": account_id,
+            ":spent_unconfirmed_status": spent_unconfirmed,
+        },
+    )? as u64;
+
+    info!(
+        target: "audit",
+        account_id = account_id,
+        marked_spent = marked_spent;
+        "Resolved SpentUnconfirmed outputs with matching inputs"
+    );
+
+    Ok(marked_spent)
+}
+
+/// Returned data for an unresolved SpentUnconfirmed output.
+pub struct UnresolvedSpentOutput {
+    pub output_id: i64,
+    pub output_hash: Vec<u8>,
+    pub mined_in_block_height: u64,
+    pub value: u64,
+}
+
+/// Returns info for remaining `SpentUnconfirmed` outputs that have no matching input.
+/// These need to be verified against the base node.
+pub fn get_unresolved_spent_unconfirmed_outputs(
+    conn: &Connection,
+    account_id: i64,
+) -> WalletDbResult<Vec<UnresolvedSpentOutput>> {
+    let spent_unconfirmed = OutputStatus::SpentUnconfirmed.to_string();
+
+    let mut stmt = conn.prepare_cached(
+        r#"
+        SELECT id, output_hash, mined_in_block_height, value
+        FROM outputs
+        WHERE account_id = :account_id
+          AND status = :status
+          AND deleted_at IS NULL
+        ORDER BY mined_in_block_height
+        "#,
+    )?;
+
+    let rows = stmt.query_map(
+        named_params! {
+            ":account_id": account_id,
+            ":status": spent_unconfirmed,
+        },
+        |row| {
+            Ok(UnresolvedSpentOutput {
+                output_id: row.get(0)?,
+                output_hash: row.get(1)?,
+                mined_in_block_height: row.get::<_, i64>(2).map(|h| h as u64)?,
+                value: row.get::<_, i64>(3).map(|v| v as u64)?,
+            })
+        },
+    )?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+
+    Ok(results)
 }
 
 pub fn update_output_status(conn: &Connection, output_id: i64, status: OutputStatus) -> WalletDbResult<()> {

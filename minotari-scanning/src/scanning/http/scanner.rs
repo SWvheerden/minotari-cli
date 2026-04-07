@@ -135,6 +135,7 @@ where
         limit: u64,
         page: u64,
         exclude_spent: bool,
+        exclude_inputs: bool,
     ) -> WalletResult<SyncUtxosByBlockResponseV0> {
         let mut timeout_retries = 0;
         let mut error_retries = 0;
@@ -202,6 +203,7 @@ where
                 ("page", &page.to_string()),
                 ("version", &version.to_string()),
                 ("exclude_spent", &exclude_spent.to_string()),
+                ("exclude_inputs", &exclude_inputs.to_string()),
             ])
             .send()
             .await
@@ -325,6 +327,7 @@ where
             batch_size: Some(50),
             request_timeout: self.timeout,
             exclude_spent: false,
+            exclude_inputs: false,
         })
     }
 
@@ -351,6 +354,7 @@ where
     async fn fetch_block_range(&mut self) -> WalletResult<(Vec<BlockUtxoInfo>, bool)> {
         let start_height = self.current_in_progress.get_config().map_or(0, |c| c.start_height);
         let exclude_spent = self.current_in_progress.get_config().is_some_and(|c| c.exclude_spent);
+        let include_inputs = self.current_in_progress.get_config().is_some_and(|c| !c.exclude_inputs);
 
         // Get the starting header hash
         let mut more_blocks = true;
@@ -379,7 +383,7 @@ where
             .unwrap_or(SYNC_UTXOS_BY_BLOCK_PAGE_LIMIT);
         let page = self.current_in_progress.page();
         let sync_response = self
-            .sync_utxos_by_block(&current_header_hash, limit, page, exclude_spent)
+            .sync_utxos_by_block(&current_header_hash, limit, page, exclude_spent, include_inputs)
             .await?;
         if sync_response.blocks.is_empty() {
             debug!("No more blocks available from base node");

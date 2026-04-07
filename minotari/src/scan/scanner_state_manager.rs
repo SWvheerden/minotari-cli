@@ -18,6 +18,13 @@ impl ScannerStateManager {
         }
     }
 
+    #[allow(dead_code)]
+    pub fn reset(&mut self) {
+        self.scanner = None;
+        self.active_account_ids.clear();
+        self.scan_config = ScanConfig::default();
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn get_scanner_and_config(
         &mut self,
@@ -62,7 +69,9 @@ impl ScannerStateManager {
         // This ensures the scanner always starts at a valid, existing block.
         self.scan_config = ScanConfig::default()
             .with_start_height(new_start_height)
-            .with_batch_size(batch_size);
+            .with_batch_size(batch_size)
+            .with_exclude_spent(false)
+            .with_exclude_inputs(false);
         self.scan_config.end_height = new_end_height;
 
         let scanner = self
