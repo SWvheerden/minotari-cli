@@ -445,6 +445,7 @@ where
             .num_threads(self.number_processing_threads)
             .build()
             .map_err(|e| WalletError::ConfigurationError(format!("Failed to build thread pool: {e}")))?;
+        let config = config.clone();
         tokio::spawn(async move {
             loop {
                 let grpc_block_response = stream.message().await;

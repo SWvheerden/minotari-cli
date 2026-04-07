@@ -1,5 +1,5 @@
-use log::{debug, info, warn};
-use minotari_scanning::{HttpBlockchainScanner, ScanConfig, scanning::BlockchainScanner};
+use log::{debug, info};
+use minotari_scanning::{HttpBlockchainScanner, scanning::BlockchainScanner};
 use std::{collections::VecDeque, sync::Arc};
 use tari_common_types::{seeds::cipher_seed::BIRTHDAY_GENESIS_FROM_UNIX_EPOCH, types::PrivateKey};
 use tari_transaction_components::key_manager::KeyManager;
@@ -13,7 +13,7 @@ use crate::{
     scan::{
         DisplayedTransactionsEvent, ReorgDetectedEvent, ScanError, ScanMode, ScanRetryConfig, TransactionsUpdatedEvent,
         block_processor::BlockProcessor,
-        config::{MAX_BACKOFF_EXPONENT, MAX_BACKOFF_SECONDS, OPTIMAL_SCANNING_THREADS},
+        config::OPTIMAL_SCANNING_THREADS,
         events::{EventSender, FastSyncPhase, ProcessingEvent},
         reorg,
         scan_db_handler::ScanDbHandler,
@@ -330,6 +330,12 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
                 if blocks_since_reorg_check >= self.reorg_check_interval {
                     self.check_global_reorgs(&mut targets, &db_handler, scanner).await?;
                     blocks_since_reorg_check = 0;
+                }
+
+                if let Some(token) = &cancel_token
+                    && token.is_cancelled()
+                {
+                    return self.handle_pause(&targets, PauseReason::Cancelled, all_events);
                 }
             }
             if let ScanMode::Partial { max_blocks } = mode
@@ -688,82 +694,80 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
         );
         let mut db_handler = ScanDbHandler::new(self.pool.clone(), block_processor);
 
-        loop {
+        let global_next_block = targets.iter().map(|t| t.next_block_to_scan).min().unwrap_or(0);
+        let active_account_ids: Vec<i64> = targets
+            .iter()
+            .filter(|t| t.next_block_to_scan <= end_height)
+            .map(|t| t.account.id)
+            .collect();
+
+        if active_account_ids.is_empty() || global_next_block > end_height {
+            return Ok((all_events, false));
+        }
+
+        let (scanner, mut scanner_config) = state_manager
+            .get_scanner_and_config(
+                &active_account_ids,
+                global_next_block,
+                Some(end_height),
+                self.batch_size,
+                targets,
+                &self.base_url,
+                self.processing_threads,
+                &self.retry_config,
+            )
+            .await?;
+
+        // Set exclude_spent and exclude_inputs for fast sync
+        scanner_config.exclude_spent = true;
+        scanner_config.exclude_inputs = true;
+
+        let mut utxo_stream = scanner
+            .scan_blocks(&scanner_config)
+            .await
+            .map_err(|e| ScanError::Intermittent(e.to_string()))?;
+
+        while let Some(response) = utxo_stream.recv().await {
             if let Some(token) = cancel_token
                 && token.is_cancelled()
             {
                 break;
             }
 
-            let global_next_block = targets.iter().map(|t| t.next_block_to_scan).min().unwrap_or(0);
-            if global_next_block > end_height {
+            let scanned_blocks = response.map_err(|e| ScanError::Intermittent(e.to_string()))?;
+            if scanned_blocks.is_empty() {
                 break;
             }
-
-            let active_account_ids: Vec<i64> = targets
-                .iter()
-                .filter(|t| t.next_block_to_scan <= end_height)
-                .map(|t| t.account.id)
-                .collect();
-
-            if active_account_ids.is_empty() {
-                break;
-            }
-
-            let (scanner, mut scanner_config) = state_manager
-                .get_scanner_and_config(
-                    &active_account_ids,
-                    global_next_block,
-                    Some(end_height),
-                    self.batch_size,
-                    targets,
-                    &self.base_url,
-                    self.processing_threads,
-                )
-                .await?;
-
-            // Set exclude_spent and exclude_inputs for fast sync
-            scanner_config.exclude_spent = true;
-            scanner_config.exclude_inputs = true;
-
-            let (scanned_blocks, _more) = self.scan_blocks_with_timeout(scanner, &scanner_config).await?;
-            let is_empty = scanned_blocks.is_empty();
             total_scanned += scanned_blocks.len() as u64;
 
-            if !is_empty {
-                let shared_blocks = Arc::new(scanned_blocks);
+            let shared_blocks = Arc::new(scanned_blocks);
 
-                for account_id in &active_account_ids {
-                    let Some(target) = targets.iter_mut().find(|t| t.account.id == *account_id) else {
-                        continue;
-                    };
+            for account_id in &active_account_ids {
+                let Some(target) = targets.iter_mut().find(|t| t.account.id == *account_id) else {
+                    continue;
+                };
 
-                    let events = db_handler
-                        .process_blocks(
-                            shared_blocks.clone(),
-                            *account_id,
-                            false,
-                            self.webhook_config.clone(),
-                            target.next_block_to_scan,
-                        )
-                        .await?;
-                    all_events.extend(events);
+                let events = db_handler
+                    .process_blocks(
+                        shared_blocks.clone(),
+                        *account_id,
+                        false,
+                        self.webhook_config.clone(),
+                        target.next_block_to_scan,
+                    )
+                    .await?;
+                all_events.extend(events);
 
-                    if let Some(last) = shared_blocks.last() {
-                        target.next_block_to_scan = last.height + 1;
+                if let Some(last) = shared_blocks.last() {
+                    target.next_block_to_scan = last.height + 1;
 
-                        self.event_sender
-                            .send(ProcessingEvent::ScanStatus(ScanStatusEvent::Progress {
-                                account_id: target.account.id,
-                                current_height: last.height,
-                                blocks_scanned: total_scanned,
-                            }));
-                    }
+                    self.event_sender
+                        .send(ProcessingEvent::ScanStatus(ScanStatusEvent::Progress {
+                            account_id: target.account.id,
+                            current_height: last.height,
+                            blocks_scanned: total_scanned,
+                        }));
                 }
-            }
-
-            if is_empty {
-                break;
             }
         }
 
@@ -792,76 +796,77 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
         );
         let mut db_handler = ScanDbHandler::new(self.pool.clone(), block_processor);
 
-        loop {
+        let global_next_block = targets.iter().map(|t| t.next_block_to_scan).min().unwrap_or(0);
+        let active_account_ids: Vec<i64> = targets.iter().map(|t| t.account.id).collect();
+
+        let (scanner, scanner_config) = state_manager
+            .get_scanner_and_config(
+                &active_account_ids,
+                global_next_block,
+                None, // scan to tip
+                self.batch_size,
+                targets,
+                &self.base_url,
+                self.processing_threads,
+                &self.retry_config,
+            )
+            .await?;
+
+        let mut utxo_stream = scanner
+            .scan_blocks(&scanner_config)
+            .await
+            .map_err(|e| ScanError::Intermittent(e.to_string()))?;
+
+        while let Some(response) = utxo_stream.recv().await {
             if let Some(token) = cancel_token
                 && token.is_cancelled()
             {
                 break;
             }
 
-            let global_next_block = targets.iter().map(|t| t.next_block_to_scan).min().unwrap_or(0);
-
-            let active_account_ids: Vec<i64> = targets.iter().map(|t| t.account.id).collect();
-
-            let (scanner, scanner_config) = state_manager
-                .get_scanner_and_config(
-                    &active_account_ids,
-                    global_next_block,
-                    None, // scan to tip
-                    self.batch_size,
-                    targets,
-                    &self.base_url,
-                    self.processing_threads,
-                )
-                .await?;
-
-            let (scanned_blocks, more_blocks) = self.scan_blocks_with_timeout(scanner, &scanner_config).await?;
-            let is_empty = scanned_blocks.is_empty();
+            let scanned_blocks = response.map_err(|e| ScanError::Intermittent(e.to_string()))?;
+            if scanned_blocks.is_empty() {
+                break;
+            }
             total_scanned += scanned_blocks.len() as u64;
 
-            if !is_empty {
-                let shared_blocks = Arc::new(scanned_blocks);
+            let shared_blocks = Arc::new(scanned_blocks);
 
-                for account_id in &active_account_ids {
-                    let Some(target) = targets.iter_mut().find(|t| t.account.id == *account_id) else {
-                        continue;
-                    };
+            for account_id in &active_account_ids {
+                let Some(target) = targets.iter_mut().find(|t| t.account.id == *account_id) else {
+                    continue;
+                };
 
-                    let events = db_handler
-                        .process_blocks(
-                            shared_blocks.clone(),
-                            *account_id,
-                            target.transaction_monitor.has_pending_outbound(),
-                            self.webhook_config.clone(),
-                            target.next_block_to_scan,
-                        )
-                        .await?;
-                    all_events.extend(events);
+                let events = db_handler
+                    .process_blocks(
+                        shared_blocks.clone(),
+                        *account_id,
+                        target.transaction_monitor.has_pending_outbound(),
+                        self.webhook_config.clone(),
+                        target.next_block_to_scan,
+                    )
+                    .await?;
+                all_events.extend(events);
 
-                    if let Some(last) = shared_blocks.last() {
-                        target.next_block_to_scan = last.height + 1;
+                if let Some(last) = shared_blocks.last() {
+                    target.next_block_to_scan = last.height + 1;
 
-                        let monitor_res = target
-                            .transaction_monitor
-                            .monitor_if_needed(&self.client, &self.pool, target.account.id, last.height)
-                            .await
-                            .map_err(ScanError::Fatal)?;
+                    let monitor_res = target
+                        .transaction_monitor
+                        .monitor_if_needed(&self.client, &self.pool, target.account.id, last.height)
+                        .await
+                        .map_err(ScanError::Fatal)?;
 
-                        all_events.extend(monitor_res.wallet_events.clone());
-                        self.emit_monitor_events(target.account.id, last.height, monitor_res);
+                    all_events.extend(monitor_res.wallet_events.clone());
+                    self.emit_monitor_events(target.account.id, last.height, monitor_res);
 
-                        self.event_sender
-                            .send(ProcessingEvent::ScanStatus(ScanStatusEvent::Progress {
-                                account_id: target.account.id,
-                                current_height: last.height,
-                                blocks_scanned: total_scanned,
-                            }));
-                    }
+                    self.event_sender
+                        .send(ProcessingEvent::ScanStatus(ScanStatusEvent::Progress {
+                            account_id: target.account.id,
+                            current_height: last.height,
+                            blocks_scanned: total_scanned,
+                        }));
                 }
-            }
-
-            if is_empty || !more_blocks {
-                break;
             }
         }
 
@@ -892,78 +897,76 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
         block_processor.set_backfill_mode(true);
         let mut db_handler = ScanDbHandler::new(self.pool.clone(), block_processor);
 
-        loop {
+        let global_next_block = targets.iter().map(|t| t.next_block_to_scan).min().unwrap_or(0);
+        let active_account_ids: Vec<i64> = targets
+            .iter()
+            .filter(|t| t.next_block_to_scan <= end_height)
+            .map(|t| t.account.id)
+            .collect();
+
+        if active_account_ids.is_empty() || global_next_block > end_height {
+            return Ok((all_events, false));
+        }
+
+        let (scanner, scanner_config) = state_manager
+            .get_scanner_and_config(
+                &active_account_ids,
+                global_next_block,
+                Some(end_height),
+                self.batch_size,
+                targets,
+                &self.base_url,
+                self.processing_threads,
+                &self.retry_config,
+            )
+            .await?;
+
+        let mut utxo_stream = scanner
+            .scan_blocks(&scanner_config)
+            .await
+            .map_err(|e| ScanError::Intermittent(e.to_string()))?;
+
+        while let Some(response) = utxo_stream.recv().await {
             if let Some(token) = cancel_token
                 && token.is_cancelled()
             {
                 break;
             }
 
-            let global_next_block = targets.iter().map(|t| t.next_block_to_scan).min().unwrap_or(0);
-            if global_next_block > end_height {
+            let scanned_blocks = response.map_err(|e| ScanError::Intermittent(e.to_string()))?;
+            if scanned_blocks.is_empty() {
                 break;
             }
-
-            let active_account_ids: Vec<i64> = targets
-                .iter()
-                .filter(|t| t.next_block_to_scan <= end_height)
-                .map(|t| t.account.id)
-                .collect();
-
-            if active_account_ids.is_empty() {
-                break;
-            }
-
-            let (scanner, scanner_config) = state_manager
-                .get_scanner_and_config(
-                    &active_account_ids,
-                    global_next_block,
-                    Some(end_height),
-                    self.batch_size,
-                    targets,
-                    &self.base_url,
-                    self.processing_threads,
-                )
-                .await?;
-
-            let (scanned_blocks, _more) = self.scan_blocks_with_timeout(scanner, &scanner_config).await?;
-            let is_empty = scanned_blocks.is_empty();
             total_scanned += scanned_blocks.len() as u64;
 
-            if !is_empty {
-                let shared_blocks = Arc::new(scanned_blocks);
+            let shared_blocks = Arc::new(scanned_blocks);
 
-                for account_id in &active_account_ids {
-                    let Some(target) = targets.iter_mut().find(|t| t.account.id == *account_id) else {
-                        continue;
-                    };
+            for account_id in &active_account_ids {
+                let Some(target) = targets.iter_mut().find(|t| t.account.id == *account_id) else {
+                    continue;
+                };
 
-                    let events = db_handler
-                        .process_blocks(
-                            shared_blocks.clone(),
-                            *account_id,
-                            false,
-                            self.webhook_config.clone(),
-                            target.next_block_to_scan,
-                        )
-                        .await?;
-                    all_events.extend(events);
+                let events = db_handler
+                    .process_blocks(
+                        shared_blocks.clone(),
+                        *account_id,
+                        false,
+                        self.webhook_config.clone(),
+                        target.next_block_to_scan,
+                    )
+                    .await?;
+                all_events.extend(events);
 
-                    if let Some(last) = shared_blocks.last() {
-                        target.next_block_to_scan = last.height + 1;
+                if let Some(last) = shared_blocks.last() {
+                    target.next_block_to_scan = last.height + 1;
 
-                        self.event_sender
-                            .send(ProcessingEvent::ScanStatus(ScanStatusEvent::Progress {
-                                account_id: target.account.id,
-                                current_height: last.height,
-                                blocks_scanned: total_scanned,
-                            }));
-                    }
+                    self.event_sender
+                        .send(ProcessingEvent::ScanStatus(ScanStatusEvent::Progress {
+                            account_id: target.account.id,
+                            current_height: last.height,
+                            blocks_scanned: total_scanned,
+                        }));
                 }
-            }
-
-            if is_empty {
-                break;
             }
         }
 

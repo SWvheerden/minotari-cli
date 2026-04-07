@@ -143,7 +143,7 @@ where
         loop {
             match timeout(
                 self.timeout,
-                self.sync_utxos_by_block_http_call(start_header_hash, limit, page, exclude_spent),
+                self.sync_utxos_by_block_http_call(start_header_hash, limit, page, exclude_spent, exclude_inputs),
             )
             .await
             {
@@ -191,6 +191,7 @@ where
         limit: u64,
         page: u64,
         exclude_spent: bool,
+        exclude_inputs: bool,
     ) -> WalletResult<SyncUtxosByBlockResponseV0> {
         let url = format!("{}/sync_utxos_by_block", self.base_url);
         let version = 1;
