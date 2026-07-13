@@ -38,7 +38,6 @@ tari_shutdown = { git = "https://github.com/tari-project/tari/" }
 # Minotari wallet library (for fast sync tests)
 minotari = { path = "../minotari" }
 
-
 # Other dependencies
 rand = "0.8"
 tonic = "0.13"

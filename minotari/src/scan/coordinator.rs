@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     PauseReason, ScanStatusEvent,
-    db::{AccountRow, SqlitePool},
+    db::{AccountRow, SqlitePool, WalletDbError},
     http::WalletHttpClient,
     models::{OutputStatus, WalletEvent},
     scan::{
@@ -126,6 +126,25 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
         }
     }
 
+    /// Resolves the block height corresponding to an account's birthday.
+    ///
+    /// Used to determine where a scan should begin when there is no existing
+    /// scan state to resume from (and by the backfill, which always rescans from
+    /// the birthday regardless of how far the fast-sync cursor advanced).
+    async fn birthday_height(
+        &self,
+        account: &AccountRow,
+        scanning_offset: u64,
+        wallet_client: &WalletHttpClient,
+    ) -> Result<u64, ScanError> {
+        let timestamp = (account.birthday as u64).saturating_sub(scanning_offset) * 24 * 60 * 60
+            + BIRTHDAY_GENESIS_FROM_UNIX_EPOCH;
+        wallet_client
+            .get_height_at_time(timestamp)
+            .await
+            .map_err(ScanError::Fatal)
+    }
+
     /// Prepares a scan context for an account.
     async fn prepare_target(
         &self,
@@ -146,12 +165,7 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
 
         if next_block == 0 {
             // Use birthday logic
-            let timestamp = (account.birthday as u64).saturating_sub(scanning_offset) * 24 * 60 * 60
-                + BIRTHDAY_GENESIS_FROM_UNIX_EPOCH;
-            next_block = wallet_client
-                .get_height_at_time(timestamp)
-                .await
-                .map_err(ScanError::Fatal)?;
+            next_block = self.birthday_height(&account, scanning_offset, wallet_client).await?;
         }
 
         let monitor_state = MonitoringState::new();
@@ -604,7 +618,7 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
 
         let mut targets = Vec::with_capacity(accounts.len());
         for account in accounts {
-            let target = self
+            let mut target = self
                 .prepare_target(
                     account,
                     password,
@@ -613,6 +627,16 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
                     &mut conn,
                     &mut shared_reorg_scanner,
                 )
+                .await?;
+
+            // Backfill always rescans from the account birthday. prepare_target
+            // resumes from the last scanned tip block, which after a fast sync
+            // sits at (or near) the chain tip — that is past backfill_to_height,
+            // so without this reset the backfill range would be empty and no
+            // history would be filled in. Idempotent (OR IGNORE) inserts in
+            // backfill mode make rescanning already-recorded blocks safe.
+            target.next_block_to_scan = self
+                .birthday_height(&target.account, scanning_offset, &self.client)
                 .await?;
             targets.push(target);
         }
@@ -1032,14 +1056,19 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
                     debug!(
                         account = &*target.account.friendly_name,
                         output_hash = &*utxo_info.utxo_hash.to_hex();
-                        "Ouput unkown by base node, status kept as SpentUnconfirmed"
+                        "Output unknown by base node, status kept as SpentUnconfirmed"
                     );
                 }
             }
         }
 
-        // Phase 2: Apply all DB writes with a short-lived connection
-        let conn = self.pool.get().map_err(|e| ScanError::DbError(e.into()))?;
+        // Phase 2: Apply all DB writes in a single transaction so a mid-loop
+        // failure cannot leave a half-written spend (an input without its debit
+        // balance change, or a status update without a matching input).
+        let mut conn = self.pool.get().map_err(|e| ScanError::DbError(e.into()))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| ScanError::DbError(WalletDbError::from(e)))?;
         let mut marked_unspent = 0u64;
         let mut confirmed_spent = 0u64;
 
@@ -1052,7 +1081,7 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
                     spent_block_hash,
                 } => {
                     let input_id = crate::db::insert_input(
-                        &conn,
+                        &tx,
                         target.account.id,
                         *output_id,
                         *spent_height,
@@ -1080,19 +1109,21 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
                         reversal_of_balance_change_id: None,
                         is_reversed: false,
                     };
-                    crate::db::insert_balance_change(&conn, &change).map_err(ScanError::DbError)?;
+                    crate::db::insert_balance_change(&tx, &change).map_err(ScanError::DbError)?;
 
-                    crate::db::update_output_status(&conn, *output_id, OutputStatus::Spent)
+                    crate::db::update_output_status(&tx, *output_id, OutputStatus::Spent)
                         .map_err(ScanError::DbError)?;
                     confirmed_spent += 1;
                 },
                 VerifyAction::MarkUnspent { output_id } => {
-                    crate::db::update_output_status(&conn, *output_id, OutputStatus::Unspent)
+                    crate::db::update_output_status(&tx, *output_id, OutputStatus::Unspent)
                         .map_err(ScanError::DbError)?;
                     marked_unspent += 1;
                 },
             }
         }
+
+        tx.commit().map_err(|e| ScanError::DbError(WalletDbError::from(e)))?;
 
         info!(
             account_id = target.account.id,

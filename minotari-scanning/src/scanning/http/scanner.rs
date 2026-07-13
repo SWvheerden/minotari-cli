@@ -355,7 +355,7 @@ where
     async fn fetch_block_range(&mut self) -> WalletResult<(Vec<BlockUtxoInfo>, bool)> {
         let start_height = self.current_in_progress.get_config().map_or(0, |c| c.start_height);
         let exclude_spent = self.current_in_progress.get_config().is_some_and(|c| c.exclude_spent);
-        let include_inputs = self.current_in_progress.get_config().is_some_and(|c| !c.exclude_inputs);
+        let exclude_inputs = self.current_in_progress.get_config().is_some_and(|c| c.exclude_inputs);
 
         // Get the starting header hash
         let mut more_blocks = true;
@@ -384,7 +384,7 @@ where
             .unwrap_or(SYNC_UTXOS_BY_BLOCK_PAGE_LIMIT);
         let page = self.current_in_progress.page();
         let sync_response = self
-            .sync_utxos_by_block(&current_header_hash, limit, page, exclude_spent, include_inputs)
+            .sync_utxos_by_block(&current_header_hash, limit, page, exclude_spent, exclude_inputs)
             .await?;
         if sync_response.blocks.is_empty() {
             debug!("No more blocks available from base node");

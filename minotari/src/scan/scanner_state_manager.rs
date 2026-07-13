@@ -18,13 +18,6 @@ impl ScannerStateManager {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn reset(&mut self) {
-        self.scanner = None;
-        self.active_account_ids.clear();
-        self.scan_config = ScanConfig::default();
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub async fn get_scanner_and_config(
         &mut self,
