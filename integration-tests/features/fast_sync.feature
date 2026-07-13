@@ -91,3 +91,43 @@ Feature: Fast Sync Scanning
     And I perform a backfill scan
     Then the fast sync should complete successfully
     And the fast sync balance should be at least 1 microTari
+
+  # =============================
+  # Transaction-History Reconstruction
+  #
+  # These prove the backfill phase actually scans and reconstructs spent-output
+  # history. The spend is placed below (tip - safety_buffer) so it falls in the
+  # fast-sync region and is only recovered by the backfill, never by the recent
+  # full scan. Asserting on balance alone cannot catch a no-op backfill because a
+  # spent output nets to zero whether it is recorded or absent.
+  # =============================
+
+  Scenario: Fast sync without backfill omits spent-output history
+    Given I have a seed node MinerNode
+    And I have a test database with a full signing wallet
+    When I mine 10 blocks on MinerNode
+    And I perform a normal full scan
+    And I send 1 transactions
+    And I mine 20 blocks on MinerNode
+    And I reset the wallet database keeping account
+    And I perform a fast sync without backfill
+    Then the fast sync should complete successfully
+    And the wallet should have no spent outputs
+
+  Scenario: Backfill reconstructs spent-output history
+    Given I have a seed node MinerNode
+    And I have a test database with a full signing wallet
+    When I mine 10 blocks on MinerNode
+    And I perform a normal full scan
+    And I send 1 transactions
+    And I mine 20 blocks on MinerNode
+    And I perform a normal full scan
+    And I record the current balance as the reference balance
+    And I reset the wallet database keeping account
+    And I perform a fast sync without backfill
+    And I perform a backfill scan
+    Then the fast sync should complete successfully
+    And the wallet should have at least one spent output
+    And the wallet should have at least one recorded spend
+    And the wallet should have no unresolved spent-unconfirmed outputs
+    And the fast sync balance should equal the reference balance

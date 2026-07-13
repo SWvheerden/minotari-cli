@@ -386,6 +386,88 @@ async fn print_fast_sync_benchmarks(world: &mut MinotariWorld) {
 }
 
 // =============================
+// Reference Balance Steps
+// =============================
+
+#[when("I record the current balance as the reference balance")]
+async fn record_reference_balance(world: &mut MinotariWorld) {
+    let balance = world.fetch_balance();
+    println!("Reference balance recorded: {} µT", balance);
+    world
+        .transaction_data
+        .insert("reference_balance".to_string(), serde_json::json!(balance));
+}
+
+#[then("the fast sync balance should equal the reference balance")]
+async fn fast_sync_balance_equals_reference(world: &mut MinotariWorld) {
+    let reference = world
+        .transaction_data
+        .get("reference_balance")
+        .and_then(serde_json::Value::as_u64)
+        .expect("Reference balance not recorded");
+    let balance = world.fetch_balance();
+    println!("Fast sync balance: {} µT, reference balance: {} µT", balance, reference);
+    assert_eq!(
+        balance, reference,
+        "Fast sync + backfill balance ({}) should equal the full-scan reference balance ({})",
+        balance, reference
+    );
+}
+
+// =============================
+// Transaction-History Assertion Steps
+//
+// These inspect the wallet DB directly to prove the backfill actually
+// reconstructed spent-output history. Balance alone cannot distinguish a
+// working backfill from a no-op, because a spent output nets to zero
+// (credit - debit) whether it is recorded or simply absent.
+// =============================
+
+#[then("the wallet should have at least one spent output")]
+async fn wallet_has_spent_output(world: &mut MinotariWorld) {
+    let spent = count_outputs_with_status(world, "SPENT");
+    println!("SPENT outputs: {}", spent);
+    assert!(
+        spent >= 1,
+        "Expected at least one SPENT output after backfill, found {}",
+        spent
+    );
+}
+
+#[then("the wallet should have no spent outputs")]
+async fn wallet_has_no_spent_output(world: &mut MinotariWorld) {
+    let spent = count_outputs_with_status(world, "SPENT");
+    println!("SPENT outputs: {}", spent);
+    assert_eq!(
+        spent, 0,
+        "Expected no SPENT outputs after a fast sync without backfill, found {}",
+        spent
+    );
+}
+
+#[then("the wallet should have no unresolved spent-unconfirmed outputs")]
+async fn wallet_has_no_spent_unconfirmed(world: &mut MinotariWorld) {
+    let unresolved = count_outputs_with_status(world, "SPENT_UNCONFIRMED");
+    println!("SPENT_UNCONFIRMED outputs: {}", unresolved);
+    assert_eq!(
+        unresolved, 0,
+        "Expected no SPENT_UNCONFIRMED outputs after backfill, found {}",
+        unresolved
+    );
+}
+
+#[then("the wallet should have at least one recorded spend")]
+async fn wallet_has_recorded_spend(world: &mut MinotariWorld) {
+    let inputs = count_active_inputs(world);
+    println!("Recorded input spends: {}", inputs);
+    assert!(
+        inputs >= 1,
+        "Expected at least one recorded input (spend) after backfill, found {}",
+        inputs
+    );
+}
+
+// =============================
 // Helpers
 // =============================
 
@@ -395,4 +477,42 @@ fn get_base_url(world: &MinotariWorld) -> String {
     } else {
         panic!("No base node available for scanning");
     }
+}
+
+/// Opens a connection to the wallet DB and resolves the `default` account id.
+fn with_default_account<T>(world: &MinotariWorld, f: impl FnOnce(&rusqlite::Connection, i64) -> T) -> T {
+    let db_path = world.database_path.as_ref().expect("Database not set up");
+    let pool = db::init_db(db_path.clone()).expect("Failed to init db");
+    let conn = pool.get().expect("Failed to get connection");
+    let account_id = db::get_accounts(&conn, Some("default"))
+        .expect("Failed to load accounts")
+        .into_iter()
+        .next()
+        .expect("default account not found")
+        .id;
+    f(&conn, account_id)
+}
+
+/// Counts active (non-deleted) outputs for the default account with the given status.
+fn count_outputs_with_status(world: &MinotariWorld, status: &str) -> i64 {
+    with_default_account(world, |conn, account_id| {
+        conn.query_row(
+            "SELECT COUNT(*) FROM outputs WHERE account_id = ?1 AND status = ?2 AND deleted_at IS NULL",
+            rusqlite::params![account_id, status],
+            |row| row.get(0),
+        )
+        .expect("Failed to count outputs by status")
+    })
+}
+
+/// Counts active (non-deleted) input (spend) records for the default account.
+fn count_active_inputs(world: &MinotariWorld) -> i64 {
+    with_default_account(world, |conn, account_id| {
+        conn.query_row(
+            "SELECT COUNT(*) FROM inputs WHERE account_id = ?1 AND deleted_at IS NULL",
+            rusqlite::params![account_id],
+            |row| row.get(0),
+        )
+        .expect("Failed to count inputs")
+    })
 }
