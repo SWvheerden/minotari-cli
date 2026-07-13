@@ -637,18 +637,19 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
         // Resolve SpentUnconfirmed outputs:
         // 1. Mark outputs with matching inputs as Spent
         // 2. Verify remaining outputs against the base node
-        let conn = self.pool.get().map_err(|e| ScanError::DbError(e.into()))?;
         for target in &targets {
-            let marked_spent = crate::db::resolve_spent_unconfirmed_with_inputs(&conn, target.account.id)
-                .map_err(ScanError::DbError)?;
-            info!(
-                account_id = target.account.id,
-                marked_spent = marked_spent;
-                "Resolved SpentUnconfirmed outputs with matching inputs"
-            );
-
-            let unresolved = crate::db::get_unresolved_spent_unconfirmed_outputs(&conn, target.account.id)
-                .map_err(ScanError::DbError)?;
+            let unresolved = {
+                let conn = self.pool.get().map_err(|e| ScanError::DbError(e.into()))?;
+                let marked_spent = crate::db::resolve_spent_unconfirmed_with_inputs(&conn, target.account.id)
+                    .map_err(ScanError::DbError)?;
+                info!(
+                    account_id = target.account.id,
+                    marked_spent = marked_spent;
+                    "Resolved SpentUnconfirmed outputs with matching inputs"
+                );
+                crate::db::get_unresolved_spent_unconfirmed_outputs(&conn, target.account.id)
+                    .map_err(ScanError::DbError)?
+            };
 
             if !unresolved.is_empty() {
                 info!(
@@ -656,7 +657,7 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
                     count = unresolved.len();
                     "Verifying remaining SpentUnconfirmed outputs against base node"
                 );
-                self.verify_spent_unconfirmed_outputs(&conn, target, &unresolved)
+                self.verify_spent_unconfirmed_outputs(target, &unresolved)
                     .await?;
             }
 
@@ -979,7 +980,6 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
     /// are created so the balance sums correctly. Otherwise it's marked Unspent.
     async fn verify_spent_unconfirmed_outputs(
         &self,
-        conn: &rusqlite::Connection,
         target: &AccountSyncTarget,
         unresolved: &[crate::db::UnresolvedSpentOutput],
     ) -> Result<(), ScanError> {
@@ -990,8 +990,20 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
 
         let all_output_hashes: Vec<Vec<u8>> = unresolved.iter().map(|o| o.output_hash.clone()).collect();
 
-        let mut marked_unspent = 0u64;
-        let mut confirmed_spent = 0u64;
+        // Phase 1: Collect all network results before touching the database
+        enum VerifyAction {
+            ConfirmSpent {
+                output_id: i64,
+                value: u64,
+                spent_height: u64,
+                spent_block_hash: Vec<u8>,
+            },
+            MarkUnspent {
+                output_id: i64,
+            },
+        }
+
+        let mut actions = Vec::new();
 
         for output_hashes in all_output_hashes.chunks(50) {
             let response = self
@@ -1006,25 +1018,56 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
                 };
 
                 if let Some((spent_height, spent_block_hash)) = &utxo_info.spent_in_header {
-                    // Create input record so the spend is tracked in the DB
+                    actions.push(VerifyAction::ConfirmSpent {
+                        output_id: output.output_id,
+                        value: output.value,
+                        spent_height: *spent_height,
+                        spent_block_hash: spent_block_hash.clone(),
+                    });
+                } else if utxo_info.found_in_header.is_some() {
+                    actions.push(VerifyAction::MarkUnspent {
+                        output_id: output.output_id,
+                    });
+                } else {
+                    debug!(
+                        account = &*target.account.friendly_name,
+                        output_hash = &*utxo_info.utxo_hash.to_hex();
+                        "Ouput unkown by base node, status kept as SpentUnconfirmed"
+                    );
+                }
+            }
+        }
+
+        // Phase 2: Apply all DB writes with a short-lived connection
+        let conn = self.pool.get().map_err(|e| ScanError::DbError(e.into()))?;
+        let mut marked_unspent = 0u64;
+        let mut confirmed_spent = 0u64;
+
+        for action in &actions {
+            match action {
+                VerifyAction::ConfirmSpent {
+                    output_id,
+                    value,
+                    spent_height,
+                    spent_block_hash,
+                } => {
                     let input_id = crate::db::insert_input(
-                        conn,
+                        &conn,
                         target.account.id,
-                        output.output_id,
+                        *output_id,
                         *spent_height,
                         spent_block_hash,
                         0, // timestamp not available from deleted info
                     )
                     .map_err(ScanError::DbError)?;
 
-                    // Create debit balance change so credits - debits nets correctly
                     let change = crate::models::BalanceChange {
                         account_id: target.account.id,
                         caused_by_output_id: None,
                         caused_by_input_id: Some(input_id),
                         description: "Output spent (verified by base node)".to_string(),
                         balance_credit: 0.into(),
-                        balance_debit: output.value.into(),
+                        balance_debit: (*value).into(),
                         effective_date: chrono::Utc::now().naive_utc(),
                         effective_height: *spent_height,
                         claimed_recipient_address: None,
@@ -1037,22 +1080,17 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
                         reversal_of_balance_change_id: None,
                         is_reversed: false,
                     };
-                    crate::db::insert_balance_change(conn, &change).map_err(ScanError::DbError)?;
+                    crate::db::insert_balance_change(&conn, &change).map_err(ScanError::DbError)?;
 
-                    crate::db::update_output_status(conn, output.output_id, OutputStatus::Spent)
+                    crate::db::update_output_status(&conn, *output_id, OutputStatus::Spent)
                         .map_err(ScanError::DbError)?;
                     confirmed_spent += 1;
-                } else if utxo_info.found_in_header.is_some() {
-                    crate::db::update_output_status(conn, output.output_id, OutputStatus::Unspent)
+                },
+                VerifyAction::MarkUnspent { output_id } => {
+                    crate::db::update_output_status(&conn, *output_id, OutputStatus::Unspent)
                         .map_err(ScanError::DbError)?;
                     marked_unspent += 1;
-                } else {
-                    debug!(
-                        account = &*target.account.friendly_name,
-                        output_hash = &*utxo_info.utxo_hash.to_hex();
-                        "Ouput unkown by base node, status kept as SpentUnconfirmed"
-                    );
-                }
+                },
             }
         }
 
