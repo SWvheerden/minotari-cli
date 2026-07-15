@@ -154,6 +154,11 @@ impl DisplayedTransactionProcessor {
                 .memo_hex(memo.hex)
                 .output_type(Some(OutputType::Coinbase))
                 .coinbase_extra(Some(output.output.features().coinbase_extra.clone()))
+                // A coinbase has no sender payment id, so reference its own output
+                // hash. This yields a payref matching the output's stored
+                // payment_reference, so coinbase receipts are addressable and
+                // survive reorgs via the payref-history fallback.
+                .sent_output_hashes(vec![output.output.output_hash()])
                 .build(id)?;
             new_transactions.push(display_tx);
         }

@@ -177,7 +177,39 @@ pub struct TransactionDetails {
     /// Hashes of outputs sent in this transaction (hex encoded).
     /// Used to match pending broadcasted transactions with scanned ones.
     pub sent_output_hashes: Vec<FixedHash>,
+    /// Payment references for this transaction, serialized as hex strings so
+    /// they are human-usable and match the hex form used by the payref lookup
+    /// and reorg-history APIs.
+    #[serde(with = "payref_hex_vec")]
+    #[schema(value_type = Vec<String>)]
     pub sent_payrefs: Vec<PaymentReference>,
+}
+
+/// Serde helper that (de)serializes a list of [`PaymentReference`]s as hex
+/// strings. `PaymentReference` is a `FixedHash`, whose default (transparent)
+/// serialization is a byte array — but the payref column, the `LIKE` lookup,
+/// the reorg-history parser (which expects `Vec<String>`) and the public API
+/// all operate on hex, so this keeps every representation consistent.
+pub mod payref_hex_vec {
+    use serde::{Deserialize, Deserializer, Serializer, ser::SerializeSeq};
+    use tari_common_types::payment_reference::PaymentReference;
+    use tari_common_types::types::FixedHash;
+    use tari_utilities::hex::Hex;
+
+    pub fn serialize<S: Serializer>(payrefs: &[PaymentReference], serializer: S) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(payrefs.len()))?;
+        for payref in payrefs {
+            seq.serialize_element(&payref.to_hex())?;
+        }
+        seq.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<PaymentReference>, D::Error> {
+        Vec::<String>::deserialize(deserializer)?
+            .into_iter()
+            .map(|h| FixedHash::from_hex(&h).map_err(serde::de::Error::custom))
+            .collect()
+    }
 }
 
 /// A transaction input (spent UTXO).

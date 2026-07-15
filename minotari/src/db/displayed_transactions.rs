@@ -9,6 +9,15 @@ use serde::Deserialize;
 use serde_rusqlite::from_rows;
 use tari_common_types::transaction::TxId;
 use tari_common_types::types::FixedHash;
+use tari_utilities::hex::Hex;
+
+/// Serialize the transaction's payrefs to the denormalized `payref` column as a
+/// JSON array of hex strings. This matches the hex form used by the `LIKE`
+/// payref lookup and the reorg-history parser (which reads `Vec<String>`).
+fn payrefs_to_column_json(transaction: &DisplayedTransaction) -> WalletDbResult<String> {
+    let hexes: Vec<String> = transaction.details.sent_payrefs.iter().map(FixedHash::to_hex).collect();
+    Ok(serde_json::to_string(&hexes)?)
+}
 
 #[derive(Deserialize)]
 struct TransactionJsonRow {
@@ -54,7 +63,7 @@ pub fn insert_displayed_transaction(conn: &Connection, transaction: &DisplayedTr
 
     let transaction_json = serialize_tx(transaction)?;
     let now = current_db_timestamp();
-    let payref = Some(serde_json::to_string(&transaction.details.sent_payrefs)?);
+    let payref = Some(payrefs_to_column_json(transaction)?);
     #[allow(clippy::cast_possible_wrap)]
     conn.execute(
         r#"
@@ -311,7 +320,7 @@ pub fn update_displayed_transaction_mined(conn: &Connection, tx: &DisplayedTrans
 
     let status_str = format!("{:?}", tx.status).to_lowercase();
     let transaction_json = serialize_tx(tx)?;
-    let payref = Some(serde_json::to_string(&tx.details.sent_payrefs)?);
+    let payref = Some(payrefs_to_column_json(tx)?);
 
     #[allow(clippy::cast_possible_wrap)]
     let rows_affected = conn.execute(
