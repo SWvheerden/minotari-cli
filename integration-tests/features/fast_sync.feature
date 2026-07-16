@@ -104,8 +104,8 @@ Feature: Fast Sync Scanning
 
   Scenario: Fast sync without backfill omits spent-output history
     Given I have a seed node MinerNode
-    And I have a test database with a full signing wallet
-    When I mine 10 blocks on MinerNode
+    And I have a test database with an existing wallet
+    When I mine 20 blocks on MinerNode
     And I perform a normal full scan
     And I send 1 transactions
     And I mine 20 blocks on MinerNode
@@ -116,8 +116,8 @@ Feature: Fast Sync Scanning
 
   Scenario: Backfill reconstructs spent-output history
     Given I have a seed node MinerNode
-    And I have a test database with a full signing wallet
-    When I mine 10 blocks on MinerNode
+    And I have a test database with an existing wallet
+    When I mine 20 blocks on MinerNode
     And I perform a normal full scan
     And I send 1 transactions
     And I mine 20 blocks on MinerNode
