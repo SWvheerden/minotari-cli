@@ -137,8 +137,8 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
         scanning_offset: u64,
         wallet_client: &WalletHttpClient,
     ) -> Result<u64, ScanError> {
-        let timestamp = (account.birthday as u64).saturating_sub(scanning_offset) * 24 * 60 * 60
-            + BIRTHDAY_GENESIS_FROM_UNIX_EPOCH;
+        let timestamp =
+            (account.birthday as u64).saturating_sub(scanning_offset) * 24 * 60 * 60 + BIRTHDAY_GENESIS_FROM_UNIX_EPOCH;
         wallet_client
             .get_height_at_time(timestamp)
             .await
@@ -681,8 +681,7 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
                     count = unresolved.len();
                     "Verifying remaining SpentUnconfirmed outputs against base node"
                 );
-                self.verify_spent_unconfirmed_outputs(target, &unresolved)
-                    .await?;
+                self.verify_spent_unconfirmed_outputs(target, &unresolved).await?;
             }
 
             self.event_sender
