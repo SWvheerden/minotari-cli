@@ -30,6 +30,59 @@ fn generate_test_address(world: &MinotariWorld) -> String {
 // Helper Functions
 // =============================
 
+/// Find an unused TCP port in the given range. Used instead of a hardcoded port
+/// so the daemon never collides with an unrelated service already bound to that
+/// port (e.g. a base node a developer is running locally).
+///
+/// The daemon binds `0.0.0.0:<port>`, so we probe the same wildcard address —
+/// probing `127.0.0.1` would report a port as free even when another process
+/// holds `0.0.0.0:<port>`, and the daemon would then fail to bind.
+fn find_free_port(start: u16, end: u16) -> u16 {
+    for port in start..end {
+        if std::net::TcpListener::bind(("0.0.0.0", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("No free port found in range {}..{}", start, end);
+}
+
+/// HTTP client with a bounded timeout so a hung or stale daemon fails fast with
+/// a clear error instead of blocking the whole scenario until CI times out.
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .expect("Failed to build HTTP client")
+}
+
+/// Wait until the freshly-spawned daemon is actually serving its HTTP API before
+/// proceeding. A blind sleep otherwise lets the test query a daemon that hasn't
+/// finished starting (or that failed to bind its port), producing confusing
+/// downstream API failures instead of a clear, fast error.
+async fn wait_for_daemon_ready(child: &mut std::process::Child, port: u16) {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .expect("Failed to build HTTP client");
+    let url = format!("http://127.0.0.1:{}/version", port);
+    for _ in 0..60 {
+        // If the daemon process already exited, it never came up — fail loudly
+        // rather than hanging on requests that will never be answered.
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("Daemon process exited before becoming ready (status: {status}) on port {port}");
+        }
+        // Require a 2xx from /version so a foreign service answering on this port
+        // (which would return 404) is not mistaken for our daemon being ready.
+        if let Ok(resp) = client.get(&url).send().await
+            && resp.status().is_success()
+        {
+            return;
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+    panic!("Daemon on port {port} did not become ready within 30s");
+}
+
 /// Start a daemon process with the given configuration
 async fn start_daemon_process(world: &mut MinotariWorld, port: u16, scan_interval: Option<u64>) {
     world.setup_database();
@@ -61,15 +114,17 @@ async fn start_daemon_process(world: &mut MinotariWorld, port: u16, scan_interva
         args.push(base_url);
     }
 
-    let child = std::process::Command::new(&command)
+    // Discard the daemon's stdio. A daemon in continuous-scan mode can emit a
+    // lot of output; an unread pipe would eventually fill and block it.
+    let mut child = std::process::Command::new(&command)
         .args(&args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .expect("Failed to start daemon process");
 
-    // Give the daemon time to start up
-    sleep(Duration::from_secs(2)).await;
+    // Poll until the daemon is actually serving before proceeding.
+    wait_for_daemon_ready(&mut child, port).await;
 
     world.daemon_handle = Some(child);
     world.api_port = Some(port);
@@ -83,14 +138,16 @@ async fn start_daemon_process(world: &mut MinotariWorld, port: u16, scan_interva
 async fn running_daemon_with_wallet(world: &mut MinotariWorld) {
     // Import a wallet so the daemon has an account to query
     database_with_wallet(world).await;
-    // Start daemon on default port 9000
-    start_daemon_process(world, 9000, None).await;
+    // Start daemon on a free port (avoids collisions with other local services)
+    let port = find_free_port(9000, 9200);
+    start_daemon_process(world, port, None).await;
 }
 
 #[given("I have a running daemon")]
 async fn running_daemon(world: &mut MinotariWorld) {
-    // Start daemon on default port 9000
-    start_daemon_process(world, 9000, None).await;
+    // Start daemon on a free port (avoids collisions with other local services)
+    let port = find_free_port(9000, 9200);
+    start_daemon_process(world, port, None).await;
 }
 
 #[when(regex = r#"^I start the daemon on port "([^"]*)"$"#)]
@@ -102,7 +159,8 @@ async fn start_daemon_on_port(world: &mut MinotariWorld, port: String) {
 #[when(regex = r#"^I start the daemon with scan interval "([^"]*)" seconds$"#)]
 async fn start_daemon_with_interval(world: &mut MinotariWorld, interval: String) {
     let interval_num = interval.parse::<u64>().expect("Invalid scan interval");
-    start_daemon_process(world, 9000, Some(interval_num)).await;
+    let port = find_free_port(9000, 9200);
+    start_daemon_process(world, port, Some(interval_num)).await;
 }
 
 #[when(regex = r#"^I query the balance via the API for account "([^"]*)"$"#)]
@@ -110,7 +168,7 @@ async fn query_balance_api(world: &mut MinotariWorld, account_name: String) {
     let port = world.api_port.expect("Daemon must be running");
     let url = format!("http://127.0.0.1:{}/accounts/{}/balance", port, account_name);
 
-    let client = reqwest::Client::new();
+    let client = http_client();
     let response = client.get(&url).send().await.expect("Failed to query balance API");
 
     let status = response.status();
@@ -131,7 +189,7 @@ async fn lock_funds_api(world: &mut MinotariWorld, amount: String) {
         "idempotency_key": format!("test_lock_{}", chrono::Utc::now().timestamp())
     });
 
-    let client = reqwest::Client::new();
+    let client = http_client();
     let response = client
         .post(&url)
         .json(&request_body)
@@ -161,7 +219,7 @@ async fn create_transaction_api(world: &mut MinotariWorld) {
         "idempotency_key": format!("test_tx_{}", chrono::Utc::now().timestamp())
     });
 
-    let client = reqwest::Client::new();
+    let client = http_client();
     let response = client
         .post(&url)
         .json(&request_body)
@@ -220,7 +278,7 @@ async fn api_accessible(world: &mut MinotariWorld, port: String) {
     let port_num = port.parse::<u16>().expect("Invalid port number");
     let url = format!("http://127.0.0.1:{}/version", port_num);
 
-    let client = reqwest::Client::new();
+    let client = http_client();
     let result = client.get(&url).send().await;
 
     assert!(
@@ -243,7 +301,7 @@ async fn swagger_available(world: &mut MinotariWorld) {
     let port = world.api_port.expect("Daemon must be running");
     let url = format!("http://127.0.0.1:{}/swagger-ui/", port);
 
-    let client = reqwest::Client::new();
+    let client = http_client();
     let response = client.get(&url).send().await.expect("Failed to access Swagger UI");
 
     assert!(
@@ -258,7 +316,7 @@ async fn daemon_scans_periodically(world: &mut MinotariWorld) {
     let port = world.api_port.expect("Daemon must be running");
     let url = format!("http://127.0.0.1:{}/accounts/default/scan_status", port);
 
-    let client = reqwest::Client::new();
+    let client = http_client();
 
     // Get initial scan status
     let response1 = client.get(&url).send().await.expect("Failed to get scan status");
@@ -277,7 +335,7 @@ async fn scanned_tip_updated_over_time(world: &mut MinotariWorld) {
     let port = world.api_port.expect("Daemon must be running");
     let url = format!("http://127.0.0.1:{}/accounts/default/scan_status", port);
 
-    let client = reqwest::Client::new();
+    let client = http_client();
 
     // Get initial tip
     let response1 = client

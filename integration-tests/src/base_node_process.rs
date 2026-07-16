@@ -177,20 +177,30 @@ impl BaseNodeProcess {
     pub fn kill(&mut self) {
         self.kill_signal.trigger();
 
-        // Wait for ports to be released
-        loop {
-            if TcpListener::bind(("127.0.0.1", self.port.try_into().unwrap())).is_ok() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        loop {
-            if TcpListener::bind(("127.0.0.1", self.grpc_port.try_into().unwrap())).is_ok() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        // Wait (bounded) for the listening ports to be released. If a port never
+        // frees within the deadline, give up rather than hanging the whole test
+        // forever: the node was signalled to shut down, and a lingering socket
+        // will either be reclaimed by the OS or surface as a bind error in the
+        // next step. An unbounded wait here previously hung node restarts.
+        wait_for_port_release(self.port);
+        wait_for_port_release(self.grpc_port);
     }
+}
+
+/// Wait up to ~30s for a TCP port to become bindable again after shutdown.
+/// Returns once the port is free or the deadline elapses (logging a warning).
+fn wait_for_port_release(port: u64) {
+    let Ok(port) = u16::try_from(port) else {
+        return;
+    };
+    // 300 * 100ms = 30s
+    for _ in 0..300 {
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    eprintln!("WARN: port {port} was not released within 30s after node shutdown; continuing anyway");
 }
 
 /// Spawn a base node with default configuration

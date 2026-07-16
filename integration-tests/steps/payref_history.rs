@@ -27,10 +27,12 @@ use super::common::test_support;
 // Helper Functions
 // =============================
 
-/// Find an unused port in a given range.
+/// Find an unused port in a given range. The daemon binds `0.0.0.0:<port>`, so
+/// we probe the same wildcard address — probing `127.0.0.1` would report a port
+/// as free even when another process holds `0.0.0.0:<port>`.
 fn find_free_port(start: u16, end: u16) -> u16 {
     for port in start..end {
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+        if TcpListener::bind(("0.0.0.0", port)).is_ok() {
             return port;
         }
     }
@@ -55,7 +57,10 @@ async fn wait_for_daemon_ready(child: &mut std::process::Child, port: u16) {
         .timeout(Duration::from_secs(2))
         .build()
         .expect("Failed to build HTTP client");
-    let url = format!("http://127.0.0.1:{}/accounts/default/displayed_transactions?limit=1", port);
+    let url = format!(
+        "http://127.0.0.1:{}/accounts/default/displayed_transactions?limit=1",
+        port
+    );
     for _ in 0..60 {
         // If the daemon process already exited, it never bound the port — fail
         // loudly rather than hanging on a request that will never be answered.

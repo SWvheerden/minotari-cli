@@ -23,7 +23,11 @@ impl TransactionUnlocker {
 
         for tx in expired_txs {
             info!(target: "audit", id = &*tx.id; "Transaction expired: unlocking funds");
-            let transaction = conn.transaction()?;
+            // BEGIN IMMEDIATE: acquire the write lock up front. A deferred
+            // transaction that upgrades read->write can dead-lock against another
+            // writer in WAL mode (SQLITE_BUSY_SNAPSHOT, surfaced as "database is
+            // locked"), which busy_timeout does not retry.
+            let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
             db::update_pending_transaction_status(&transaction, &tx.id, PendingTransactionStatus::Expired)?;
             db::unlock_outputs_for_request(&transaction, &tx.id)?;

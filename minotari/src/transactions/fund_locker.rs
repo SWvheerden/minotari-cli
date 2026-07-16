@@ -213,7 +213,12 @@ impl FundLocker {
         let utxo_selection =
             input_selector.fetch_unspent_outputs(&conn, amount, num_outputs, fee_per_gram, estimated_output_size)?;
 
-        let transaction = conn.transaction()?;
+        // BEGIN IMMEDIATE: acquire the write lock up front rather than upgrading
+        // a read->write inside the transaction. Under concurrent writers in WAL
+        // mode (e.g. the background unlocker task), a deferred transaction can
+        // dead-lock with SQLITE_BUSY_SNAPSHOT — surfaced as "database is locked"
+        // — which busy_timeout will not retry.
+        let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         #[allow(clippy::cast_possible_wrap)]
         let expires_at = Utc::now() + Duration::seconds(seconds_to_lock_utxos as i64);
         let idempotency_key = idempotency_key.unwrap_or_else(|| Uuid::new_v4().to_string());
