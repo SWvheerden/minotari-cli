@@ -253,7 +253,7 @@ impl TransactionSender {
     ) -> Result<Self, anyhow::Error> {
         let connection = db_pool.get()?;
         let account_of_processed_transaction: AccountRow = db::get_account_by_name(&connection, &account_name)?
-            .ok_or_else(|| anyhow!("Account with name '{}' not found", &account_name))?;
+            .ok_or_else(|| anyhow!("Account with name '{}' not found", account_name))?;
 
         Ok(Self {
             db_pool,

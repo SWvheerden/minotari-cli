@@ -27,14 +27,52 @@ use super::common::test_support;
 // Helper Functions
 // =============================
 
-/// Find an unused port in a given range.
+/// Find an unused port in a given range. The daemon binds `0.0.0.0:<port>`, so
+/// we probe the same wildcard address — probing `127.0.0.1` would report a port
+/// as free even when another process holds `0.0.0.0:<port>`.
 fn find_free_port(start: u16, end: u16) -> u16 {
     for port in start..end {
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+        if TcpListener::bind(("0.0.0.0", port)).is_ok() {
             return port;
         }
     }
     panic!("No free port found in range {}..{}", start, end);
+}
+
+/// HTTP client with a bounded timeout so a hung or stale daemon fails fast with
+/// a clear error instead of blocking the whole scenario until CI times out.
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .expect("Failed to build HTTP client")
+}
+
+/// Wait until the freshly-spawned daemon is actually serving its HTTP API before
+/// proceeding. Without this, a blind sleep lets the test query a daemon that
+/// never came up (e.g. it failed to bind its port because a stale daemon from a
+/// prior run is squatting on it), which hangs the next request indefinitely.
+async fn wait_for_daemon_ready(child: &mut std::process::Child, port: u16) {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .expect("Failed to build HTTP client");
+    let url = format!(
+        "http://127.0.0.1:{}/accounts/default/displayed_transactions?limit=1",
+        port
+    );
+    for _ in 0..60 {
+        // If the daemon process already exited, it never bound the port — fail
+        // loudly rather than hanging on a request that will never be answered.
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("Daemon process exited before becoming ready (status: {status}) on port {port}");
+        }
+        if client.get(&url).send().await.is_ok() {
+            return;
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+    panic!("Daemon on port {port} did not become ready within 30s");
 }
 
 // =============================
@@ -69,7 +107,7 @@ async fn wallet_has_displayed_transactions_with_payrefs(world: &mut MinotariWorl
         port
     );
 
-    let client = reqwest::Client::new();
+    let client = http_client();
     let txs: Vec<serde_json::Value> = client
         .get(&url)
         .send()
@@ -106,7 +144,7 @@ async fn capture_payref_from_displayed_transactions(world: &mut MinotariWorld) {
         port
     );
 
-    let client = reqwest::Client::new();
+    let client = http_client();
     let txs: Vec<serde_json::Value> = client
         .get(&url)
         .send()
@@ -236,15 +274,15 @@ async fn start_daemon_on_free_port(world: &mut MinotariWorld) {
         args.push(base_url);
     }
 
-    let child = Command::new(&command)
+    let mut child = Command::new(&command)
         .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("Failed to start daemon process");
 
-    // Give the daemon time to start up
-    sleep(Duration::from_secs(3)).await;
+    // Poll until the daemon is actually serving before proceeding.
+    wait_for_daemon_ready(&mut child, port).await;
 
     world.daemon_handle = Some(child);
     world.api_port = Some(port);
@@ -269,7 +307,7 @@ async fn request_displayed_by_captured_payref(world: &mut MinotariWorld) {
 
     println!("Querying displayed transactions by captured payref: {}", url);
 
-    let client = reqwest::Client::new();
+    let client = http_client();
     let response = client
         .get(&url)
         .send()
@@ -295,7 +333,7 @@ async fn request_displayed_by_payref(world: &mut MinotariWorld, payref: String) 
         port, payref
     );
 
-    let client = reqwest::Client::new();
+    let client = http_client();
     let response = client
         .get(&url)
         .send()

@@ -25,7 +25,7 @@ Feature: Payref history fallback after reorg
     And I perform a scan with max blocks "50"
     Then the scan should complete successfully
     # Verify the old payref still resolves via the already-running daemon
-    And I request the displayed transactions by the captured payref via the API
+    When I request the displayed transactions by the captured payref via the API
     Then the API should return the displayed transaction via history fallback
     # An unrelated payref should return empty
     When I request the displayed transactions by payref "never_seen_payref_xyz" via the API

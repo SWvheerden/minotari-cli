@@ -550,8 +550,13 @@ where
         let (send_download, rec_download) = mpsc::channel(1000);
         self.update_scan_config(config)?;
         let mut download_scanner = self.clone();
-        let send_download_1 = send_download.clone();
         let scan_config = config.clone();
+        // Download task: fetch raw blocks and forward them to the processing task
+        // via `send_scan_result` ONLY. It must never send directly to
+        // `send_download`, otherwise its completion signal can overtake the
+        // slower processing task's results on that shared channel and truncate
+        // the scan. When this task finishes it simply drops `send_scan_result`,
+        // which the processing task observes as end-of-input.
         tokio::spawn(async move {
             let tip = match download_scanner.get_tip_info().await {
                 Ok(tip) => tip,
@@ -565,13 +570,8 @@ where
                     "Tip height {} is less than requested start height {}, returning empty results",
                     tip.best_block_height, scan_config.start_height
                 );
-
-                let _unused = send_download_1
-                    .send(Ok(Vec::<BlockScanResult>::new()))
-                    .await
-                    .inspect_err(|e| {
-                        error!("Failed to send tip result with error: {}", e);
-                    });
+                // Nothing to fetch: dropping `send_scan_result` lets the
+                // processing task emit the terminal empty batch in order.
                 return;
             }
             loop {
@@ -584,7 +584,9 @@ where
                         more_blocks
                     },
                     Err(e) => {
-                        let _unused = send_download_1.send(Err(e)).await.inspect_err(|e| {
+                        // Route the error through the processing task so it is
+                        // ordered after any results already in flight.
+                        let _unused = send_scan_result.send(Err(e)).await.inspect_err(|e| {
                             error!("Failed to send download result with error: {}", e);
                         });
                         return;
@@ -596,9 +598,8 @@ where
                 }
             }
             debug!("Finished downloading blocks");
-            if let Err(e) = send_download_1.send(Ok(Vec::new())).await {
-                error!("Failed to send download result with error: {}", e);
-            };
+            // Drop `send_scan_result` (by returning) to signal end-of-input to
+            // the processing task, which emits the terminal empty batch.
         });
         let thread_count = self.thread_count;
         let processing_scanner = self.clone();
@@ -747,7 +748,13 @@ where
                     error!("Failed to send download error with error: {}", e);
                 });
             }
-            debug!("HTTP scan completed, found",);
+            // All fetched batches have been processed and forwarded. Emit the
+            // terminal empty batch now, from the same task that sends results,
+            // so the consumer only sees "end of stream" AFTER every real block.
+            let _unused = send_download.send(Ok(Vec::new())).await.inspect_err(|e| {
+                error!("Failed to send terminal download result with error: {}", e);
+            });
+            debug!("HTTP scan completed");
         });
 
         Ok(rec_download)

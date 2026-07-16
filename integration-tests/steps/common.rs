@@ -97,16 +97,26 @@ impl MinotariWorld {
         let release_binary = workspace_root.join("target/release/minotari");
         let debug_binary = workspace_root.join("target/debug/minotari");
 
-        if release_binary.exists() {
-            (release_binary.to_string_lossy().to_string(), vec![])
-        } else if debug_binary.exists() {
-            (debug_binary.to_string_lossy().to_string(), vec![])
+        // Prefer the binary that matches the current build profile so it stays
+        // in sync with ensure_minotari_binary_built(), which rebuilds exactly
+        // that profile. Otherwise a debug test run would silently exercise a
+        // stale release binary (or vice-versa) and test old code.
+        let (preferred, fallback) = if cfg!(debug_assertions) {
+            (debug_binary, release_binary)
+        } else {
+            (release_binary, debug_binary)
+        };
+
+        if preferred.exists() {
+            (preferred.to_string_lossy().to_string(), vec![])
+        } else if fallback.exists() {
+            (fallback.to_string_lossy().to_string(), vec![])
         } else {
             panic!(
                 "minotari binary not found at {:?} or {:?}. \
                  The binary should have been built by ensure_minotari_binary_built() \
                  in the cucumber test runner.",
-                release_binary, debug_binary
+                preferred, fallback
             );
         }
     }

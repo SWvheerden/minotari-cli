@@ -72,11 +72,16 @@ fn ensure_minotari_binary_built() {
 
     let binary = workspace_root.join(format!("target/{target_dir}/minotari"));
 
-    // Paths whose changes should trigger a rebuild.
+    // Paths whose changes should trigger a rebuild. This must include every
+    // workspace crate the `minotari` binary depends on and exercises at runtime
+    // (e.g. `minotari-scanning`), otherwise a stale binary would be reused after
+    // changes to those crates and CLI-driven scenarios would test old code.
     let watched: Vec<PathBuf> = vec![
         workspace_root.join("minotari/src"),
         workspace_root.join("minotari/migrations"),
         workspace_root.join("minotari/Cargo.toml"),
+        workspace_root.join("minotari-scanning/src"),
+        workspace_root.join("minotari-scanning/Cargo.toml"),
         workspace_root.join("Cargo.lock"),
     ];
 
@@ -106,7 +111,11 @@ async fn main() {
     ensure_minotari_binary_built();
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let features_path = manifest_dir.join("features");
+    // Allow running a single feature file (or subdirectory) via CUCUMBER_FEATURES
+    // for faster iteration; defaults to the full features directory.
+    let features_path = std::env::var_os("CUCUMBER_FEATURES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| manifest_dir.join("features"));
 
     steps::MinotariWorld::cucumber()
         .max_concurrent_scenarios(1)
