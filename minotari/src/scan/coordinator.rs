@@ -1,4 +1,4 @@
-use log::info;
+use log::{debug, info};
 use minotari_scanning::{HttpBlockchainScanner, scanning::BlockchainScanner};
 use std::{collections::VecDeque, sync::Arc};
 use tari_common_types::{seeds::cipher_seed::BIRTHDAY_GENESIS_FROM_UNIX_EPOCH, types::PrivateKey};
@@ -7,14 +7,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     PauseReason, ScanStatusEvent,
-    db::{AccountRow, SqlitePool},
+    db::{AccountRow, SqlitePool, WalletDbError},
     http::WalletHttpClient,
-    models::WalletEvent,
+    models::{OutputStatus, WalletEvent},
     scan::{
         DisplayedTransactionsEvent, ReorgDetectedEvent, ScanError, ScanMode, ScanRetryConfig, TransactionsUpdatedEvent,
         block_processor::BlockProcessor,
         config::OPTIMAL_SCANNING_THREADS,
-        events::{EventSender, ProcessingEvent},
+        events::{EventSender, FastSyncPhase, ProcessingEvent},
         reorg,
         scan_db_handler::ScanDbHandler,
         scanner_state_manager::ScannerStateManager,
@@ -23,6 +23,7 @@ use crate::{
     webhooks::WebhookTriggerConfig,
 };
 use tari_transaction_components::key_manager::TransactionKeyManagerInterface;
+use tari_utilities::hex::Hex;
 
 const MAX_CONTINUOUS_BUFFERED_EVENTS: usize = 10_000;
 
@@ -119,7 +120,29 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
             sync_targets.push(target);
         }
 
-        self.unified_scan_loop(sync_targets, mode, cancel_token).await
+        match mode {
+            ScanMode::FastSync { safety_buffer } => self.run_fast_sync(sync_targets, safety_buffer, cancel_token).await,
+            _ => self.unified_scan_loop(sync_targets, mode, cancel_token).await,
+        }
+    }
+
+    /// Resolves the block height corresponding to an account's birthday.
+    ///
+    /// Used to determine where a scan should begin when there is no existing
+    /// scan state to resume from (and by the backfill, which always rescans from
+    /// the birthday regardless of how far the fast-sync cursor advanced).
+    async fn birthday_height(
+        &self,
+        account: &AccountRow,
+        scanning_offset: u64,
+        wallet_client: &WalletHttpClient,
+    ) -> Result<u64, ScanError> {
+        let timestamp =
+            (account.birthday as u64).saturating_sub(scanning_offset) * 24 * 60 * 60 + BIRTHDAY_GENESIS_FROM_UNIX_EPOCH;
+        wallet_client
+            .get_height_at_time(timestamp)
+            .await
+            .map_err(ScanError::Fatal)
     }
 
     /// Prepares a scan context for an account.
@@ -142,12 +165,7 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
 
         if next_block == 0 {
             // Use birthday logic
-            let timestamp = (account.birthday as u64).saturating_sub(scanning_offset) * 24 * 60 * 60
-                + BIRTHDAY_GENESIS_FROM_UNIX_EPOCH;
-            next_block = wallet_client
-                .get_height_at_time(timestamp)
-                .await
-                .map_err(ScanError::Fatal)?;
+            next_block = self.birthday_height(&account, scanning_offset, wallet_client).await?;
         }
 
         let monitor_state = MonitoringState::new();
@@ -249,7 +267,6 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
             let mut max_new_height_in_batch = 0;
             while let Some(response) = utxo_stream.recv().await {
                 let scanned_blocks = response.map_err(|e| ScanError::Intermittent(e.to_string()))?;
-                //let (scanned_blocks, mut more_blocks) = self.scan_blocks_with_timeout(scanner, &scanner_config).await?;
                 let new_blocks_count = scanned_blocks.len() as u64;
                 is_batch_empty = scanned_blocks.is_empty();
                 // Go on, if we stopped on artificial horizon
@@ -327,6 +344,12 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
                 if blocks_since_reorg_check >= self.reorg_check_interval {
                     self.check_global_reorgs(&mut targets, &db_handler, scanner).await?;
                     blocks_since_reorg_check = 0;
+                }
+
+                if let Some(token) = &cancel_token
+                    && token.is_cancelled()
+                {
+                    return self.handle_pause(&targets, PauseReason::Cancelled, all_events);
                 }
             }
             if let ScanMode::Partial { max_blocks } = mode
@@ -478,6 +501,637 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
                 cancelled_transaction_ids: reorg_info.cancelled_transaction_ids,
                 reorganized_displayed_transactions: reorg_info.reorganized_displayed_transactions,
             }));
+    }
+
+    /// Runs the three-phase fast sync strategy.
+    #[allow(clippy::too_many_lines)]
+    async fn run_fast_sync(
+        &self,
+        mut targets: Vec<AccountSyncTarget>,
+        safety_buffer: u64,
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<(Vec<WalletEvent>, bool), ScanError> {
+        let mut all_events = Vec::new();
+
+        // Get chain tip to compute fast_sync_target
+        let tip_response = self.client.get_tip_info().await.map_err(ScanError::Fatal)?;
+        let tip_height = tip_response
+            .metadata
+            .as_ref()
+            .map(|m| m.best_block_height())
+            .unwrap_or(0);
+        let fast_sync_target = tip_height.saturating_sub(safety_buffer);
+
+        info!(
+            tip = tip_height,
+            fast_sync_target = fast_sync_target,
+            safety_buffer = safety_buffer;
+            "Starting fast sync"
+        );
+
+        // --- Phase 1: Fast UTXO scan (birthday -> fast_sync_target, exclude_spent=true) ---
+        for target in &targets {
+            self.event_sender
+                .send(ProcessingEvent::ScanStatus(ScanStatusEvent::FastSyncPhaseStarted {
+                    account_id: target.account.id,
+                    phase: FastSyncPhase::FastUtxoScan,
+                    from_height: target.next_block_to_scan,
+                    to_height: Some(fast_sync_target),
+                }));
+        }
+
+        let (events, _) = self
+            .fast_sync_loop(&mut targets, fast_sync_target, &cancel_token)
+            .await?;
+        all_events.extend(events);
+
+        for target in &targets {
+            self.event_sender
+                .send(ProcessingEvent::ScanStatus(ScanStatusEvent::FastSyncPhaseCompleted {
+                    account_id: target.account.id,
+                    phase: FastSyncPhase::FastUtxoScan,
+                }));
+        }
+
+        // Check cancellation between phases
+        if let Some(token) = &cancel_token
+            && token.is_cancelled()
+        {
+            return Ok((all_events, true));
+        }
+
+        // --- Phase 2: Recent full scan (fast_sync_target -> tip) ---
+        // Targets already have next_block_to_scan set to fast_sync_target + 1
+        // from Phase 1, so no reset needed.
+        for target in &targets {
+            self.event_sender
+                .send(ProcessingEvent::ScanStatus(ScanStatusEvent::FastSyncPhaseStarted {
+                    account_id: target.account.id,
+                    phase: FastSyncPhase::RecentFullScan,
+                    from_height: fast_sync_target,
+                    to_height: None,
+                }));
+        }
+
+        // Phase 2 uses the same simple loop pattern as fast_sync_loop but without
+        // exclude_spent, effectively doing a full scan of recent blocks.
+        let (events, _) = self.recent_full_scan_loop(&mut targets, &cancel_token).await?;
+        all_events.extend(events);
+
+        for target in &targets {
+            self.event_sender
+                .send(ProcessingEvent::ScanStatus(ScanStatusEvent::FastSyncPhaseCompleted {
+                    account_id: target.account.id,
+                    phase: FastSyncPhase::RecentFullScan,
+                }));
+        }
+
+        info!("Fast sync completed (wallet is now usable; run backfill separately for full history)");
+        Ok((all_events, false))
+    }
+
+    /// Runs the history backfill phase separately.
+    ///
+    /// Scans from each account's birthday to `backfill_to_height` with full block
+    /// processing (outputs + inputs) using backfill mode (OR IGNORE for duplicates,
+    /// SpentUnconfirmed status for new outputs). After scanning, resolves
+    /// SpentUnconfirmed outputs by checking inputs and verifying against the base node.
+    pub async fn run_backfill(
+        &self,
+        accounts: Vec<AccountRow>,
+        password: &str,
+        backfill_to_height: u64,
+        scanning_offset: u64,
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<(Vec<WalletEvent>, bool), ScanError> {
+        if accounts.is_empty() {
+            return Ok((Vec::new(), false));
+        }
+
+        let mut conn = self.pool.get().map_err(|e| ScanError::DbError(e.into()))?;
+
+        let first_km = accounts
+            .first()
+            .expect("is already checked")
+            .get_key_manager(password)?;
+        let mut shared_reorg_scanner = self.create_reorg_scanner(first_km).await?;
+
+        let mut targets = Vec::with_capacity(accounts.len());
+        for account in accounts {
+            let mut target = self
+                .prepare_target(
+                    account,
+                    password,
+                    &self.client,
+                    scanning_offset,
+                    &mut conn,
+                    &mut shared_reorg_scanner,
+                )
+                .await?;
+
+            // Backfill always rescans from the account birthday. prepare_target
+            // resumes from the last scanned tip block, which after a fast sync
+            // sits at (or near) the chain tip — that is past backfill_to_height,
+            // so without this reset the backfill range would be empty and no
+            // history would be filled in. Idempotent (OR IGNORE) inserts in
+            // backfill mode make rescanning already-recorded blocks safe.
+            target.next_block_to_scan = self
+                .birthday_height(&target.account, scanning_offset, &self.client)
+                .await?;
+            targets.push(target);
+        }
+
+        let mut all_events = Vec::new();
+
+        for target in &targets {
+            self.event_sender
+                .send(ProcessingEvent::ScanStatus(ScanStatusEvent::FastSyncPhaseStarted {
+                    account_id: target.account.id,
+                    phase: FastSyncPhase::HistoryBackfill,
+                    from_height: target.next_block_to_scan,
+                    to_height: Some(backfill_to_height),
+                }));
+        }
+
+        let (events, _) = self
+            .backfill_loop(&mut targets, backfill_to_height, &cancel_token)
+            .await?;
+        all_events.extend(events);
+
+        // Resolve SpentUnconfirmed outputs:
+        // 1. Mark outputs with matching inputs as Spent
+        // 2. Verify remaining outputs against the base node
+        for target in &targets {
+            let unresolved = {
+                let conn = self.pool.get().map_err(|e| ScanError::DbError(e.into()))?;
+                let marked_spent = crate::db::resolve_spent_unconfirmed_with_inputs(&conn, target.account.id)
+                    .map_err(ScanError::DbError)?;
+                info!(
+                    account_id = target.account.id,
+                    marked_spent = marked_spent;
+                    "Resolved SpentUnconfirmed outputs with matching inputs"
+                );
+                crate::db::get_unresolved_spent_unconfirmed_outputs(&conn, target.account.id)
+                    .map_err(ScanError::DbError)?
+            };
+
+            if !unresolved.is_empty() {
+                info!(
+                    account_id = target.account.id,
+                    count = unresolved.len();
+                    "Verifying remaining SpentUnconfirmed outputs against base node"
+                );
+                self.verify_spent_unconfirmed_outputs(target, &unresolved).await?;
+            }
+
+            self.event_sender
+                .send(ProcessingEvent::ScanStatus(ScanStatusEvent::FastSyncPhaseCompleted {
+                    account_id: target.account.id,
+                    phase: FastSyncPhase::HistoryBackfill,
+                }));
+        }
+
+        info!("History backfill completed");
+        Ok((all_events, false))
+    }
+
+    /// Phase 1: Fast sync loop scanning only unspent outputs.
+    async fn fast_sync_loop(
+        &self,
+        targets: &mut [AccountSyncTarget],
+        end_height: u64,
+        cancel_token: &Option<CancellationToken>,
+    ) -> Result<(Vec<WalletEvent>, bool), ScanError> {
+        let mut all_events = Vec::new();
+        let mut state_manager = ScannerStateManager::new();
+        let mut total_scanned = 0u64;
+
+        let all_accounts: Vec<(i64, PrivateKey)> = targets
+            .iter()
+            .map(|target| (target.account.id, target.view_key.clone()))
+            .collect();
+        let block_processor = BlockProcessor::with_event_sender(
+            all_accounts,
+            self.event_sender.clone(),
+            false,
+            self.required_confirmations,
+        );
+        let mut db_handler = ScanDbHandler::new(self.pool.clone(), block_processor);
+
+        let global_next_block = targets.iter().map(|t| t.next_block_to_scan).min().unwrap_or(0);
+        let active_account_ids: Vec<i64> = targets
+            .iter()
+            .filter(|t| t.next_block_to_scan <= end_height)
+            .map(|t| t.account.id)
+            .collect();
+
+        if active_account_ids.is_empty() || global_next_block > end_height {
+            return Ok((all_events, false));
+        }
+
+        let (scanner, mut scanner_config) = state_manager
+            .get_scanner_and_config(
+                &active_account_ids,
+                global_next_block,
+                Some(end_height),
+                self.batch_size,
+                targets,
+                &self.base_url,
+                self.processing_threads,
+                &self.retry_config,
+            )
+            .await?;
+
+        // Set exclude_spent and exclude_inputs for fast sync
+        scanner_config.exclude_spent = true;
+        scanner_config.exclude_inputs = true;
+
+        let mut utxo_stream = scanner
+            .scan_blocks(&scanner_config)
+            .await
+            .map_err(|e| ScanError::Intermittent(e.to_string()))?;
+
+        while let Some(response) = utxo_stream.recv().await {
+            if let Some(token) = cancel_token
+                && token.is_cancelled()
+            {
+                break;
+            }
+
+            let scanned_blocks = response.map_err(|e| ScanError::Intermittent(e.to_string()))?;
+            if scanned_blocks.is_empty() {
+                break;
+            }
+            total_scanned += scanned_blocks.len() as u64;
+
+            let shared_blocks = Arc::new(scanned_blocks);
+
+            for account_id in &active_account_ids {
+                let Some(target) = targets.iter_mut().find(|t| t.account.id == *account_id) else {
+                    continue;
+                };
+
+                let events = db_handler
+                    .process_blocks(
+                        shared_blocks.clone(),
+                        *account_id,
+                        false,
+                        self.webhook_config.clone(),
+                        target.next_block_to_scan,
+                    )
+                    .await?;
+                all_events.extend(events);
+
+                if let Some(last) = shared_blocks.last() {
+                    target.next_block_to_scan = last.height + 1;
+
+                    self.event_sender
+                        .send(ProcessingEvent::ScanStatus(ScanStatusEvent::Progress {
+                            account_id: target.account.id,
+                            current_height: last.height,
+                            blocks_scanned: total_scanned,
+                        }));
+                }
+            }
+        }
+
+        Ok((all_events, false))
+    }
+
+    /// Phase 2: Full scan of recent blocks from fast_sync_target to tip.
+    async fn recent_full_scan_loop(
+        &self,
+        targets: &mut [AccountSyncTarget],
+        cancel_token: &Option<CancellationToken>,
+    ) -> Result<(Vec<WalletEvent>, bool), ScanError> {
+        let mut all_events = Vec::new();
+        let mut state_manager = ScannerStateManager::new();
+        let mut total_scanned = 0u64;
+
+        let all_accounts: Vec<(i64, PrivateKey)> = targets
+            .iter()
+            .map(|target| (target.account.id, target.view_key.clone()))
+            .collect();
+        let block_processor = BlockProcessor::with_event_sender(
+            all_accounts,
+            self.event_sender.clone(),
+            false,
+            self.required_confirmations,
+        );
+        let mut db_handler = ScanDbHandler::new(self.pool.clone(), block_processor);
+
+        let global_next_block = targets.iter().map(|t| t.next_block_to_scan).min().unwrap_or(0);
+        let active_account_ids: Vec<i64> = targets.iter().map(|t| t.account.id).collect();
+
+        let (scanner, scanner_config) = state_manager
+            .get_scanner_and_config(
+                &active_account_ids,
+                global_next_block,
+                None, // scan to tip
+                self.batch_size,
+                targets,
+                &self.base_url,
+                self.processing_threads,
+                &self.retry_config,
+            )
+            .await?;
+
+        let mut utxo_stream = scanner
+            .scan_blocks(&scanner_config)
+            .await
+            .map_err(|e| ScanError::Intermittent(e.to_string()))?;
+
+        while let Some(response) = utxo_stream.recv().await {
+            if let Some(token) = cancel_token
+                && token.is_cancelled()
+            {
+                break;
+            }
+
+            let scanned_blocks = response.map_err(|e| ScanError::Intermittent(e.to_string()))?;
+            if scanned_blocks.is_empty() {
+                break;
+            }
+            total_scanned += scanned_blocks.len() as u64;
+
+            let shared_blocks = Arc::new(scanned_blocks);
+
+            for account_id in &active_account_ids {
+                let Some(target) = targets.iter_mut().find(|t| t.account.id == *account_id) else {
+                    continue;
+                };
+
+                let events = db_handler
+                    .process_blocks(
+                        shared_blocks.clone(),
+                        *account_id,
+                        target.transaction_monitor.has_pending_outbound(),
+                        self.webhook_config.clone(),
+                        target.next_block_to_scan,
+                    )
+                    .await?;
+                all_events.extend(events);
+
+                if let Some(last) = shared_blocks.last() {
+                    target.next_block_to_scan = last.height + 1;
+
+                    let monitor_res = target
+                        .transaction_monitor
+                        .monitor_if_needed(&self.client, &self.pool, target.account.id, last.height)
+                        .await
+                        .map_err(ScanError::Fatal)?;
+
+                    all_events.extend(monitor_res.wallet_events.clone());
+                    self.emit_monitor_events(target.account.id, last.height, monitor_res);
+
+                    self.event_sender
+                        .send(ProcessingEvent::ScanStatus(ScanStatusEvent::Progress {
+                            account_id: target.account.id,
+                            current_height: last.height,
+                            blocks_scanned: total_scanned,
+                        }));
+                }
+            }
+        }
+
+        Ok((all_events, false))
+    }
+
+    /// Phase 3: Backfill loop scanning full blocks with OR IGNORE for existing data.
+    async fn backfill_loop(
+        &self,
+        targets: &mut [AccountSyncTarget],
+        end_height: u64,
+        cancel_token: &Option<CancellationToken>,
+    ) -> Result<(Vec<WalletEvent>, bool), ScanError> {
+        let mut all_events = Vec::new();
+        let mut state_manager = ScannerStateManager::new();
+        let mut total_scanned = 0u64;
+
+        let all_accounts: Vec<(i64, PrivateKey)> = targets
+            .iter()
+            .map(|target| (target.account.id, target.view_key.clone()))
+            .collect();
+        let mut block_processor = BlockProcessor::with_event_sender(
+            all_accounts,
+            self.event_sender.clone(),
+            false,
+            self.required_confirmations,
+        );
+        block_processor.set_backfill_mode(true);
+        let mut db_handler = ScanDbHandler::new(self.pool.clone(), block_processor);
+
+        let global_next_block = targets.iter().map(|t| t.next_block_to_scan).min().unwrap_or(0);
+        let active_account_ids: Vec<i64> = targets
+            .iter()
+            .filter(|t| t.next_block_to_scan <= end_height)
+            .map(|t| t.account.id)
+            .collect();
+
+        if active_account_ids.is_empty() || global_next_block > end_height {
+            return Ok((all_events, false));
+        }
+
+        let (scanner, scanner_config) = state_manager
+            .get_scanner_and_config(
+                &active_account_ids,
+                global_next_block,
+                Some(end_height),
+                self.batch_size,
+                targets,
+                &self.base_url,
+                self.processing_threads,
+                &self.retry_config,
+            )
+            .await?;
+
+        let mut utxo_stream = scanner
+            .scan_blocks(&scanner_config)
+            .await
+            .map_err(|e| ScanError::Intermittent(e.to_string()))?;
+
+        while let Some(response) = utxo_stream.recv().await {
+            if let Some(token) = cancel_token
+                && token.is_cancelled()
+            {
+                break;
+            }
+
+            let scanned_blocks = response.map_err(|e| ScanError::Intermittent(e.to_string()))?;
+            if scanned_blocks.is_empty() {
+                break;
+            }
+            total_scanned += scanned_blocks.len() as u64;
+
+            let shared_blocks = Arc::new(scanned_blocks);
+
+            for account_id in &active_account_ids {
+                let Some(target) = targets.iter_mut().find(|t| t.account.id == *account_id) else {
+                    continue;
+                };
+
+                let events = db_handler
+                    .process_blocks(
+                        shared_blocks.clone(),
+                        *account_id,
+                        false,
+                        self.webhook_config.clone(),
+                        target.next_block_to_scan,
+                    )
+                    .await?;
+                all_events.extend(events);
+
+                if let Some(last) = shared_blocks.last() {
+                    target.next_block_to_scan = last.height + 1;
+
+                    self.event_sender
+                        .send(ProcessingEvent::ScanStatus(ScanStatusEvent::Progress {
+                            account_id: target.account.id,
+                            current_height: last.height,
+                            blocks_scanned: total_scanned,
+                        }));
+                }
+            }
+        }
+
+        Ok((all_events, false))
+    }
+
+    /// Verifies remaining SpentUnconfirmed outputs against the base node using
+    /// the `get_utxos_deleted_info` endpoint. If `spent_in_header` is present,
+    /// the output is confirmed Spent and an input record + debit balance change
+    /// are created so the balance sums correctly. Otherwise it's marked Unspent.
+    async fn verify_spent_unconfirmed_outputs(
+        &self,
+        target: &AccountSyncTarget,
+        unresolved: &[crate::db::UnresolvedSpentOutput],
+    ) -> Result<(), ScanError> {
+        use std::collections::HashMap;
+
+        let hash_to_output: HashMap<Vec<u8>, &crate::db::UnresolvedSpentOutput> =
+            unresolved.iter().map(|o| (o.output_hash.clone(), o)).collect();
+
+        let all_output_hashes: Vec<Vec<u8>> = unresolved.iter().map(|o| o.output_hash.clone()).collect();
+
+        // Phase 1: Collect all network results before touching the database
+        enum VerifyAction {
+            ConfirmSpent {
+                output_id: i64,
+                value: u64,
+                spent_height: u64,
+                spent_block_hash: Vec<u8>,
+            },
+            MarkUnspent {
+                output_id: i64,
+            },
+        }
+
+        let mut actions = Vec::new();
+
+        for output_hashes in all_output_hashes.chunks(50) {
+            let response = self
+                .client
+                .get_utxos_deleted_info(output_hashes.to_vec())
+                .await
+                .map_err(|e| ScanError::Intermittent(format!("Failed to query UTXO deleted info: {}", e)))?;
+
+            for utxo_info in &response.utxos {
+                let Some(output) = hash_to_output.get(&utxo_info.utxo_hash) else {
+                    continue;
+                };
+
+                if let Some((spent_height, spent_block_hash)) = &utxo_info.spent_in_header {
+                    actions.push(VerifyAction::ConfirmSpent {
+                        output_id: output.output_id,
+                        value: output.value,
+                        spent_height: *spent_height,
+                        spent_block_hash: spent_block_hash.clone(),
+                    });
+                } else if utxo_info.found_in_header.is_some() {
+                    actions.push(VerifyAction::MarkUnspent {
+                        output_id: output.output_id,
+                    });
+                } else {
+                    debug!(
+                        account = &*target.account.friendly_name,
+                        output_hash = &*utxo_info.utxo_hash.to_hex();
+                        "Output unknown by base node, status kept as SpentUnconfirmed"
+                    );
+                }
+            }
+        }
+
+        // Phase 2: Apply all DB writes in a single transaction so a mid-loop
+        // failure cannot leave a half-written spend (an input without its debit
+        // balance change, or a status update without a matching input).
+        let mut conn = self.pool.get().map_err(|e| ScanError::DbError(e.into()))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| ScanError::DbError(WalletDbError::from(e)))?;
+        let mut marked_unspent = 0u64;
+        let mut confirmed_spent = 0u64;
+
+        for action in &actions {
+            match action {
+                VerifyAction::ConfirmSpent {
+                    output_id,
+                    value,
+                    spent_height,
+                    spent_block_hash,
+                } => {
+                    let input_id = crate::db::insert_input(
+                        &tx,
+                        target.account.id,
+                        *output_id,
+                        *spent_height,
+                        spent_block_hash,
+                        0, // timestamp not available from deleted info
+                    )
+                    .map_err(ScanError::DbError)?;
+
+                    let change = crate::models::BalanceChange {
+                        account_id: target.account.id,
+                        caused_by_output_id: None,
+                        caused_by_input_id: Some(input_id),
+                        description: "Output spent (verified by base node)".to_string(),
+                        balance_credit: 0.into(),
+                        balance_debit: (*value).into(),
+                        effective_date: chrono::Utc::now().naive_utc(),
+                        effective_height: *spent_height,
+                        claimed_recipient_address: None,
+                        claimed_sender_address: None,
+                        memo_hex: None,
+                        memo_parsed: None,
+                        claimed_fee: None,
+                        claimed_amount: None,
+                        is_reversal: false,
+                        reversal_of_balance_change_id: None,
+                        is_reversed: false,
+                    };
+                    crate::db::insert_balance_change(&tx, &change).map_err(ScanError::DbError)?;
+
+                    crate::db::update_output_status(&tx, *output_id, OutputStatus::Spent)
+                        .map_err(ScanError::DbError)?;
+                    confirmed_spent += 1;
+                },
+                VerifyAction::MarkUnspent { output_id } => {
+                    crate::db::update_output_status(&tx, *output_id, OutputStatus::Unspent)
+                        .map_err(ScanError::DbError)?;
+                    marked_unspent += 1;
+                },
+            }
+        }
+
+        tx.commit().map_err(|e| ScanError::DbError(WalletDbError::from(e)))?;
+
+        info!(
+            account_id = target.account.id,
+            marked_unspent = marked_unspent,
+            confirmed_spent = confirmed_spent;
+            "Verified SpentUnconfirmed outputs against base node"
+        );
+
+        Ok(())
     }
 
     async fn create_reorg_scanner(

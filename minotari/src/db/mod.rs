@@ -73,11 +73,13 @@ pub use scanned_tip_blocks::{
 
 mod outputs;
 pub use outputs::{
-    DbOutput, DbWalletOutput, OutputTotals, fetch_outputs_by_lock_request_id, fetch_unspent_outputs,
+    DbOutput, DbWalletOutput, UnresolvedSpentOutput, fetch_outputs_by_lock_request_id, fetch_unspent_outputs,
     get_active_outputs_from_height, get_output_by_id, get_output_info_by_hash, get_output_info_by_hash_for_account,
-    get_output_totals_for_account, get_total_unspent_balance, get_unconfirmed_outputs, insert_output, lock_output,
-    mark_output_confirmed, soft_delete_outputs_from_height, unlock_outputs_for_request,
-    unlock_outputs_for_request as unlock_outputs_for_pending_transaction, update_output_status,
+    get_output_totals_for_account, get_total_unspent_balance, get_unconfirmed_outputs,
+    get_unresolved_spent_unconfirmed_outputs, insert_output, insert_spent_output_if_not_exists, lock_output,
+    mark_output_confirmed, resolve_spent_unconfirmed_with_inputs, soft_delete_outputs_from_height,
+    unlock_outputs_for_request, unlock_outputs_for_request as unlock_outputs_for_pending_transaction,
+    update_output_status,
 };
 
 mod pending_transactions;
@@ -106,7 +108,9 @@ pub use webhooks::{delete_webhooks_older_than, enqueue_webhook, fetch_due_webhoo
 
 mod balance_changes;
 pub use balance_changes::{
-    get_all_active_balance_changes_by_account_id, get_all_balance_changes_by_account_id, insert_balance_change,
+    get_all_active_balance_changes_by_account_id, get_all_balance_changes_by_account_id,
+    get_balance_change_id_by_input, get_balance_change_id_by_output, insert_balance_change,
+    insert_balance_change_if_not_exists,
 };
 
 mod inputs;

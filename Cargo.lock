@@ -3381,6 +3381,7 @@ dependencies = [
  "cucumber",
  "indexmap 1.9.3",
  "log",
+ "minotari",
  "minotari_app_grpc 5.3.0-pre.3",
  "minotari_app_utilities",
  "minotari_node",

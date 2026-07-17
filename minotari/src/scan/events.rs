@@ -150,12 +150,33 @@ pub enum ScanStatusEvent {
         last_scanned_height: u64,
         reason: PauseReason,
     },
+    FastSyncPhaseStarted {
+        account_id: i64,
+        phase: FastSyncPhase,
+        from_height: u64,
+        to_height: Option<u64>,
+    },
+    FastSyncPhaseCompleted {
+        account_id: i64,
+        phase: FastSyncPhase,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub enum PauseReason {
     MaxBlocksReached { limit: u64 },
     Cancelled,
+}
+
+/// Identifies which phase of a fast sync operation is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastSyncPhase {
+    /// Phase 1: Fast scan from birthday to (tip - safety_buffer), unspent UTXOs only.
+    FastUtxoScan,
+    /// Phase 2: Full scan of recent blocks from (tip - safety_buffer) to tip.
+    RecentFullScan,
+    /// Phase 3: Full history backfill from birthday to (tip - safety_buffer).
+    HistoryBackfill,
 }
 
 #[derive(Debug, Clone)]

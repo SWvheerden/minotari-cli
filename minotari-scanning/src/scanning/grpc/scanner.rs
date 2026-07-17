@@ -147,6 +147,7 @@ where
             batch_size: Some(100),
             request_timeout: self.timeout,
             exclude_spent: false,
+            exclude_inputs: false,
         })
     }
 
@@ -387,6 +388,7 @@ where
                 batch_size: config.batch_size,
                 request_timeout: config.request_timeout,
                 exclude_spent: config.exclude_spent,
+                exclude_inputs: config.exclude_inputs,
             };
             self.current_in_progress = InProgressScan::new(adjusted_config);
             return Ok(());
@@ -443,6 +445,7 @@ where
             .num_threads(self.number_processing_threads)
             .build()
             .map_err(|e| WalletError::ConfigurationError(format!("Failed to build thread pool: {e}")))?;
+        let config = config.clone();
         tokio::spawn(async move {
             loop {
                 let grpc_block_response = stream.message().await;
@@ -495,12 +498,17 @@ where
                         }
                     });
                 });
-                let inputs = tari_block
-                    .body
-                    .inputs()
-                    .iter()
-                    .map(tari_transaction_components::transaction_components::TransactionInput::output_hash)
-                    .collect();
+
+                let inputs = if config.exclude_inputs {
+                    Vec::new()
+                } else {
+                    tari_block
+                        .body
+                        .inputs()
+                        .iter()
+                        .map(tari_transaction_components::transaction_components::TransactionInput::output_hash)
+                        .collect()
+                };
 
                 let block_res = BlockScanResult {
                     height: tari_block.header.height,

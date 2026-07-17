@@ -7,6 +7,10 @@ pub enum OutputStatus {
     Unspent,
     Locked,
     Spent,
+    /// Output discovered during fast sync backfill that is known to be spent
+    /// but whose spending input has not yet been processed. Once the backfill
+    /// processes the corresponding input, the status transitions to `Spent`.
+    SpentUnconfirmed,
 }
 
 impl std::fmt::Display for OutputStatus {
@@ -15,6 +19,7 @@ impl std::fmt::Display for OutputStatus {
             OutputStatus::Unspent => write!(f, "UNSPENT"),
             OutputStatus::Locked => write!(f, "LOCKED"),
             OutputStatus::Spent => write!(f, "SPENT"),
+            OutputStatus::SpentUnconfirmed => write!(f, "SPENT_UNCONFIRMED"),
         }
     }
 }
@@ -27,6 +32,7 @@ impl FromStr for OutputStatus {
             "UNSPENT" => Ok(OutputStatus::Unspent),
             "LOCKED" => Ok(OutputStatus::Locked),
             "SPENT" => Ok(OutputStatus::Spent),
+            "SPENT_UNCONFIRMED" => Ok(OutputStatus::SpentUnconfirmed),
             _ => Err(format!("Invalid OutputStatus: {}", s)),
         }
     }

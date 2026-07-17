@@ -348,4 +348,64 @@ impl Scanner {
         let future = self.run_internal(event_sender);
         (rx, future)
     }
+
+    /// Runs the history backfill phase independently.
+    ///
+    /// This scans from each account's birthday to `backfill_to_height` using full
+    /// block processing with idempotent inserts. Newly discovered outputs are marked
+    /// `SpentUnconfirmed` and then verified against the base node.
+    ///
+    /// Call this after a fast sync has completed and the wallet is already usable.
+    /// The backfill fills in complete transaction history (spent outputs, inputs,
+    /// balance changes) for the period that was fast-synced.
+    pub async fn run_backfill(self, backfill_to_height: u64) -> Result<(Vec<WalletEvent>, bool), ScanError> {
+        self.run_backfill_internal(backfill_to_height, NoopEventSender).await
+    }
+
+    /// Runs the history backfill with real-time event streaming.
+    #[allow(clippy::type_complexity)]
+    pub fn run_backfill_with_events(
+        self,
+        backfill_to_height: u64,
+    ) -> (
+        mpsc::UnboundedReceiver<ProcessingEvent>,
+        impl std::future::Future<Output = Result<(Vec<WalletEvent>, bool), ScanError>>,
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let event_sender = ChannelEventSender::new(tx);
+        let future = self.run_backfill_internal(backfill_to_height, event_sender);
+        (rx, future)
+    }
+
+    async fn run_backfill_internal<E: EventSender + Clone + Send + 'static>(
+        self,
+        backfill_to_height: u64,
+        event_sender: E,
+    ) -> Result<(Vec<WalletEvent>, bool), ScanError> {
+        let pool = db::init_db(self.database_file.clone())?;
+        let conn = pool.get().map_err(|e| ScanError::DbError(e.into()))?;
+
+        let accounts = db::get_accounts(&conn, self.account_name.as_deref())?;
+        let coordinator = ScanCoordinator::new(
+            pool,
+            self.base_url,
+            event_sender,
+            self.retry_config,
+            self.required_confirmations,
+            self.webhook_config,
+            self.processing_threads,
+            self.reorg_check_interval,
+            self.batch_size,
+        )?;
+
+        coordinator
+            .run_backfill(
+                accounts,
+                &self.password,
+                backfill_to_height,
+                self.scanning_offset,
+                self.cancel_token,
+            )
+            .await
+    }
 }

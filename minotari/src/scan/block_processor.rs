@@ -94,8 +94,11 @@ pub struct BlockProcessor<E: EventSender = NoopEventSender> {
     has_pending_outbound: bool,
     /// Required confirmations
     required_confirmations: u64,
-    /// Webhook Configuration                                                                                        
+    /// Webhook Configuration
     webhook_config: Option<WebhookTriggerConfig>,
+    /// When true, uses OR IGNORE inserts for outputs/inputs/balance_changes
+    /// to skip already-existing records during history backfill (Phase 3 of FastSync).
+    backfill_mode: bool,
 }
 
 impl BlockProcessor<NoopEventSender> {
@@ -120,6 +123,7 @@ impl BlockProcessor<NoopEventSender> {
             has_pending_outbound: false,
             required_confirmations,
             webhook_config: None,
+            backfill_mode: false,
         }
     }
 }
@@ -153,6 +157,7 @@ impl<E: EventSender> BlockProcessor<E> {
             has_pending_outbound,
             required_confirmations,
             webhook_config: None,
+            backfill_mode: false,
         }
     }
 
@@ -179,6 +184,12 @@ impl<E: EventSender> BlockProcessor<E> {
     /// Sets webhook config
     pub fn set_webhook_config(&mut self, config: Option<WebhookTriggerConfig>) {
         self.webhook_config = config;
+    }
+
+    /// Enables or disables backfill mode for history backfill (Phase 3 of FastSync).
+    /// In backfill mode, outputs and inputs use OR IGNORE inserts to skip duplicates.
+    pub fn set_backfill_mode(&mut self, value: bool) {
+        self.backfill_mode = value;
     }
 
     /// Processes a single scanned block.
@@ -327,6 +338,46 @@ impl<E: EventSender> BlockProcessor<E> {
 
             let memo = MemoInfo::from_output(output);
 
+            // Compute the payment reference from block hash and output hash
+            let payment_reference = generate_payment_reference(&block.block_hash, hash);
+
+            let is_burn = output.is_burned();
+
+            let output_id = if self.backfill_mode {
+                match db::insert_spent_output_if_not_exists(
+                    tx,
+                    account_id,
+                    account_view_key,
+                    hash.to_vec(),
+                    output,
+                    block.height,
+                    &block.block_hash,
+                    block.mined_timestamp,
+                    memo.parsed.clone(),
+                    memo.hex.clone(),
+                    payment_reference,
+                    is_burn,
+                )? {
+                    Some(id) => id,
+                    None => continue, // Output already exists, skip events and balance changes
+                }
+            } else {
+                db::insert_output(
+                    tx,
+                    account_id,
+                    account_view_key,
+                    hash.to_vec(),
+                    output,
+                    block.height,
+                    &block.block_hash,
+                    block.mined_timestamp,
+                    memo.parsed.clone(),
+                    memo.hex.clone(),
+                    payment_reference,
+                    is_burn,
+                )?
+            };
+
             info!(
                 target: "audit",
                 account_id = account_id,
@@ -338,26 +389,6 @@ impl<E: EventSender> BlockProcessor<E> {
 
             let event = self.make_output_detected_event(account_id, *hash, block, &memo);
             self.wallet_events.push(event.clone());
-
-            // Compute the payment reference from block hash and output hash
-            let payment_reference = generate_payment_reference(&block.block_hash, hash);
-
-            let is_burn = output.is_burned();
-
-            let output_id = db::insert_output(
-                tx,
-                account_id,
-                account_view_key,
-                hash.to_vec(),
-                output,
-                block.height,
-                &block.block_hash,
-                block.mined_timestamp,
-                memo.parsed.clone(),
-                memo.hex.clone(),
-                payment_reference,
-                is_burn,
-            )?;
 
             let event_id = db::insert_wallet_event(tx, account_id, &event)?;
             generated_events.push((event_id, event));
@@ -418,7 +449,11 @@ impl<E: EventSender> BlockProcessor<E> {
     ) -> Result<BalanceChange, BlockProcessorError> {
         let change = make_balance_change_for_output(account_id, output_id, block.mined_timestamp, block.height, output);
 
-        db::insert_balance_change(tx, &change)?;
+        if self.backfill_mode {
+            db::insert_balance_change_if_not_exists(tx, &change)?;
+        } else {
+            db::insert_balance_change(tx, &change)?;
+        }
 
         Ok(change)
     }
@@ -513,7 +548,11 @@ impl<E: EventSender> BlockProcessor<E> {
             is_reversed: false,
         };
 
-        db::insert_balance_change(tx, &change)?;
+        if self.backfill_mode {
+            db::insert_balance_change_if_not_exists(tx, &change)?;
+        } else {
+            db::insert_balance_change(tx, &change)?;
+        }
         Ok(change)
     }
 

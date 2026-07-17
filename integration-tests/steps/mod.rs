@@ -8,6 +8,7 @@ pub mod base_node;
 pub mod burn;
 pub mod common;
 pub mod daemon;
+pub mod fast_sync;
 pub mod fund_locking;
 pub mod load_testing;
 pub mod payref_history;
