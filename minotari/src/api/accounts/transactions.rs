@@ -50,11 +50,11 @@ use super::params::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, PaginationParams, Payref
 ///
 /// ```bash
 /// # Get first 50 completed transactions (default)
-/// curl -X GET http://localhost:8080/accounts/default/completed_transactions \
+/// curl -X GET http://127.0.0.1:9000/accounts/default/completed_transactions \
 ///   -H "Authorization: Bearer $MINOTARI_API_TOKEN"
 ///
 /// # Get 100 transactions starting from offset 50
-/// curl -X GET "http://localhost:8080/accounts/default/completed_transactions?limit=100&offset=50" \
+/// curl -X GET "http://127.0.0.1:9000/accounts/default/completed_transactions?limit=100&offset=50" \
 ///   -H "Authorization: Bearer $MINOTARI_API_TOKEN"
 /// ```
 ///
@@ -171,11 +171,11 @@ pub async fn api_get_completed_transactions(
 ///
 /// ```bash
 /// # Get first 50 displayed transactions (default)
-/// curl -X GET http://localhost:8080/accounts/default/displayed_transactions \
+/// curl -X GET http://127.0.0.1:9000/accounts/default/displayed_transactions \
 ///   -H "Authorization: Bearer $MINOTARI_API_TOKEN"
 ///
 /// # Get 100 transactions starting from offset 50
-/// curl -X GET "http://localhost:8080/accounts/default/displayed_transactions?limit=100&offset=50" \
+/// curl -X GET "http://127.0.0.1:9000/accounts/default/displayed_transactions?limit=100&offset=50" \
 ///   -H "Authorization: Bearer $MINOTARI_API_TOKEN"
 /// ```
 #[utoipa::path(
@@ -255,7 +255,7 @@ pub async fn api_get_displayed_transactions(
 /// # Example Request
 ///
 /// ```bash
-/// curl -X GET http://localhost:8080/accounts/default/completed_transactions/by_payref/my-payment-ref-123 \
+/// curl -X GET http://127.0.0.1:9000/accounts/default/completed_transactions/by_payref/my-payment-ref-123 \
 ///   -H "Authorization: Bearer $MINOTARI_API_TOKEN"
 /// ```
 #[utoipa::path(
@@ -352,7 +352,7 @@ pub async fn api_get_completed_transaction_by_payref(
 /// # Example Request
 ///
 /// ```bash
-/// curl -X GET http://localhost:8080/accounts/default/displayed_transactions/by_payref/my-payment-ref-123 \
+/// curl -X GET http://127.0.0.1:9000/accounts/default/displayed_transactions/by_payref/my-payment-ref-123 \
 ///   -H "Authorization: Bearer $MINOTARI_API_TOKEN"
 /// ```
 #[utoipa::path(

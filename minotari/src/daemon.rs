@@ -84,8 +84,17 @@ pub struct ApiServerConfig {
 
 impl ApiServerConfig {
     /// Socket address to bind, as `<address>:<port>`.
+    ///
+    /// A bare IPv6 address is wrapped in brackets, since `::1:9000` is itself a
+    /// valid IPv6 address and would otherwise be parsed as one rather than as an
+    /// address and a port.
     fn socket_addr(&self) -> String {
-        format!("{}:{}", self.bind_address, self.port)
+        let address = self.host();
+        if address.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("[{}]:{}", address, self.port)
+        } else {
+            format!("{}:{}", address, self.port)
+        }
     }
 
     /// Whether the API will be reachable from outside this host.
@@ -93,10 +102,20 @@ impl ApiServerConfig {
     /// A hostname that does not parse as an IP is treated as network-exposed:
     /// it resolves through DNS and we cannot assume it is loopback.
     fn is_network_exposed(&self) -> bool {
-        match self.bind_address.parse::<std::net::IpAddr>() {
+        match self.host().parse::<std::net::IpAddr>() {
             Ok(ip) => !ip.is_loopback(),
             Err(_) => true,
         }
+    }
+
+    /// The configured address with any surrounding IPv6 brackets removed, so
+    /// `::1` and `[::1]` are treated as the same address.
+    fn host(&self) -> &str {
+        let address = self.bind_address.trim();
+        address
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .unwrap_or(address)
     }
 }
 
@@ -453,5 +472,25 @@ mod tests {
     #[test]
     fn socket_addr_joins_address_and_port() {
         assert_eq!(config("127.0.0.1").socket_addr(), "127.0.0.1:9000");
+        assert_eq!(config("localhost").socket_addr(), "localhost:9000");
+    }
+
+    #[test]
+    fn socket_addr_brackets_ipv6_addresses() {
+        assert_eq!(config("::1").socket_addr(), "[::1]:9000");
+        assert_eq!(config("::").socket_addr(), "[::]:9000");
+        // Already bracketed input is left alone rather than double-wrapped.
+        assert_eq!(config("[::1]").socket_addr(), "[::1]:9000");
+    }
+
+    #[test]
+    fn socket_addr_parses_as_a_socket_address() {
+        for address in ["127.0.0.1", "0.0.0.0", "::1", "::"] {
+            let addr = config(address).socket_addr();
+            assert!(
+                addr.parse::<std::net::SocketAddr>().is_ok(),
+                "{addr} should parse as a socket address"
+            );
+        }
     }
 }

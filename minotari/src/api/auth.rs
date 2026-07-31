@@ -30,8 +30,8 @@
 //! # Disabling authentication
 //!
 //! `--api-disable-auth` (or `api_disable_auth = true` in `config.toml`) drops the
-//! token check entirely, leaving every endpoint - including the fund-moving ones
-//! - open to anyone who can reach the port. It defaults to `false` and is only
+//! token check entirely, leaving every endpoint open to anyone who can reach the
+//! port, including the fund-moving ones. It defaults to `false` and is only
 //! appropriate for local development against a throwaway wallet. Combined with a
 //! non-loopback `api_bind_address` it hands the wallet to the whole network, so
 //! the daemon warns loudly on both stderr and the audit log when it is used.
@@ -100,7 +100,12 @@ impl ApiToken {
     ///
     /// Returns [`ApiTokenError::TooShort`] if the secret is shorter than
     /// [`MIN_TOKEN_LEN`] characters.
+    /// Surrounding whitespace is stripped before the secret is hashed, matching
+    /// the trim applied to presented tokens. A stray space or newline in the
+    /// config file or environment would otherwise make every request fail with
+    /// nothing to point at.
     pub fn new(token: &str) -> Result<Self, ApiTokenError> {
+        let token = token.trim();
         if token.len() < MIN_TOKEN_LEN {
             return Err(ApiTokenError::TooShort(token.len()));
         }
@@ -294,6 +299,18 @@ mod tests {
         assert!(!token.matches("test-token-012345678"));
         assert!(!token.matches("test-token-0123456789 "));
         assert!(!token.matches(""));
+    }
+
+    #[test]
+    fn surrounding_whitespace_in_the_configured_token_is_ignored() {
+        // Presented tokens are trimmed, so a configured token with stray
+        // whitespace has to be trimmed too or it could never be matched.
+        let token = ApiToken::new(&format!("  {TEST_TOKEN}\n")).unwrap();
+        assert!(token.matches(TEST_TOKEN));
+
+        // Trimming applies to the length check as well, so padding cannot be
+        // used to sneak a short token past the minimum.
+        assert!(matches!(ApiToken::new("  short  "), Err(ApiTokenError::TooShort(5))));
     }
 
     #[test]

@@ -31,15 +31,15 @@
 //!
 //! ```bash
 //! # Get account balance
-//! curl -X GET http://localhost:8080/accounts/default/balance \
+//! curl -X GET http://127.0.0.1:9000/accounts/default/balance \
 //!   -H "Authorization: Bearer $MINOTARI_API_TOKEN"
 //!
 //! # Get wallet events
-//! curl -X GET http://localhost:8080/accounts/default/events \
+//! curl -X GET http://127.0.0.1:9000/accounts/default/events \
 //!   -H "Authorization: Bearer $MINOTARI_API_TOKEN"
 //!
 //! # Lock funds for a transaction
-//! curl -X POST http://localhost:8080/accounts/default/lock_funds \
+//! curl -X POST http://127.0.0.1:9000/accounts/default/lock_funds \
 //!   -H "Authorization: Bearer $MINOTARI_API_TOKEN" \
 //!   -H "Content-Type: application/json" \
 //!   -d '{"amount": 1000000}'
