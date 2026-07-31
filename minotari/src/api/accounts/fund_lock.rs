@@ -18,14 +18,22 @@ use crate::{
     db::get_account_by_name,
     log::mask_amount,
     transactions::{
-        fund_locker::FundLocker,
+        fund_locker::{FundLocker, MAX_SECONDS_TO_LOCK_UTXOS, validate_seconds_to_lock},
         one_sided_transaction::{OneSidedTransaction, Recipient},
     },
 };
 
 use super::params::{
-    WalletParams, confirmation_window_schema, default_fee_per_gram, default_num_outputs, default_seconds_to_lock_utxos,
+    DEFAULT_FEE_PER_GRAM, DEFAULT_NUM_OUTPUTS, DEFAULT_SECONDS_TO_LOCK_UTXOS, WalletParams, confirmation_window_schema,
+    default_fee_per_gram, default_num_outputs, default_seconds_to_lock_utxos,
 };
+
+/// `utoipa`'s `maximum = ..` only accepts a literal, so it cannot reference
+/// [`MAX_SECONDS_TO_LOCK_UTXOS`] directly. Fail the build if the two drift.
+const _: () = assert!(
+    MAX_SECONDS_TO_LOCK_UTXOS == 31_536_000,
+    "OpenAPI `maximum` annotations for seconds_to_lock_utxos must match MAX_SECONDS_TO_LOCK_UTXOS",
+);
 
 /// Request body for locking funds in preparation for a transaction.
 ///
@@ -88,10 +96,11 @@ pub struct LockFundsRequest {
 
     /// Duration in seconds to keep the UTXOs locked.
     ///
-    /// Defaults to 86,400 seconds (24 hours). After this period, locked UTXOs
-    /// are automatically released if the transaction was not completed.
+    /// Defaults to 86,400 seconds (24 hours) and may not exceed 31,536,000
+    /// seconds (365 days). After this period, locked UTXOs are automatically
+    /// released if the transaction was not completed.
     #[serde(default = "default_seconds_to_lock_utxos")]
-    #[schema(default = "86400")]
+    #[schema(default = "86400", maximum = 31_536_000)]
     pub seconds_to_lock_utxos: Option<u64>,
 
     /// Optional idempotency key to prevent duplicate requests.
@@ -181,12 +190,12 @@ pub struct CreateTransactionRequest {
 
     /// Duration in seconds to keep the input UTXOs locked.
     ///
-    /// Defaults to 86,400 seconds (24 hours). The lock prevents the same UTXOs
-    /// from being used in multiple transactions while the unsigned transaction
-    /// is being signed and broadcast.
-
+    /// Defaults to 86,400 seconds (24 hours) and may not exceed 31,536,000
+    /// seconds (365 days). The lock prevents the same UTXOs from being used in
+    /// multiple transactions while the unsigned transaction is being signed and
+    /// broadcast.
     #[serde(default = "default_seconds_to_lock_utxos")]
-    #[schema(default = "86400")]
+    #[schema(default = "86400", maximum = 31_536_000)]
     seconds_to_lock_utxos: Option<u64>,
 
     /// Optional idempotency key to prevent duplicate transactions.
@@ -273,6 +282,14 @@ pub async fn api_lock_funds(
     let name = name.clone();
     let default_confirmations = app_state.required_confirmations;
 
+    // An explicit `null` in the body bypasses `#[serde(default)]`, so fall back
+    // to the defaults here rather than unwrapping.
+    let num_outputs = body.num_outputs.unwrap_or(DEFAULT_NUM_OUTPUTS);
+    let fee_per_gram = body.fee_per_gram.unwrap_or(DEFAULT_FEE_PER_GRAM);
+    let seconds_to_lock_utxos = body.seconds_to_lock_utxos.unwrap_or(DEFAULT_SECONDS_TO_LOCK_UTXOS);
+    // Reject an out-of-range duration as a client error before doing any work.
+    validate_seconds_to_lock(seconds_to_lock_utxos)?;
+
     let response = tokio::task::spawn_blocking(move || {
         let conn = pool.get().map_err(|e| ApiError::DbError(e.to_string()))?;
 
@@ -286,11 +303,11 @@ pub async fn api_lock_funds(
             .lock(
                 account.id,
                 body.amount,
-                body.num_outputs.expect("must be defaulted"),
-                body.fee_per_gram.expect("must be defaulted"),
+                num_outputs,
+                fee_per_gram,
                 body.estimated_output_size,
                 body.idempotency_key,
-                body.seconds_to_lock_utxos.expect("must be defaulted"),
+                seconds_to_lock_utxos,
                 confirmation_window,
             )
             .map_err(|e| ApiError::FailedToLockFunds(e.to_string()))
@@ -400,6 +417,10 @@ pub async fn api_create_unsigned_transaction(
         })
         .collect();
 
+    let seconds_to_lock_utxos = body.seconds_to_lock_utxos.unwrap_or(DEFAULT_SECONDS_TO_LOCK_UTXOS);
+    // Reject an out-of-range duration as a client error before doing any work.
+    validate_seconds_to_lock(seconds_to_lock_utxos)?;
+
     let result = tokio::task::spawn_blocking(move || {
         let conn = pool.get().map_err(|e| ApiError::DbError(e.to_string()))?;
 
@@ -411,7 +432,6 @@ pub async fn api_create_unsigned_transaction(
         let num_outputs = recipients.len();
         let fee_per_gram = MicroMinotari(5);
         let estimated_output_size = None;
-        let seconds_to_lock_utxos = body.seconds_to_lock_utxos.unwrap_or(86400); // 24 hours
 
         let confirmation_window = body.confirmation_window.unwrap_or(default_confirmations);
         let lock_amount = FundLocker::new(pool.clone());
