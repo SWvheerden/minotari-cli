@@ -112,9 +112,9 @@ pub enum Commands {
     /// - View key (private) and spend key (public)
     /// - Tari address for receiving funds
     ///
-    /// The output file can be encrypted with a password using XChaCha20-Poly1305.
-    /// If no password is provided, keys are stored in plaintext (not recommended
-    /// for production use).
+    /// The output file can be encrypted with a password using XChaCha20-Poly1305, keyed by an
+    /// Argon2id derivation of the password. If no password is provided, keys are stored in
+    /// plaintext (not recommended for production use).
     ///
     /// # Output Format
     ///
@@ -124,7 +124,9 @@ pub enum Commands {
     /// - `spend_key` / `encrypted_spend_key`: Public spend key
     /// - `seed_words` / `encrypted_seed_words`: Mnemonic recovery phrase
     /// - `birthday`: Block height when wallet was created
-    /// - `nonce`: (encrypted only) Encryption nonce
+    /// - `salt`: (encrypted only) Argon2id salt for the key derivation
+    /// - `view_key_nonce`, `spend_key_nonce`, `seed_words_nonce`: (encrypted only) the
+    ///   per-field encryption nonces. Each field has its own; they are never shared.
     CreateAddress {
         #[arg(short, long, help = "Password to encrypt the wallet file")]
         password: Option<String>,

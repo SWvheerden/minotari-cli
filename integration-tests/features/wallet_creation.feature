@@ -16,7 +16,7 @@ Feature: Wallet Creation
     And the wallet should contain encrypted view key
     And the wallet should contain encrypted spend key
     And the wallet should contain encrypted seed words
-    And the wallet should contain a nonce
+    And the wallet should contain a salt and a distinct nonce per encrypted field
 
   Scenario: Create wallet with custom output file
     When I create a new address with output file "custom_wallet.json"
