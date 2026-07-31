@@ -20,8 +20,17 @@ pub fn insert_balance_change(conn: &Connection, change: &BalanceChange) -> Walle
     let balance_credit = change.balance_credit.as_u64() as i64;
     let balance_debit = change.balance_debit.as_u64() as i64;
     let effective_height = change.effective_height as i64;
-    let claimed_fee = change.claimed_fee.map(|v| v.as_u64() as i64);
-    let claimed_amount = change.claimed_amount.map(|v| v.as_u64() as i64);
+    // Unlike the credit/debit above, these two come from the sender-controlled memo and are never validated against
+    // the commitment, so they can be any u64. SQLite integers are signed, and a wrapping `as i64` cast would persist a
+    // negative that no longer deserialises back into `MicroMinotari`, breaking every later read of this account's
+    // balance changes. Saturate instead: these are unverified claims kept for display only, and no real amount comes
+    // anywhere near `i64::MAX`.
+    let claimed_fee = change
+        .claimed_fee
+        .map(|v| i64::try_from(v.as_u64()).unwrap_or(i64::MAX));
+    let claimed_amount = change
+        .claimed_amount
+        .map(|v| i64::try_from(v.as_u64()).unwrap_or(i64::MAX));
 
     conn.execute(
         r#"
@@ -275,4 +284,71 @@ pub fn mark_balance_change_as_reversed(conn: &Connection, balance_change_id: i64
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{create_account, get_account_by_name, init_db};
+    use chrono::Utc;
+    use tari_common_types::seeds::cipher_seed::CipherSeed;
+    use tari_transaction_components::MicroMinotari;
+    use tari_transaction_components::key_manager::wallet_types::{SeedWordsWallet, WalletType};
+    use tempfile::tempdir;
+
+    fn create_test_account(conn: &Connection) -> i64 {
+        let seeds = CipherSeed::random();
+        let wallet = WalletType::SeedWords(SeedWordsWallet::construct_new(seeds).unwrap());
+        create_account(conn, "default", &wallet, "password").unwrap();
+        get_account_by_name(conn, "default").unwrap().unwrap().id
+    }
+
+    fn credit_change(account_id: i64, claimed_amount: u64, claimed_fee: u64) -> BalanceChange {
+        BalanceChange {
+            account_id,
+            caused_by_output_id: None,
+            caused_by_input_id: None,
+            description: "test".to_string(),
+            balance_credit: MicroMinotari::from(1),
+            balance_debit: MicroMinotari::from(0),
+            effective_date: Utc::now().naive_utc(),
+            effective_height: 50,
+            claimed_recipient_address: None,
+            claimed_sender_address: None,
+            memo_parsed: None,
+            memo_hex: None,
+            claimed_fee: Some(MicroMinotari::from(claimed_fee)),
+            claimed_amount: Some(MicroMinotari::from(claimed_amount)),
+            is_reversal: false,
+            reversal_of_balance_change_id: None,
+            is_reversed: false,
+        }
+    }
+
+    fn stored_claims(conn: &Connection, id: i64) -> (i64, i64) {
+        conn.query_row(
+            "SELECT claimed_amount, claimed_fee FROM balance_changes WHERE id = :id",
+            named_params! { ":id": id },
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read back claims")
+    }
+
+    #[test]
+    fn hostile_claimed_amount_is_never_stored_negative() {
+        // `claimed_amount`/`claimed_fee` are copied out of a sender-controlled memo without validation, so they can be
+        // any u64. SQLite integers are signed, so a wrapping cast would persist a negative — a value that is not a
+        // valid `MicroMinotari` and that no reader can make sense of.
+        let temp = tempdir().expect("temp dir");
+        let pool = init_db(temp.path().join("claims.db")).expect("init db");
+        let conn = pool.get().expect("conn");
+        let account_id = create_test_account(&conn);
+
+        let hostile = insert_balance_change(&conn, &credit_change(account_id, u64::MAX, u64::MAX)).expect("insert");
+        assert_eq!(stored_claims(&conn, hostile), (i64::MAX, i64::MAX));
+
+        // Ordinary claims are still stored exactly.
+        let ordinary = insert_balance_change(&conn, &credit_change(account_id, 1_234, 56)).expect("insert");
+        assert_eq!(stored_claims(&conn, ordinary), (1_234, 56));
+    }
 }
