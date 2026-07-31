@@ -232,6 +232,7 @@ pub struct CreateTransactionRequest {
 ///
 /// ```bash
 /// curl -X POST http://localhost:8080/accounts/default/lock_funds \
+///   -H "Authorization: Bearer $MINOTARI_API_TOKEN" \
 ///   -H "Content-Type: application/json" \
 ///   -d '{"amount": 1000000, "num_outputs": 1}'
 /// ```
@@ -334,6 +335,7 @@ pub async fn api_lock_funds(
 ///
 /// ```bash
 /// curl -X POST http://localhost:8080/accounts/default/create_unsigned_transaction \
+///   -H "Authorization: Bearer $MINOTARI_API_TOKEN" \
 ///   -H "Content-Type: application/json" \
 ///   -d '{
 ///     "recipients": [

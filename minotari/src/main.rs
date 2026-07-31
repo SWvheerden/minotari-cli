@@ -56,11 +56,11 @@ use clap::Parser;
 use log::info;
 use minotari::{
     ScanError,
-    api::accounts::LockFundsRequest,
+    api::{ApiAuth, accounts::LockFundsRequest, auth::API_TOKEN_ENV_VAR, resolve_api_token},
     cli::{ApplyArgs, Cli, Commands, DaemonArgs},
     commands::{burn::handle_burn_funds, validator_nodes},
     config::{defaults::WalletConfig, loader::load_configuration},
-    daemon,
+    daemon::{self, ApiServerConfig},
     db::{self, WalletDbError, get_accounts, get_balance, init_db},
     log::{init_logging, mask_string},
     migrate::{MigrationOptions, run_migration},
@@ -341,15 +341,52 @@ async fn main() -> Result<(), anyhow::Error> {
             db,
             scan_interval_secs,
             api_port,
+            api_bind_address,
+            api_token,
+            api_disable_auth,
         } => {
             info!("Starting Tari wallet daemon...");
 
             wallet_config.apply_node(&node);
             wallet_config.apply_database(&db);
+            // Kept separate so the precedence stays CLI > environment > config file;
+            // `apply_daemon` folds the CLI value into the config, which would otherwise
+            // make the two indistinguishable.
+            let cli_api_token = api_token.clone();
             wallet_config.apply_daemon(&DaemonArgs {
                 scan_interval_secs,
                 api_port,
+                api_bind_address,
+                api_token,
+                api_disable_auth,
             });
+
+            // Disabling authentication wins over any configured token: it is the more
+            // explicit instruction, and resolving a token here would only mislead the
+            // operator into thinking it is being enforced.
+            let api_auth = if wallet_config.api_disable_auth {
+                ApiAuth::Disabled
+            } else {
+                let (api_token, generated_token) =
+                    resolve_api_token(cli_api_token.as_deref(), wallet_config.api_token.as_deref())?;
+                if let Some(token) = &generated_token {
+                    // Printed rather than logged: the log file is long-lived and often
+                    // shipped elsewhere, and this secret unlocks fund-moving endpoints.
+                    eprintln!(
+                        "\n\
+                         ============================================================\n\
+                         No API token configured, so one was generated for this run:\n\
+                         \n    {token}\n\n\
+                         Send it with every API request:\n\
+                         \n    Authorization: Bearer {token}\n\n\
+                         Set {API_TOKEN_ENV_VAR} or `api_token` in config.toml to keep\n\
+                         a stable token across restarts.\n\
+                         ============================================================\n",
+                        token = token.as_str()
+                    );
+                }
+                ApiAuth::Required(api_token)
+            };
 
             let webhook_url = wallet_config.webhook.url.clone();
             let webhook_secret = wallet_config.webhook.secret.clone();
@@ -364,7 +401,11 @@ async fn main() -> Result<(), anyhow::Error> {
                 max_blocks_to_scan,
                 wallet_config.batch_size,
                 wallet_config.scan_interval_secs,
-                wallet_config.api_port,
+                ApiServerConfig {
+                    bind_address: wallet_config.api_bind_address,
+                    port: wallet_config.api_port,
+                    auth: api_auth,
+                },
                 wallet_config.network,
                 wallet_config.confirmation_window,
                 webhook_url,

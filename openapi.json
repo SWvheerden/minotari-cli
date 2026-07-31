@@ -3,10 +3,14 @@
   "info": {
     "title": "minotari",
     "description": "",
-    "license": {
-      "name": ""
+    "contact": {
+      "name": "The Tari Development Community"
     },
-    "version": "0.1.0"
+    "license": {
+      "name": "BSD-3-Clause",
+      "identifier": "BSD-3-Clause"
+    },
+    "version": "0.2.0"
   },
   "paths": {
     "/accounts/{name}/address": {
@@ -68,7 +72,7 @@
           "accounts"
         ],
         "summary": "Creates a Tari address with an embedded payment ID for a specified account.",
-        "description": "Generates a new address that includes a payment ID, which can be used to\nidentify specific transactions or invoices. When someone sends funds to\nthis address, the payment ID will be included in the transaction.\n\n# Path Parameters\n\n- `name`: The unique account name\n\n# Request Body\n\nSee [`CreatePaymentIdAddressRequest`] for the complete request schema.\n\n# Response\n\nReturns an [`AddressWithPaymentIdResponse`] object containing:\n- The address with embedded payment ID in Base58 encoding\n- The emoji ID representation\n- The original payment ID\n\n# Errors\n\n- [`ApiError::AccountNotFound`]: The specified account does not exist\n- [`ApiError::DbError`]: Database connection or query failure\n- [`ApiError::InternalServerError`]: Failed to generate the address\n\n# Example Request\n\n```bash\ncurl -X POST http://localhost:8080/accounts/default/address_with_payment_id \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"payment_id\": \"696e766f6963652d3132333435\"}'\n```\n\n# Example Response\n\n```json\n{\n  \"address\": \"f4FxMqKAPDMqAjh6hTpCnLKfEu3MmS7NRu2YmKZPvZHc2K\",\n  \"emoji_id\": \"🎉🌟🚀...\",\n  \"payment_id_hex\": \"696e766f6963652d3132333435\"\n}\n```",
+        "description": "Generates a new address that includes a payment ID, which can be used to\nidentify specific transactions or invoices. When someone sends funds to\nthis address, the payment ID will be included in the transaction.\n\n# Path Parameters\n\n- `name`: The unique account name\n\n# Request Body\n\nSee [`CreatePaymentIdAddressRequest`] for the complete request schema.\n\n# Response\n\nReturns an [`AddressWithPaymentIdResponse`] object containing:\n- The address with embedded payment ID in Base58 encoding\n- The emoji ID representation\n- The original payment ID\n\n# Errors\n\n- [`ApiError::AccountNotFound`]: The specified account does not exist\n- [`ApiError::DbError`]: Database connection or query failure\n- [`ApiError::InternalServerError`]: Failed to generate the address\n\n# Example Request\n\n```bash\ncurl -X POST http://localhost:8080/accounts/default/address_with_payment_id \\\n  -H \"Authorization: Bearer $MINOTARI_API_TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"payment_id\": \"696e766f6963652d3132333435\"}'\n```\n\n# Example Response\n\n```json\n{\n  \"address\": \"f4FxMqKAPDMqAjh6hTpCnLKfEu3MmS7NRu2YmKZPvZHc2K\",\n  \"emoji_id\": \"🎉🌟🚀...\",\n  \"payment_id_hex\": \"696e766f6963652d3132333435\"\n}\n```",
         "operationId": "api_create_address_with_payment_id",
         "parameters": [
           {
@@ -188,13 +192,86 @@
         }
       }
     },
+    "/accounts/{name}/burn": {
+      "post": {
+        "tags": [
+          "accounts"
+        ],
+        "summary": "Burns funds from an account and records a partial burn proof for L2 claiming.",
+        "description": "Creates a burn transaction, broadcasts it, and stores the partial proof in the\ndatabase. The daemon's `BurnProofWorker` will automatically fetch the kernel\nmerkle proof once the transaction is confirmed and write the complete\n`CompleteClaimBurnProof` JSON file to the configured `burn_proofs_dir`.\n\n# Path Parameters\n\n- `name`: The account to burn funds from\n\n# Request Body\n\nSee [`BurnFundsRequest`] for the complete schema.\n\n# Response\n\nReturns a [`BurnFundsResponse`] with:\n- `tx_id`: the transaction ID\n- `output_hash`: hex-encoded output hash (use this to identify the proof file)\n\n# Errors\n\n- `400 Bad Request`: invalid `claim_public_key` or `sidechain_deployment_key` hex\n- `404 Not Found`: account does not exist\n- `500`: insufficient funds, broadcast failure, or other internal error\n\n# Example Request\n\n```bash\ncurl -X POST http://localhost:9000/accounts/default/burn \\\n  -H \"Authorization: Bearer $MINOTARI_API_TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"amount\": 1000000, \"claim_public_key\": \"a3f9...\"}'\n```",
+        "operationId": "api_burn_funds",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Name of the account to burn from",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BurnFundsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Burn transaction broadcast successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BurnFundsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request parameters",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Account not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Burn failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/accounts/{name}/completed_transactions": {
       "get": {
         "tags": [
           "accounts"
         ],
         "summary": "Retrieves completed transactions for a specified account with pagination.",
-        "description": "Returns a paginated list of completed transactions for the account, including\ntheir status, mined block information, and confirmation details. Transactions\nare ordered by creation time (most recent first).\n\n# Path Parameters\n\n- `name`: The unique account name to query\n\n# Query Parameters\n\n- `limit`: Maximum number of transactions to return (default: 50, max: 1000)\n- `offset`: Number of transactions to skip for pagination (default: 0)\n\n# Response\n\nReturns a list of [`CompletedTransactionResponse`] objects, each containing:\n- Transaction ID and status\n- Kernel excess (hex encoded)\n- Mining and confirmation details\n- Creation and update timestamps\n\n# Errors\n\n- [`ApiError::AccountNotFound`]: The specified account does not exist\n- [`ApiError::DbError`]: Database connection or query failure\n\n# Example Request\n\n```bash\n# Get first 50 completed transactions (default)\ncurl -X GET http://localhost:8080/accounts/default/completed_transactions\n\n# Get 100 transactions starting from offset 50\ncurl -X GET \"http://localhost:8080/accounts/default/completed_transactions?limit=100&offset=50\"\n```\n\n# Example Response\n\n```json\n[\n  {\n    \"id\": \"550e8400-e29b-41d4-a716-446655440000\",\n    \"pending_tx_id\": \"661e8400-e29b-41d4-a716-446655440001\",\n    \"account_id\": 1,\n    \"status\": \"mined_confirmed\",\n    \"last_rejected_reason\": null,\n    \"kernel_excess_hex\": \"abc123...\",\n    \"sent_payref\": \"payref-123\",\n    \"sent_output_hash\": \"def456...\",\n    \"mined_height\": 12345,\n    \"mined_block_hash_hex\": \"789abc...\",\n    \"confirmation_height\": 12350,\n    \"broadcast_attempts\": 1,\n    \"created_at\": \"2024-01-15T10:30:00Z\",\n    \"updated_at\": \"2024-01-15T10:35:00Z\"\n  }\n]\n```",
+        "description": "Returns a paginated list of completed transactions for the account, including\ntheir status, mined block information, and confirmation details. Transactions\nare ordered by creation time (most recent first).\n\n# Path Parameters\n\n- `name`: The unique account name to query\n\n# Query Parameters\n\n- `limit`: Maximum number of transactions to return (default: 50, max: 1000)\n- `offset`: Number of transactions to skip for pagination (default: 0)\n\n# Response\n\nReturns a list of [`CompletedTransactionResponse`] objects, each containing:\n- Transaction ID and status\n- Kernel excess (hex encoded)\n- Mining and confirmation details\n- Creation and update timestamps\n\n# Errors\n\n- [`ApiError::AccountNotFound`]: The specified account does not exist\n- [`ApiError::DbError`]: Database connection or query failure\n\n# Example Request\n\n```bash\n# Get first 50 completed transactions (default)\ncurl -X GET http://localhost:8080/accounts/default/completed_transactions \\\n  -H \"Authorization: Bearer $MINOTARI_API_TOKEN\"\n\n# Get 100 transactions starting from offset 50\ncurl -X GET \"http://localhost:8080/accounts/default/completed_transactions?limit=100&offset=50\" \\\n  -H \"Authorization: Bearer $MINOTARI_API_TOKEN\"\n```\n\n# Example Response\n\n```json\n[\n  {\n    \"id\": \"550e8400-e29b-41d4-a716-446655440000\",\n    \"pending_tx_id\": \"661e8400-e29b-41d4-a716-446655440001\",\n    \"account_id\": 1,\n    \"status\": \"mined_confirmed\",\n    \"last_rejected_reason\": null,\n    \"kernel_excess_hex\": \"abc123...\",\n    \"sent_payref\": \"payref-123\",\n    \"sent_output_hash\": \"def456...\",\n    \"mined_height\": 12345,\n    \"mined_block_hash_hex\": \"789abc...\",\n    \"confirmation_height\": 12350,\n    \"broadcast_attempts\": 1,\n    \"created_at\": \"2024-01-15T10:30:00Z\",\n    \"updated_at\": \"2024-01-15T10:35:00Z\"\n  }\n]\n```",
         "operationId": "api_get_completed_transactions",
         "parameters": [
           {
@@ -270,7 +347,7 @@
           "accounts"
         ],
         "summary": "Retrieves a completed transaction by its payment reference.",
-        "description": "Returns a completed transaction that matches the specified payment reference.\nThe payment reference is typically assigned when a transaction is confirmed\non the blockchain.\n\n# Path Parameters\n\n- `name`: The unique account name to query\n- `payref`: The payment reference to search for\n\n# Response\n\nReturns a [`CompletedTransactionResponse`] object if found, containing:\n- Transaction ID and status\n- Kernel excess (hex encoded)\n- Mining and confirmation details\n- Creation and update timestamps\n\n# Errors\n\n- [`ApiError::AccountNotFound`]: The specified account does not exist\n- [`ApiError::NotFound`]: No transaction found with the given payment reference\n- [`ApiError::DbError`]: Database connection or query failure\n\n# Example Request\n\n```bash\ncurl -X GET http://localhost:8080/accounts/default/completed_transactions/by_payref/my-payment-ref-123\n```",
+        "description": "Returns a completed transaction that matches the specified payment reference.\nThe payment reference is typically assigned when a transaction is confirmed\non the blockchain.\n\n# Path Parameters\n\n- `name`: The unique account name to query\n- `payref`: The payment reference to search for\n\n# Response\n\nReturns a [`CompletedTransactionResponse`] object if found, containing:\n- Transaction ID and status\n- Kernel excess (hex encoded)\n- Mining and confirmation details\n- Creation and update timestamps\n\n# Errors\n\n- [`ApiError::AccountNotFound`]: The specified account does not exist\n- [`ApiError::NotFound`]: No transaction found with the given payment reference\n- [`ApiError::DbError`]: Database connection or query failure\n\n# Example Request\n\n```bash\ncurl -X GET http://localhost:8080/accounts/default/completed_transactions/by_payref/my-payment-ref-123 \\\n  -H \"Authorization: Bearer $MINOTARI_API_TOKEN\"\n```",
         "operationId": "api_get_completed_transaction_by_payref",
         "parameters": [
           {
@@ -332,7 +409,7 @@
           "accounts"
         ],
         "summary": "Creates an unsigned one-sided transaction for external signing.",
-        "description": "This endpoint constructs a complete transaction ready for signing, including\ninput selection, output creation, and fee calculation. The transaction is\nreturned in an unsigned state, allowing it to be signed by an external\nkey management system or hardware wallet.\n\n# Path Parameters\n\n- `name`: The account name to send funds from\n\n# Request Body\n\nSee [`CreateTransactionRequest`] for the complete request schema.\n\n# Response\n\nReturns a JSON object containing the unsigned transaction data, including:\n- Transaction inputs (selected UTXOs)\n- Transaction outputs (recipient outputs and change)\n- Fee information\n- Data required for signing\n\n# Errors\n\n- [`ApiError::AccountNotFound`]: The specified account does not exist\n- [`ApiError::FailedToLockFunds`]: Insufficient funds or UTXO selection failure\n- [`ApiError::FailedCreateUnsignedTx`]: Transaction construction failure\n- [`ApiError::DbError`]: Database connection or query failure\n\n# Example\n\n```bash\ncurl -X POST http://localhost:8080/accounts/default/create_unsigned_transaction \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"recipients\": [\n      {\"address\": \"f4FxMqKAPDMqAjh6hTpC...\", \"amount\": 1000000}\n    ]\n  }'\n```\n\n# Workflow\n\n1. Client calls this endpoint to create an unsigned transaction\n2. Server locks required UTXOs and constructs the transaction\n3. Client signs the transaction externally\n4. Client broadcasts the signed transaction to the network\n\n# Notes\n\n- This creates a one-sided transaction (no recipient interaction required)\n- UTXOs are automatically locked for the configured duration\n- Fee is calculated at 5 MicroMinotari per gram\n- Change outputs are created automatically when necessary",
+        "description": "This endpoint constructs a complete transaction ready for signing, including\ninput selection, output creation, and fee calculation. The transaction is\nreturned in an unsigned state, allowing it to be signed by an external\nkey management system or hardware wallet.\n\n# Path Parameters\n\n- `name`: The account name to send funds from\n\n# Request Body\n\nSee [`CreateTransactionRequest`] for the complete request schema.\n\n# Response\n\nReturns a JSON object containing the unsigned transaction data, including:\n- Transaction inputs (selected UTXOs)\n- Transaction outputs (recipient outputs and change)\n- Fee information\n- Data required for signing\n\n# Errors\n\n- [`ApiError::AccountNotFound`]: The specified account does not exist\n- [`ApiError::FailedToLockFunds`]: Insufficient funds or UTXO selection failure\n- [`ApiError::FailedCreateUnsignedTx`]: Transaction construction failure\n- [`ApiError::DbError`]: Database connection or query failure\n\n# Example\n\n```bash\ncurl -X POST http://localhost:8080/accounts/default/create_unsigned_transaction \\\n  -H \"Authorization: Bearer $MINOTARI_API_TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"recipients\": [\n      {\"address\": \"f4FxMqKAPDMqAjh6hTpC...\", \"amount\": 1000000}\n    ]\n  }'\n```\n\n# Workflow\n\n1. Client calls this endpoint to create an unsigned transaction\n2. Server locks required UTXOs and constructs the transaction\n3. Client signs the transaction externally\n4. Client broadcasts the signed transaction to the network\n\n# Notes\n\n- This creates a one-sided transaction (no recipient interaction required)\n- UTXOs are automatically locked for the configured duration\n- Fee is calculated at 5 MicroMinotari per gram\n- Change outputs are created automatically when necessary",
         "operationId": "api_create_unsigned_transaction",
         "parameters": [
           {
@@ -405,7 +482,7 @@
           "accounts"
         ],
         "summary": "Retrieves displayed transactions for a specified account with pagination.",
-        "description": "Returns a paginated list of user-friendly transactions for the account,\nincluding incoming and outgoing transactions with their status, amounts,\nand blockchain information. Transactions are ordered by block height\n(most recent first).\n\n# Path Parameters\n\n- `name`: The unique account name to query\n\n# Query Parameters\n\n- `limit`: Maximum number of transactions to return (default: 50, max: 1000)\n- `offset`: Number of transactions to skip for pagination (default: 0)\n\n# Response\n\nReturns a list of [`DisplayedTransaction`] objects, each containing:\n- Transaction ID, direction (incoming/outgoing), and source\n- Status (pending, unconfirmed, confirmed, cancelled, etc.)\n- Amount and formatted display amount\n- Counterparty information (if available)\n- Blockchain details (block height, timestamp, confirmations)\n- Fee information (for outgoing transactions)\n- Detailed input/output information\n\n# Errors\n\n- [`ApiError::AccountNotFound`]: The specified account does not exist\n- [`ApiError::DbError`]: Database connection or query failure\n\n# Example Request\n\n```bash\n# Get first 50 displayed transactions (default)\ncurl -X GET http://localhost:8080/accounts/default/displayed_transactions\n\n# Get 100 transactions starting from offset 50\ncurl -X GET \"http://localhost:8080/accounts/default/displayed_transactions?limit=100&offset=50\"\n```\n\n# Example Response\n\n```json\n[\n  {\n    \"id\": \"tx-123\",\n    \"direction\": \"incoming\",\n    \"source\": \"transfer\",\n    \"status\": \"confirmed\",\n    \"amount\": 1000000,\n    \"amount_display\": \"1.000000 XTM\",\n    \"message\": null,\n    \"counterparty\": {\n      \"address\": \"f4FxMqKAPDMqAjh6hTpC...\",\n      \"address_emoji\": \"🎉🌟...\",\n      \"label\": null\n    },\n    \"blockchain\": {\n      \"block_height\": 12345,\n      \"timestamp\": \"2024-01-15T10:30:00\",\n      \"confirmations\": 10\n    },\n    \"fee\": null,\n    \"details\": {\n      \"account_id\": 1,\n      \"total_credit\": 1000000,\n      \"total_debit\": 0,\n      \"inputs\": [],\n      \"outputs\": [...]\n    }\n  }\n]\n```",
+        "description": "Returns a paginated list of user-friendly transactions for the account,\nincluding incoming and outgoing transactions with their status, amounts,\nand blockchain information. Transactions are ordered by block height\n(most recent first).\n\n# Path Parameters\n\n- `name`: The unique account name to query\n\n# Query Parameters\n\n- `limit`: Maximum number of transactions to return (default: 50, max: 1000)\n- `offset`: Number of transactions to skip for pagination (default: 0)\n\n# Response\n\nReturns a list of [`DisplayedTransaction`] objects, each containing:\n- Transaction ID, direction (incoming/outgoing), and source\n- Status (pending, unconfirmed, confirmed, cancelled, etc.)\n- Amount and formatted display amount\n- Counterparty information (if available)\n- Blockchain details (block height, timestamp, confirmations)\n- Fee information (for outgoing transactions)\n- Detailed input/output information\n\n# Errors\n\n- [`ApiError::AccountNotFound`]: The specified account does not exist\n- [`ApiError::DbError`]: Database connection or query failure\n\n# Example Request\n\n```bash\n# Get first 50 displayed transactions (default)\ncurl -X GET http://localhost:8080/accounts/default/displayed_transactions \\\n  -H \"Authorization: Bearer $MINOTARI_API_TOKEN\"\n\n# Get 100 transactions starting from offset 50\ncurl -X GET \"http://localhost:8080/accounts/default/displayed_transactions?limit=100&offset=50\" \\\n  -H \"Authorization: Bearer $MINOTARI_API_TOKEN\"\n```",
         "operationId": "api_get_displayed_transactions",
         "parameters": [
           {
@@ -481,7 +558,7 @@
           "accounts"
         ],
         "summary": "Retrieves displayed transactions by payment reference.",
-        "description": "Returns displayed transactions that contain the specified payment reference.\nThis searches within the payment references stored in each transaction.\n\n# Path Parameters\n\n- `name`: The unique account name to query\n- `payref`: The payment reference to search for\n\n# Response\n\nReturns a list of [`DisplayedTransaction`] objects that contain the payment reference.\n\n# Errors\n\n- [`ApiError::AccountNotFound`]: The specified account does not exist\n- [`ApiError::DbError`]: Database connection or query failure\n\n# Example Request\n\n```bash\ncurl -X GET http://localhost:8080/accounts/default/displayed_transactions/by_payref/my-payment-ref-123\n```",
+        "description": "Returns displayed transactions that contain the specified payment reference.\nThis searches within the payment references stored in each transaction.\n\n# Path Parameters\n\n- `name`: The unique account name to query\n- `payref`: The payment reference to search for\n\n# Response\n\nReturns a list of [`DisplayedTransaction`] objects that contain the payment reference.\n\n# Errors\n\n- [`ApiError::AccountNotFound`]: The specified account does not exist\n- [`ApiError::DbError`]: Database connection or query failure\n\n# Example Request\n\n```bash\ncurl -X GET http://localhost:8080/accounts/default/displayed_transactions/by_payref/my-payment-ref-123 \\\n  -H \"Authorization: Bearer $MINOTARI_API_TOKEN\"\n```",
         "operationId": "api_get_displayed_transactions_by_payref",
         "parameters": [
           {
@@ -546,7 +623,7 @@
           "accounts"
         ],
         "summary": "Estimates transaction fees based on current network conditions.",
-        "description": "Calculates fee estimates for Slow, Medium, and Fast priority levels by analyzing\nthe mempool state and selecting appropriate UTXOs for the requested amount.\n\n# Path Parameters\n\n- `name`: The account name to estimate fees for\n\n# Request Body\n\nSee [`EstimateFeeRequest`] for the complete request schema.\n\n# Response\n\nReturns a list of [`FeeEstimateResponse`] objects for different priorities.\n\n# Errors\n\n- [`ApiError::AccountNotFound`]: The specified account does not exist\n- [`ApiError::InternalServerError`]: Failed to query base node or calculate fees\n- [`ApiError::DbError`]: Database connection or query failure\n\n# Example Request\n\n```bash\ncurl -X POST http://localhost:8080/accounts/default/estimate_fees \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"amount\": 1000000}'\n```",
+        "description": "Calculates fee estimates for Slow, Medium, and Fast priority levels by analyzing\nthe mempool state and selecting appropriate UTXOs for the requested amount.\n\n# Path Parameters\n\n- `name`: The account name to estimate fees for\n\n# Request Body\n\nSee [`EstimateFeeRequest`] for the complete request schema.\n\n# Response\n\nReturns a list of [`FeeEstimateResponse`] objects for different priorities.\n\n# Errors\n\n- [`ApiError::AccountNotFound`]: The specified account does not exist\n- [`ApiError::InternalServerError`]: Failed to query base node or calculate fees\n- [`ApiError::DbError`]: Database connection or query failure\n\n# Example Request\n\n```bash\ncurl -X POST http://localhost:8080/accounts/default/estimate_fees \\\n  -H \"Authorization: Bearer $MINOTARI_API_TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"amount\": 1000000}'\n```",
         "operationId": "api_estimate_fees",
         "parameters": [
           {
@@ -622,7 +699,7 @@
           "accounts"
         ],
         "summary": "Retrieves wallet events for a specified account with pagination.",
-        "description": "Returns a paginated list of events that have occurred for the account, including\noutput detection, confirmation, transaction broadcasts, and blockchain\nreorganizations. Events are ordered by creation time (most recent first).\n\n# Path Parameters\n\n- `name`: The unique account name to query\n\n# Query Parameters\n\n- `limit`: Maximum number of events to return (default: 50, max: 1000)\n- `offset`: Number of events to skip for pagination (default: 0)\n\n# Response\n\nReturns a list of [`DbWalletEvent`] objects, each containing:\n- Event ID and type\n- Human-readable description\n- JSON data with event-specific details\n- Creation timestamp\n\n# Errors\n\n- [`ApiError::AccountNotFound`]: The specified account does not exist\n- [`ApiError::DbError`]: Database connection or query failure\n\n# Example Request\n\n```bash\n# Get first 50 events (default)\ncurl -X GET http://localhost:8080/accounts/default/events\n\n# Get 100 events starting from offset 50\ncurl -X GET \"http://localhost:8080/accounts/default/events?limit=100&offset=50\"\n```\n\n# Example Response\n\n```json\n[\n  {\n    \"id\": 42,\n    \"account_id\": 1,\n    \"event_type\": \"OutputDetected\",\n    \"description\": \"Detected output at height 12345\",\n    \"data_json\": \"{\\\"hash\\\":\\\"abc...\\\",\\\"block_height\\\":12345}\",\n    \"created_at\": \"2024-01-15T10:30:00\"\n  }\n]\n```",
+        "description": "Returns a paginated list of events that have occurred for the account, including\noutput detection, confirmation, transaction broadcasts, and blockchain\nreorganizations. Events are ordered by creation time (most recent first).\n\n# Path Parameters\n\n- `name`: The unique account name to query\n\n# Query Parameters\n\n- `limit`: Maximum number of events to return (default: 50, max: 1000)\n- `offset`: Number of events to skip for pagination (default: 0)\n\n# Response\n\nReturns a list of [`DbWalletEvent`] objects, each containing:\n- Event ID and type\n- Human-readable description\n- JSON data with event-specific details\n- Creation timestamp\n\n# Errors\n\n- [`ApiError::AccountNotFound`]: The specified account does not exist\n- [`ApiError::DbError`]: Database connection or query failure\n\n# Example Request\n\n```bash\n# Get first 50 events (default)\ncurl -X GET http://localhost:8080/accounts/default/events \\\n  -H \"Authorization: Bearer $MINOTARI_API_TOKEN\"\n\n# Get 100 events starting from offset 50\ncurl -X GET \"http://localhost:8080/accounts/default/events?limit=100&offset=50\" \\\n  -H \"Authorization: Bearer $MINOTARI_API_TOKEN\"\n```\n\n# Example Response\n\n```json\n[\n  {\n    \"id\": 42,\n    \"account_id\": 1,\n    \"event_type\": \"OutputDetected\",\n    \"description\": \"Detected output at height 12345\",\n    \"data_json\": \"{\\\"hash\\\":\\\"abc...\\\",\\\"block_height\\\":12345}\",\n    \"created_at\": \"2024-01-15T10:30:00\"\n  }\n]\n```",
         "operationId": "api_get_events",
         "parameters": [
           {
@@ -698,7 +775,7 @@
           "accounts"
         ],
         "summary": "Locks funds from an account for transaction preparation.",
-        "description": "This endpoint reserves UTXOs totaling at least the requested amount,\npreventing them from being used in other transactions. This is typically\nthe first step in creating a transaction, ensuring funds are available\nand reserved before constructing the transaction.\n\n# Path Parameters\n\n- `name`: The account name to lock funds from\n\n# Request Body\n\nSee [`LockFundsRequest`] for the complete request schema.\n\n# Response\n\nReturns a [`LockFundsResult`] containing:\n- The selected UTXOs to use as inputs\n- Whether a change output is required\n- Total value of locked UTXOs\n- Fee estimates with and without change\n\n# Errors\n\n- [`ApiError::AccountNotFound`]: The specified account does not exist\n- [`ApiError::FailedToLockFunds`]: Insufficient funds or UTXO selection failure\n- [`ApiError::DbError`]: Database connection or query failure\n\n# Example\n\n```bash\ncurl -X POST http://localhost:8080/accounts/default/lock_funds \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"amount\": 1000000, \"num_outputs\": 1}'\n```\n\n# Notes\n\n- Locked UTXOs are automatically released after the configured timeout\n- Use the `idempotency_key` to safely retry failed requests\n- The actual locked amount may exceed the requested amount due to UTXO granularity",
+        "description": "This endpoint reserves UTXOs totaling at least the requested amount,\npreventing them from being used in other transactions. This is typically\nthe first step in creating a transaction, ensuring funds are available\nand reserved before constructing the transaction.\n\n# Path Parameters\n\n- `name`: The account name to lock funds from\n\n# Request Body\n\nSee [`LockFundsRequest`] for the complete request schema.\n\n# Response\n\nReturns a [`LockFundsResult`] containing:\n- The selected UTXOs to use as inputs\n- Whether a change output is required\n- Total value of locked UTXOs\n- Fee estimates with and without change\n\n# Errors\n\n- [`ApiError::AccountNotFound`]: The specified account does not exist\n- [`ApiError::FailedToLockFunds`]: Insufficient funds or UTXO selection failure\n- [`ApiError::DbError`]: Database connection or query failure\n\n# Example\n\n```bash\ncurl -X POST http://localhost:8080/accounts/default/lock_funds \\\n  -H \"Authorization: Bearer $MINOTARI_API_TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"amount\": 1000000, \"num_outputs\": 1}'\n```\n\n# Notes\n\n- Locked UTXOs are automatically released after the configured timeout\n- Use the `idempotency_key` to safely retry failed requests\n- The actual locked amount may exceed the requested amount due to UTXO granularity",
         "operationId": "api_lock_funds",
         "parameters": [
           {
@@ -771,7 +848,7 @@
           "accounts"
         ],
         "summary": "Retrieves the scan status for a specified account.",
-        "description": "Returns information about the last scanned block, including the block height,\nblock hash, and the timestamp when the scan occurred. This is useful for\nmonitoring the wallet's synchronization progress with the blockchain.\n\n# Path Parameters\n\n- `name`: The unique account name to query\n\n# Response\n\nReturns a [`ScanStatusResponse`] object containing:\n- Last scanned block height\n- Last scanned block hash (hex encoded)\n- Timestamp when the block was scanned\n\n# Errors\n\n- [`ApiError::AccountNotFound`]: The specified account does not exist\n- [`ApiError::NotFound`]: No blocks have been scanned yet for this account\n- [`ApiError::DbError`]: Database connection or query failure\n\n# Example Response\n\n```json\n{\n  \"last_scanned_height\": 12345,\n  \"last_scanned_block_hash\": \"abc123def456...\",\n  \"scanned_at\": \"2024-01-15 10:30:00\"\n}\n```",
+        "description": "Returns information about the last scanned block, including the block height,\nblock hash, and the timestamp when the scan occurred. This is useful for\nmonitoring the wallet's synchronization progress with the blockchain.\n\n# Path Parameters\n\n- `name`: The unique account name to query\n\n# Response\n\nReturns a [`ScanStatusResponse`] object containing:\n- Last scanned block height\n- Last scanned block hash (hex encoded)\n- Timestamp when the block was scanned\n\n# Errors\n\n- [`ApiError::AccountNotFound`]: The specified account does not exist\nIf no blocks have been scanned yet, returns a response with default values (height 0, empty hash and timestamp).\n- [`ApiError::DbError`]: Database connection or query failure\n\n# Example Response\n\n```json\n{\n  \"last_scanned_height\": 12345,\n  \"last_scanned_block_hash\": \"abc123def456...\",\n  \"scanned_at\": \"2024-01-15 10:30:00\"\n}\n```",
         "operationId": "api_get_scan_status",
         "parameters": [
           {
@@ -796,7 +873,7 @@
             }
           },
           "404": {
-            "description": "Account not found or no blocks scanned",
+            "description": "Account not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -849,10 +926,19 @@
           "total",
           "available",
           "locked",
-          "unconfirmed"
+          "unconfirmed",
+          "immature"
         ],
         "properties": {
           "available": {
+            "type": "object",
+            "properties": {
+              "amount": {
+                "type": "integer"
+              }
+            }
+          },
+          "immature": {
             "type": "object",
             "properties": {
               "amount": {
@@ -1050,6 +1136,19 @@
                 "description": "Failed to create an unsigned transaction.\n\nThis occurs during transaction construction after funds have been\nlocked. Returns HTTP 500 Internal Server Error.\n\n# Common Causes\n\n- Invalid recipient address format\n- Transaction size exceeds limits\n- Cryptographic operation failure"
               }
             }
+          },
+          {
+            "type": "object",
+            "description": "Failed to build or broadcast a burn transaction.\n\nThis occurs during burn transaction construction or network submission.\nReturns HTTP 500 Internal Server Error.\n\n# Common Causes\n\n- Insufficient balance\n- Invalid claim public key\n- Base node rejected the transaction",
+            "required": [
+              "FailedToBurnFunds"
+            ],
+            "properties": {
+              "FailedToBurnFunds": {
+                "type": "string",
+                "description": "Failed to build or broadcast a burn transaction.\n\nThis occurs during burn transaction construction or network submission.\nReturns HTTP 500 Internal Server Error.\n\n# Common Causes\n\n- Insufficient balance\n- Invalid claim public key\n- Base node rejected the transaction"
+              }
+            }
           }
         ],
         "description": "Represents all possible errors returned by the REST API.\n\nEach variant corresponds to a specific error condition that can occur\nduring API request processing. The error type automatically converts\nto an appropriate HTTP response with a JSON error body.\n\n# Error Handling Pattern\n\nAPI handlers typically use the `?` operator with this error type:\n\n```rust,ignore\npub async fn handler() -> Result<Json<Data>, ApiError> {\n    let data = fetch_data().await?; // Errors automatically convert to ApiError\n    Ok(Json(data))\n}\n```\n\n# Serialization\n\nWhen serialized to JSON for API responses, errors produce:\n\n```json\n{\n  \"error\": \"Error message here\"\n}\n```"
@@ -1078,6 +1177,82 @@
           },
           "timestamp": {
             "type": "string"
+          }
+        }
+      },
+      "BurnFundsRequest": {
+        "type": "object",
+        "description": "Request body for burning funds and generating an L2 claim proof.\n\n# JSON Example\n\n```json\n{\n  \"amount\": 1000000,\n  \"claim_public_key\": \"a3f9...\",\n  \"fee_per_gram\": 5,\n  \"payment_id\": \"optional memo\",\n  \"seconds_to_lock\": 86400\n}\n```",
+        "required": [
+          "amount"
+        ],
+        "properties": {
+          "amount": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Amount to burn in MicroMinotari.",
+            "minimum": 0
+          },
+          "claim_public_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "L2 claim public key in hex. Required to generate a burn proof for L2 claiming."
+          },
+          "fee_per_gram": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Fee per gram in MicroMinotari (default: 5).",
+            "minimum": 0
+          },
+          "idempotency_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional idempotency key to prevent duplicate burn requests."
+          },
+          "payment_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional payment memo attached to the transaction."
+          },
+          "seconds_to_lock": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Seconds to lock input UTXOs (default: 86400 = 24 h).",
+            "minimum": 0
+          },
+          "sidechain_deployment_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Sidechain deployment key in hex, for L2 template burns."
+          }
+        }
+      },
+      "BurnFundsResponse": {
+        "type": "object",
+        "description": "Response returned after a successful burn transaction.",
+        "required": [
+          "tx_id",
+          "output_hash"
+        ],
+        "properties": {
+          "output_hash": {
+            "type": "string",
+            "description": "Hex-encoded output hash of the burn output.\n\nThe daemon will use this to track when the proof is ready."
+          },
+          "tx_id": {
+            "type": "string",
+            "description": "Transaction ID assigned to the burn transaction."
           }
         }
       },
@@ -1305,7 +1480,8 @@
           "status",
           "amount",
           "blockchain",
-          "details"
+          "details",
+          "lock_height"
         ],
         "properties": {
           "amount": {
@@ -1351,6 +1527,11 @@
                 "type": "integer"
               }
             }
+          },
+          "lock_height": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           },
           "message": {
             "type": [
@@ -1579,7 +1760,8 @@
         "enum": [
           "Unspent",
           "Locked",
-          "Spent"
+          "Spent",
+          "SpentUnconfirmed"
         ]
       },
       "RecipientRequest": {
@@ -1699,8 +1881,9 @@
           "sent_payrefs": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/FixedHash"
-            }
+              "type": "string"
+            },
+            "description": "Payment references for this transaction, serialized as hex strings so\nthey are human-usable and match the hex form used by the payref lookup\nand reorg-history APIs."
           },
           "total_credit": {
             "type": "object",
@@ -1735,7 +1918,8 @@
           "confirmed",
           "cancelled",
           "reorganized",
-          "rejected"
+          "rejected",
+          "locked"
         ]
       },
       "TransactionInput": {
@@ -1858,8 +2042,29 @@
           }
         }
       }
+    },
+    "securitySchemes": {
+      "api_key": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key",
+        "description": "Wallet API token, sent as 'X-API-Key: <token>'"
+      },
+      "bearer_token": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Wallet API token, sent as 'Authorization: Bearer <token>'"
+      }
     }
   },
+  "security": [
+    {
+      "bearer_token": []
+    },
+    {
+      "api_key": []
+    }
+  ],
   "tags": [
     {
       "name": "minotari-cli",

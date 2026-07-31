@@ -9,6 +9,15 @@ Feature: Daemon Mode
     Then the API should be accessible on port "9001"
     And the Swagger UI should be available
 
+  Scenario: API requires an API token
+    Given I have a running daemon with an existing wallet
+    Then the API should reject requests without a token
+    And the API should reject requests with an incorrect token
+
+  Scenario: API authentication can be disabled explicitly
+    Given I have a running daemon with authentication disabled
+    Then the API should serve requests without a token
+
   Scenario: Daemon performs automatic scanning
     Given I have a test database with an existing wallet
     When I start the daemon with scan interval "10" seconds

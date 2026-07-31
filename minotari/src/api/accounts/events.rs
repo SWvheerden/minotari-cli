@@ -45,10 +45,12 @@ use super::params::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, PaginationParams, Wallet
 ///
 /// ```bash
 /// # Get first 50 events (default)
-/// curl -X GET http://localhost:8080/accounts/default/events
+/// curl -X GET http://localhost:8080/accounts/default/events \
+///   -H "Authorization: Bearer $MINOTARI_API_TOKEN"
 ///
 /// # Get 100 events starting from offset 50
-/// curl -X GET "http://localhost:8080/accounts/default/events?limit=100&offset=50"
+/// curl -X GET "http://localhost:8080/accounts/default/events?limit=100&offset=50" \
+///   -H "Authorization: Bearer $MINOTARI_API_TOKEN"
 /// ```
 ///
 /// # Example Response
