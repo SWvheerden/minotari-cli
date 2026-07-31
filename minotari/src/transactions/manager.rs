@@ -55,7 +55,7 @@
 //! ```
 
 use anyhow::anyhow;
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use log::{error, info, warn};
 use r2d2::PooledConnection;
 use r2d2_sqlite::SqliteConnectionManager;
@@ -91,6 +91,7 @@ use crate::{
             DisplayedTransaction, DisplayedTransactionBuilder, TransactionDirection, TransactionDisplayStatus,
             TransactionInput, TransactionSource,
         },
+        fund_locker::lock_expiry_at,
         input_selector::{InputSelector, UtxoSelection},
         one_sided_transaction::Recipient,
     },
@@ -344,8 +345,10 @@ impl TransactionSender {
         processed_transaction: &mut ProcessedTransaction,
     ) -> Result<String, anyhow::Error> {
         let connection = self.get_connection()?;
-        #[allow(clippy::cast_possible_wrap)]
-        let expires_at = Utc::now() + Duration::seconds(processed_transaction.seconds_to_lock_utxos as i64);
+        // `seconds_to_lock_utxos` is untrusted (JSON body / CLI argument), so use
+        // the checked helper: `Utc::now() + Duration::seconds(..)` panics on
+        // overflow. See `MAX_SECONDS_TO_LOCK_UTXOS`.
+        let expires_at = lock_expiry_at(Utc::now(), processed_transaction.seconds_to_lock_utxos)?;
         let utxo_selection = self.create_utxo_selection(processed_transaction)?;
 
         let pending_tx_id = db::create_pending_transaction(

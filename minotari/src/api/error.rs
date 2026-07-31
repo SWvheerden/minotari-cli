@@ -45,7 +45,7 @@ use serde_json::json;
 use thiserror::Error;
 use utoipa::ToSchema;
 
-use crate::db::WalletDbError;
+use crate::{db::WalletDbError, transactions::fund_locker::InvalidLockDuration};
 
 /// Represents all possible errors returned by the REST API.
 ///
@@ -188,6 +188,16 @@ pub enum ApiError {
 impl From<WalletDbError> for ApiError {
     fn from(err: WalletDbError) -> Self {
         ApiError::DbError(err.to_string())
+    }
+}
+
+/// Converts an out-of-range UTXO lock duration into a client error.
+///
+/// The value comes straight from the request body, so a 400 is the honest
+/// status code: nothing is wrong on the server.
+impl From<InvalidLockDuration> for ApiError {
+    fn from(err: InvalidLockDuration) -> Self {
+        ApiError::BadRequest(err.to_string())
     }
 }
 

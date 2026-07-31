@@ -46,7 +46,7 @@ pub struct EstimateFeeRequest {
 
     /// Number of outputs in the transaction (default: 1).
     #[serde(default = "default_one_usize")]
-    #[schema(default = "1")]
+    #[schema(default = 1)]
     pub num_outputs: usize,
 
     /// Number of confirmations required for inputs.

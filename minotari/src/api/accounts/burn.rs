@@ -12,11 +12,17 @@ use crate::{
     api::{AppState, error::ApiError},
     db::get_account_by_name,
     http::WalletHttpClient,
-    transactions::burn::{BurnTxParams, create_burn_tx, persist_burn_records},
+    transactions::{
+        burn::{BurnTxParams, create_burn_tx, persist_burn_records},
+        fund_locker::validate_seconds_to_lock,
+    },
     utils::crypto::{parse_private_key_hex, parse_public_key_hex},
 };
 
-use super::params::{WalletParams, default_fee_per_gram, default_seconds_to_lock_utxos};
+use super::params::{
+    DEFAULT_FEE_PER_GRAM, DEFAULT_SECONDS_TO_LOCK_UTXOS, WalletParams, default_fee_per_gram,
+    default_seconds_to_lock_utxos,
+};
 
 /// Request body for burning funds and generating an L2 claim proof.
 ///
@@ -46,6 +52,7 @@ pub struct BurnFundsRequest {
     /// Fee per gram in MicroMinotari (default: 5).
     #[schema(value_type = u64)]
     #[serde(default = "default_fee_per_gram")]
+    #[schema(default = 5)]
     pub fee_per_gram: Option<MicroMinotari>,
 
     /// Optional payment memo attached to the transaction.
@@ -54,8 +61,9 @@ pub struct BurnFundsRequest {
     /// Optional idempotency key to prevent duplicate burn requests.
     pub idempotency_key: Option<String>,
 
-    /// Seconds to lock input UTXOs (default: 86400 = 24 h).
+    /// Seconds to lock input UTXOs (default: 86400 = 24 h, max: 31536000 = 365 days).
     #[serde(default = "default_seconds_to_lock_utxos")]
+    #[schema(default = 86_400, maximum = 31_536_000)]
     pub seconds_to_lock: Option<u64>,
 }
 
@@ -134,8 +142,10 @@ pub async fn api_burn_funds(
     let pool = app_state.db_pool.clone();
     let network = app_state.network;
     let password = app_state.password.clone();
-    let fee_per_gram = body.fee_per_gram.unwrap_or(MicroMinotari(5));
-    let seconds_to_lock = body.seconds_to_lock.unwrap_or(86400);
+    let fee_per_gram = body.fee_per_gram.unwrap_or(DEFAULT_FEE_PER_GRAM);
+    let seconds_to_lock = body.seconds_to_lock.unwrap_or(DEFAULT_SECONDS_TO_LOCK_UTXOS);
+    // Reject an out-of-range duration as a client error before doing any work.
+    validate_seconds_to_lock(seconds_to_lock)?;
     let confirmation_window = app_state.required_confirmations;
     let idempotency_key = body.idempotency_key.clone();
     let amount = body.amount;

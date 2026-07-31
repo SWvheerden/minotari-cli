@@ -20,10 +20,11 @@
 //! without accidentally locking additional funds. If a lock request with the same
 //! idempotency key already exists, the original result is returned.
 
-use chrono::{Duration, Utc};
-use log::info;
+use chrono::{DateTime, TimeDelta, Utc};
+use log::{info, warn};
 use std::sync::Mutex;
 use tari_transaction_components::tari_amount::MicroMinotari;
+use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
@@ -32,6 +33,51 @@ use crate::{
     log::mask_amount,
     transactions::input_selector::InputSelector,
 };
+
+/// Upper bound, in seconds, on how long UTXOs may be locked (365 days).
+///
+/// `seconds_to_lock_utxos` reaches us straight from a JSON request body or a
+/// CLI argument, so it must be treated as untrusted. Adding an unbounded
+/// number of seconds to `Utc::now()` pushes the result past the range chrono
+/// can represent, and chrono's `Add` impl *panics* on overflow. Because that
+/// arithmetic used to run while [`FUND_LOCK_MUTEX`] was held, a single request
+/// such as `{"seconds_to_lock_utxos": 10000000000000}` poisoned the mutex for
+/// the lifetime of the process and bricked every subsequent fund-moving
+/// request. Bounding the input keeps the arithmetic total.
+pub const MAX_SECONDS_TO_LOCK_UTXOS: u64 = 365 * 24 * 60 * 60;
+
+/// The caller asked for a UTXO lock duration that cannot be honoured.
+///
+/// Callers at a request boundary should map this to a client error (HTTP 400)
+/// rather than an internal failure: the value is invalid input, not a fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("seconds_to_lock_utxos must not exceed {MAX_SECONDS_TO_LOCK_UTXOS} seconds (365 days), got {0}")]
+pub struct InvalidLockDuration(pub u64);
+
+/// Rejects lock durations outside the range this wallet is willing to honour.
+///
+/// Use this at request boundaries to fail fast, before any database work or
+/// lock acquisition, so that a bad value can never reach the critical section.
+pub fn validate_seconds_to_lock(seconds_to_lock_utxos: u64) -> Result<(), InvalidLockDuration> {
+    if seconds_to_lock_utxos > MAX_SECONDS_TO_LOCK_UTXOS {
+        return Err(InvalidLockDuration(seconds_to_lock_utxos));
+    }
+    Ok(())
+}
+
+/// Computes when a UTXO lock taken at `now` should expire.
+///
+/// This is total: every step that chrono would panic on (out-of-range
+/// `TimeDelta`, out-of-range `DateTime`) is handled with its checked
+/// counterpart, so an absurd `seconds_to_lock_utxos` yields an error instead of
+/// unwinding through a held mutex.
+pub fn lock_expiry_at(now: DateTime<Utc>, seconds_to_lock_utxos: u64) -> Result<DateTime<Utc>, InvalidLockDuration> {
+    validate_seconds_to_lock(seconds_to_lock_utxos)?;
+    let seconds = i64::try_from(seconds_to_lock_utxos).map_err(|_| InvalidLockDuration(seconds_to_lock_utxos))?;
+    let delta = TimeDelta::try_seconds(seconds).ok_or(InvalidLockDuration(seconds_to_lock_utxos))?;
+    now.checked_add_signed(delta)
+        .ok_or(InvalidLockDuration(seconds_to_lock_utxos))
+}
 
 /// Global mutex that serializes all [`FundLocker::lock`] calls.
 ///
@@ -117,7 +163,8 @@ impl FundLocker {
     ///   uses default calculation based on standard output features
     /// * `idempotency_key` - Optional unique key for idempotent operations; if provided and
     ///   a matching lock exists, returns the existing result
-    /// * `seconds_to_lock_utxos` - Duration in seconds before the lock expires
+    /// * `seconds_to_lock_utxos` - Duration in seconds before the lock expires;
+    ///   must not exceed [`MAX_SECONDS_TO_LOCK_UTXOS`]
     ///
     /// # Returns
     ///
@@ -130,6 +177,8 @@ impl FundLocker {
     /// # Errors
     ///
     /// Returns an error if:
+    /// - `seconds_to_lock_utxos` exceeds [`MAX_SECONDS_TO_LOCK_UTXOS`]
+    ///   ([`InvalidLockDuration`])
     /// - Database connection fails
     /// - Insufficient funds are available
     /// - UTXO selection fails due to serialization errors
@@ -167,6 +216,10 @@ impl FundLocker {
             amount = &*mask_amount(amount);
             "Locking funds"
         );
+        // Reject an out-of-range lock duration before touching the database or
+        // the global mutex, so untrusted input can never reach the critical
+        // section (see `MAX_SECONDS_TO_LOCK_UTXOS`).
+        validate_seconds_to_lock(seconds_to_lock_utxos)?;
         // Acquire a database connection first so we don't hold the global
         // mutex while waiting for a pooled connection (which could deadlock
         // under pool exhaustion).
@@ -190,9 +243,21 @@ impl FundLocker {
         // selection, and database transaction are all serialised.  This
         // prevents a concurrent request from seeing the same "unspent" UTXOs
         // and creating a duplicate pending transaction.
-        let _guard = FUND_LOCK_MUTEX
-            .lock()
-            .expect("Fund locker mutex poisoned – a prior lock() call panicked");
+        //
+        // The mutex guards no in-memory state — it is a `Mutex<()>` whose only
+        // job is mutual exclusion — and the critical section's only durable
+        // side effects happen inside a database transaction that rolls back if
+        // it is not committed. A panic in a previous caller therefore leaves
+        // nothing inconsistent behind, so recover from poisoning instead of
+        // propagating it: unwrapping here would turn one panicking request into
+        // a permanent, process-wide outage of every fund-moving endpoint.
+        let _guard = FUND_LOCK_MUTEX.lock().unwrap_or_else(|poisoned| {
+            warn!(
+                target: "audit",
+                "Fund locker mutex was poisoned by a previous panic; recovering"
+            );
+            poisoned.into_inner()
+        });
         // Re-check idempotency now that we hold the mutex.  The first thread
         // that passed the fast-path check above may have created the pending
         // transaction while we were waiting for the lock; if so we return its
@@ -219,8 +284,9 @@ impl FundLocker {
         // dead-lock with SQLITE_BUSY_SNAPSHOT — surfaced as "database is locked"
         // — which busy_timeout will not retry.
         let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        #[allow(clippy::cast_possible_wrap)]
-        let expires_at = Utc::now() + Duration::seconds(seconds_to_lock_utxos as i64);
+        // Already validated above; `lock_expiry_at` is total, so a surprising
+        // value returns an error rather than panicking under the held mutex.
+        let expires_at = lock_expiry_at(Utc::now(), seconds_to_lock_utxos)?;
         let idempotency_key = idempotency_key.unwrap_or_else(|| Uuid::new_v4().to_string());
         let pending_tx_id = db::create_pending_transaction(
             &transaction,
@@ -535,5 +601,116 @@ mod tests {
         // Both should succeed (no double-spend errors) and select at least one UTXO
         assert!(!r_a.utxos.is_empty(), "A got UTXOs");
         assert!(!r_b.utxos.is_empty(), "B got UTXOs");
+    }
+
+    // -----------------------------------------------------------------------
+    // Lock duration bounds
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn lock_expiry_accepts_durations_up_to_the_maximum() {
+        let now = Utc::now();
+
+        for seconds in [0, 1, 86_400, MAX_SECONDS_TO_LOCK_UTXOS] {
+            let expires_at = lock_expiry_at(now, seconds).expect("duration within bounds is accepted");
+            assert_eq!(
+                expires_at - now,
+                TimeDelta::try_seconds(seconds as i64).expect("representable"),
+                "expiry for {seconds}s"
+            );
+        }
+    }
+
+    #[test]
+    fn lock_expiry_rejects_out_of_range_durations_instead_of_panicking() {
+        let now = Utc::now();
+
+        // The value from the original report: large enough that
+        // `Utc::now() + Duration::seconds(..)` overflows chrono's `DateTime`
+        // range and panics.
+        assert_eq!(
+            lock_expiry_at(now, 10_000_000_000_000),
+            Err(InvalidLockDuration(10_000_000_000_000))
+        );
+        // Just past the bound.
+        assert_eq!(
+            lock_expiry_at(now, MAX_SECONDS_TO_LOCK_UTXOS + 1),
+            Err(InvalidLockDuration(MAX_SECONDS_TO_LOCK_UTXOS + 1))
+        );
+        // Would wrap to a negative offset under the old `as i64` cast, silently
+        // producing an expiry in the past.
+        assert_eq!(lock_expiry_at(now, u64::MAX), Err(InvalidLockDuration(u64::MAX)));
+        assert_eq!(
+            lock_expiry_at(now, i64::MAX as u64 + 1),
+            Err(InvalidLockDuration(i64::MAX as u64 + 1))
+        );
+    }
+
+    #[test]
+    fn lock_rejects_out_of_range_duration_without_poisoning_the_mutex() {
+        let (pool, account_id, _temp) = setup_test_env(3, 1_000_000);
+        let locker = FundLocker::new(pool);
+
+        let err = locker
+            .lock(
+                account_id,
+                MicroMinotari(100_000),
+                1,
+                MicroMinotari(0),
+                Some(1000),
+                None,
+                10_000_000_000_000,
+                100,
+            )
+            .expect_err("absurd lock duration is rejected");
+        assert!(
+            err.downcast_ref::<InvalidLockDuration>().is_some(),
+            "expected InvalidLockDuration, got: {err}"
+        );
+
+        // The rejected request must not have bricked the locker: a well-formed
+        // request afterwards still succeeds.  Before the fix, the panic above
+        // poisoned `FUND_LOCK_MUTEX` and every later call died at the `.expect`.
+        let result = locker
+            .lock(
+                account_id,
+                MicroMinotari(100_000),
+                1,
+                MicroMinotari(0),
+                Some(1000),
+                None,
+                3600,
+                100,
+            )
+            .expect("subsequent lock still works");
+        assert!(!result.utxos.is_empty(), "subsequent lock selected UTXOs");
+    }
+
+    #[test]
+    fn lock_survives_a_poisoned_mutex() {
+        // Poison the global mutex the way a panic inside the critical section
+        // would, then assert that `lock()` still makes progress rather than
+        // failing for the lifetime of the process.
+        let poisoner = std::thread::spawn(|| {
+            let _guard = FUND_LOCK_MUTEX.lock().expect("acquire");
+            panic!("simulated panic while holding the fund lock");
+        });
+        assert!(poisoner.join().is_err(), "poisoning thread panicked as intended");
+        assert!(FUND_LOCK_MUTEX.is_poisoned(), "mutex is poisoned");
+
+        let (pool, account_id, _temp) = setup_test_env(3, 1_000_000);
+        let result = FundLocker::new(pool)
+            .lock(
+                account_id,
+                MicroMinotari(100_000),
+                1,
+                MicroMinotari(0),
+                Some(1000),
+                None,
+                3600,
+                100,
+            )
+            .expect("lock recovers from a poisoned mutex");
+        assert!(!result.utxos.is_empty(), "lock selected UTXOs after recovery");
     }
 }
