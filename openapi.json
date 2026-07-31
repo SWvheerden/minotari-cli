@@ -1204,6 +1204,7 @@
             "type": "integer",
             "format": "int64",
             "description": "Fee per gram in MicroMinotari (default: 5).",
+            "default": 5,
             "minimum": 0
           },
           "idempotency_key": {
@@ -1227,6 +1228,7 @@
             ],
             "format": "int64",
             "description": "Seconds to lock input UTXOs (default: 86400 = 24 h, max: 31536000 = 365 days).",
+            "default": 86400,
             "maximum": 31536000,
             "minimum": 0
           },
@@ -1424,7 +1426,7 @@
             ],
             "format": "int64",
             "description": "Duration in seconds to keep the input UTXOs locked.\n\nDefaults to 86,400 seconds (24 hours) and may not exceed 31,536,000\nseconds (365 days). The lock prevents the same UTXOs from being used in\nmultiple transactions while the unsigned transaction is being signed and\nbroadcast.",
-            "default": "86400",
+            "default": 86400,
             "maximum": 31536000,
             "minimum": 0
           }
@@ -1577,7 +1579,7 @@
           "num_outputs": {
             "type": "integer",
             "description": "Number of outputs in the transaction (default: 1).",
-            "default": "1",
+            "default": 1,
             "minimum": 0
           }
         }
@@ -1684,7 +1686,7 @@
             "type": "integer",
             "format": "int64",
             "description": "Fee per gram for the transaction in MicroMinotari.\n\nDefaults to 5 MicroMinotari. Higher fees may result in faster confirmation\nduring periods of high network congestion.",
-            "default": "5",
+            "default": 5,
             "minimum": 0
           },
           "idempotency_key": {
@@ -1700,7 +1702,7 @@
               "null"
             ],
             "description": "Number of outputs to create in the transaction.\n\nDefaults to 1. Increase this when sending to multiple recipients or when\nthe transaction requires multiple output UTXOs.",
-            "default": "1",
+            "default": 1,
             "minimum": 0
           },
           "seconds_to_lock_utxos": {
@@ -1710,7 +1712,7 @@
             ],
             "format": "int64",
             "description": "Duration in seconds to keep the UTXOs locked.\n\nDefaults to 86,400 seconds (24 hours) and may not exceed 31,536,000\nseconds (365 days). After this period, locked UTXOs are automatically\nreleased if the transaction was not completed.",
-            "default": "86400",
+            "default": 86400,
             "maximum": 31536000,
             "minimum": 0
           }

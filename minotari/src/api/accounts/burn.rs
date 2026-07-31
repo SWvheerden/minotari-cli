@@ -52,6 +52,7 @@ pub struct BurnFundsRequest {
     /// Fee per gram in MicroMinotari (default: 5).
     #[schema(value_type = u64)]
     #[serde(default = "default_fee_per_gram")]
+    #[schema(default = 5)]
     pub fee_per_gram: Option<MicroMinotari>,
 
     /// Optional payment memo attached to the transaction.
@@ -62,7 +63,7 @@ pub struct BurnFundsRequest {
 
     /// Seconds to lock input UTXOs (default: 86400 = 24 h, max: 31536000 = 365 days).
     #[serde(default = "default_seconds_to_lock_utxos")]
-    #[schema(maximum = 31_536_000)]
+    #[schema(default = 86_400, maximum = 31_536_000)]
     pub seconds_to_lock: Option<u64>,
 }
 

@@ -76,7 +76,7 @@ pub struct LockFundsRequest {
     /// Defaults to 1. Increase this when sending to multiple recipients or when
     /// the transaction requires multiple output UTXOs.
     #[serde(default = "default_num_outputs")]
-    #[schema(default = "1")]
+    #[schema(default = 1)]
     pub num_outputs: Option<usize>,
 
     /// Fee per gram for the transaction in MicroMinotari.
@@ -85,7 +85,7 @@ pub struct LockFundsRequest {
     /// during periods of high network congestion.
     #[schema(value_type = u64)]
     #[serde(default = "default_fee_per_gram")]
-    #[schema(default = "5")]
+    #[schema(default = 5)]
     pub fee_per_gram: Option<MicroMinotari>,
 
     /// Estimated size of each output in bytes.
@@ -100,7 +100,7 @@ pub struct LockFundsRequest {
     /// seconds (365 days). After this period, locked UTXOs are automatically
     /// released if the transaction was not completed.
     #[serde(default = "default_seconds_to_lock_utxos")]
-    #[schema(default = "86400", maximum = 31_536_000)]
+    #[schema(default = 86_400, maximum = 31_536_000)]
     pub seconds_to_lock_utxos: Option<u64>,
 
     /// Optional idempotency key to prevent duplicate requests.
@@ -195,7 +195,7 @@ pub struct CreateTransactionRequest {
     /// multiple transactions while the unsigned transaction is being signed and
     /// broadcast.
     #[serde(default = "default_seconds_to_lock_utxos")]
-    #[schema(default = "86400", maximum = 31_536_000)]
+    #[schema(default = 86_400, maximum = 31_536_000)]
     seconds_to_lock_utxos: Option<u64>,
 
     /// Optional idempotency key to prevent duplicate transactions.
@@ -430,7 +430,7 @@ pub async fn api_create_unsigned_transaction(
 
         let amount = recipients.iter().map(|r| r.amount).sum();
         let num_outputs = recipients.len();
-        let fee_per_gram = MicroMinotari(5);
+        let fee_per_gram = DEFAULT_FEE_PER_GRAM;
         let estimated_output_size = None;
 
         let confirmation_window = body.confirmation_window.unwrap_or(default_confirmations);
