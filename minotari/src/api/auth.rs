@@ -30,8 +30,8 @@
 //! # Disabling authentication
 //!
 //! `--api-disable-auth` (or `api_disable_auth = true` in `config.toml`) drops the
-//! token check entirely, leaving every endpoint open to anyone who can reach the
-//! port, including the fund-moving ones. It defaults to `false` and is only
+//! token check entirely, leaving every endpoint (including the fund-moving ones)
+//! open to anyone who can reach the port. It defaults to `false` and is only
 //! appropriate for local development against a throwaway wallet. Combined with a
 //! non-loopback `api_bind_address` it hands the wallet to the whole network, so
 //! the daemon warns loudly on both stderr and the audit log when it is used.

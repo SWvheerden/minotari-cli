@@ -155,11 +155,27 @@ async fn wallet_has_encrypted_seed_words(world: &mut MinotariWorld) {
     );
 }
 
-#[then("the wallet should contain a nonce")]
-async fn wallet_has_nonce(world: &mut MinotariWorld) {
+#[then("the wallet should contain a salt and a distinct nonce per encrypted field")]
+async fn wallet_has_salt_and_distinct_nonces(world: &mut MinotariWorld) {
     let wallet_data = world.wallet_data.as_ref().expect("Wallet data not loaded");
-    assert!(
-        wallet_data.get("nonce").is_some(),
-        "Nonce not found in encrypted wallet"
-    );
+    assert!(wallet_data.get("salt").is_some(), "Salt not found in encrypted wallet");
+
+    let mut nonces = Vec::new();
+    for field in ["view_key_nonce", "spend_key_nonce", "seed_words_nonce"] {
+        let nonce = wallet_data
+            .get(field)
+            .unwrap_or_else(|| panic!("{} not found in encrypted wallet", field))
+            .as_str()
+            .unwrap_or_else(|| panic!("{} is not a string", field))
+            .to_string();
+        assert!(!nonce.is_empty(), "{} is empty", field);
+        nonces.push(nonce);
+    }
+
+    // A shared nonce would xor the fields into a common keystream, which is what makes the
+    // public spend key enough to recover the private view key.
+    nonces.sort();
+    let unique = nonces.len();
+    nonces.dedup();
+    assert_eq!(nonces.len(), unique, "Encrypted fields share an encryption nonce");
 }

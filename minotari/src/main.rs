@@ -51,7 +51,6 @@ use std::{
 };
 
 use anyhow::anyhow;
-use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce, aead::Aead, aead::Generate};
 use clap::Parser;
 use log::info;
 use minotari::{
@@ -70,7 +69,7 @@ use minotari::{
         fund_locker::FundLocker,
         one_sided_transaction::{OneSidedTransaction, Recipient},
     },
-    utils,
+    utils::{self, crypto::PasswordCipher},
     webhooks::WebhookTriggerConfig,
 };
 use std::str::FromStr;
@@ -129,30 +128,23 @@ async fn main() -> Result<(), anyhow::Error> {
             );
 
             let wallet_data = if let Some(password) = password {
-                let password = if password.len() < 32 {
-                    format!("{:0<32}", password)
-                } else {
-                    password[..32].to_string()
-                };
-                let key_bytes: [u8; 32] = password
-                    .as_bytes()
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("Password must be 32 bytes"))?;
-                let key = Key::from(key_bytes);
-                let cipher = XChaCha20Poly1305::new(&key);
+                // Each field gets its own nonce: XChaCha20 is a stream cipher, so encrypting two
+                // messages under the same (key, nonce) pair would xor them into a shared keystream.
+                let cipher = PasswordCipher::new(&password)?;
 
-                let nonce = XNonce::generate();
-                let encrypted_view_key = cipher.encrypt(&nonce, view_key.as_bytes())?;
-                let encrypted_spend_key = cipher.encrypt(&nonce, spend_key.pub_key.as_bytes())?;
-
-                let encrypted_seed_words = cipher.encrypt(&nonce, seed_words.reveal().as_bytes())?;
+                let (encrypted_view_key, view_key_nonce) = cipher.encrypt(view_key.as_bytes())?;
+                let (encrypted_spend_key, spend_key_nonce) = cipher.encrypt(spend_key.pub_key.as_bytes())?;
+                let (encrypted_seed_words, seed_words_nonce) = cipher.encrypt(seed_words.reveal().as_bytes())?;
 
                 serde_json::json!({
                     "address": tari_address.to_base58(),
                     "encrypted_view_key": hex::encode(encrypted_view_key),
+                    "view_key_nonce": hex::encode(view_key_nonce),
                     "encrypted_spend_key": hex::encode(encrypted_spend_key),
+                    "spend_key_nonce": hex::encode(spend_key_nonce),
                     "encrypted_seed_words": hex::encode(encrypted_seed_words),
-                    "nonce": hex::encode(nonce),
+                    "seed_words_nonce": hex::encode(seed_words_nonce),
+                    "salt": hex::encode(cipher.salt()),
                     "birthday": birthday,
                 })
             } else {
