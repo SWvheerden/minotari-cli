@@ -18,6 +18,43 @@ pub mod test_support; // Make this public so other modules can access it
 use test_support::BaseNodeProcess;
 
 // =============================
+// API Access
+// =============================
+
+/// API token every test daemon is started with.
+///
+/// The daemon's REST API requires a token on every endpoint, so scenarios pin a
+/// known one instead of scraping the generated token out of the daemon's output.
+pub const TEST_API_TOKEN: &str = "integration-test-api-token";
+
+/// Arguments that give a spawned daemon a known API token and keep it on loopback.
+pub fn api_args() -> Vec<String> {
+    vec![
+        "--api-token".to_string(),
+        TEST_API_TOKEN.to_string(),
+        "--api-bind-address".to_string(),
+        "127.0.0.1".to_string(),
+    ]
+}
+
+/// HTTP client that authenticates to the test daemon's API and gives up after
+/// `timeout`, so a hung or stale daemon fails fast instead of blocking the whole
+/// scenario until CI times out.
+pub fn api_client(timeout: std::time::Duration) -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        reqwest::header::HeaderValue::from_str(&format!("Bearer {}", TEST_API_TOKEN))
+            .expect("Failed to build authorization header"),
+    );
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .timeout(timeout)
+        .build()
+        .expect("Failed to build HTTP client")
+}
+
+// =============================
 // World Definition
 // =============================
 

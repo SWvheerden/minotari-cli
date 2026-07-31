@@ -202,6 +202,50 @@ The application will recreate the schema automatically on the next run.
 7. Parse memos and payment information
 8. Update balance changes and generate events
 
+### Daemon API Authentication
+
+The daemon's REST API can move funds (burn, lock, build transactions) and exposes the
+wallet's full financial history, so by default **every endpoint requires an API token** —
+including `/openapi.json` and the Swagger UI.
+
+Supply the token with (in order of precedence):
+
+1. `--api-token <token>` on `minotari daemon`
+2. the `MINOTARI_API_TOKEN` environment variable
+3. `api_token` in the `[wallet]` section of `config.toml`
+
+If none is set, the daemon generates a random token at startup and prints it to stderr.
+Tokens must be at least 16 characters; use a long random value.
+
+Callers present the token as either header:
+
+```bash
+curl -X GET http://127.0.0.1:9000/accounts/default/balance \
+  -H "Authorization: Bearer $MINOTARI_API_TOKEN"
+
+curl -X GET http://127.0.0.1:9000/accounts/default/balance \
+  -H "X-API-Key: $MINOTARI_API_TOKEN"
+```
+
+Anything else gets `401 Unauthorized`.
+
+#### Disabling authentication
+
+`--api-disable-auth` (or `api_disable_auth = true` under `[wallet]`) serves the API with
+no token check at all. It defaults to `false`. With it set, **anyone who can reach the API
+port can read the wallet's history and spend its funds**, so it is only appropriate for
+local development against a throwaway wallet. It takes precedence over any configured
+token, and the daemon warns about it on stderr and in the audit log at startup.
+
+```bash
+minotari daemon --password "…" --api-disable-auth
+```
+
+The API also binds `127.0.0.1` by default. Override with `--api-bind-address` (or
+`api_bind_address` in `config.toml`) only when the API genuinely needs to be reachable
+from other hosts, and put it behind a firewall and a TLS-terminating reverse proxy when
+you do — the token would otherwise cross the network in the clear.
+
 ### OpenAPI Specification
 
 The OpenAPI specification (`openapi.json`) is generated from the API

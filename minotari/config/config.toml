@@ -9,6 +9,23 @@ api_port = 9000
 confirmation_window = 3
 account_name = "default"
 
+# Interface the REST API binds to. Loopback by default: the API can spend funds and
+# exposes the wallet's full history, so only expose it deliberately (and then only
+# behind a firewall or a TLS-terminating reverse proxy).
+api_bind_address = "127.0.0.1"
+
+# Token that every API caller must present as `Authorization: Bearer <token>` or
+# `X-API-Key: <token>`. Minimum 16 characters; use a long random value.
+# Prefer the MINOTARI_API_TOKEN environment variable so the secret is not stored on disk.
+# If neither is set, the daemon generates a token at startup and prints it to stderr.
+# api_token = "replace-with-a-long-random-token"
+
+# Serve the API with no authentication at all. Defaults to false.
+# DANGEROUS: with this set, anyone who can reach the API port can read the wallet's
+# full history and call the fund-moving endpoints (burn, lock, create transaction).
+# Only use it for local development against a throwaway wallet.
+# api_disable_auth = false
+
 # Directory where the daemon writes completed burn proof JSON files.
 # Defaults to: <platform data dir>/tari/<network>/burn_proofs
 # burn_proofs_dir = "/path/to/burn_proofs"

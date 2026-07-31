@@ -20,17 +20,27 @@
 //! | POST | `/accounts/{name}/lock_funds` | Lock UTXOs for spending |
 //! | POST | `/accounts/{name}/create_unsigned_transaction` | Create unsigned transaction |
 //!
+//! # Authentication
+//!
+//! Every endpoint requires the daemon's API token, sent as
+//! `Authorization: Bearer <token>` or `X-API-Key: <token>`. Requests without a valid
+//! token are answered with `401 Unauthorized` before reaching a handler, unless the
+//! operator started the daemon with `--api-disable-auth`. See [`crate::api::auth`].
+//!
 //! # Example Usage
 //!
 //! ```bash
 //! # Get account balance
-//! curl -X GET http://localhost:8080/accounts/default/balance
+//! curl -X GET http://127.0.0.1:9000/accounts/default/balance \
+//!   -H "Authorization: Bearer $MINOTARI_API_TOKEN"
 //!
 //! # Get wallet events
-//! curl -X GET http://localhost:8080/accounts/default/events
+//! curl -X GET http://127.0.0.1:9000/accounts/default/events \
+//!   -H "Authorization: Bearer $MINOTARI_API_TOKEN"
 //!
 //! # Lock funds for a transaction
-//! curl -X POST http://localhost:8080/accounts/default/lock_funds \
+//! curl -X POST http://127.0.0.1:9000/accounts/default/lock_funds \
+//!   -H "Authorization: Bearer $MINOTARI_API_TOKEN" \
 //!   -H "Content-Type: application/json" \
 //!   -d '{"amount": 1000000}'
 //! ```

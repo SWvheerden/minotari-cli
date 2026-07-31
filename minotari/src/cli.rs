@@ -213,6 +213,16 @@ pub enum Commands {
     ///
     /// API documentation is available at `/swagger-ui/` when the daemon is running.
     ///
+    /// # Authentication
+    ///
+    /// Every endpoint, documentation included, requires an API token sent as
+    /// `Authorization: Bearer <token>` or `X-API-Key: <token>`. The token comes from
+    /// `--api-token`, `MINOTARI_API_TOKEN` or `api_token` in config.toml; if none is
+    /// set, the daemon generates one at startup and prints it to stderr.
+    ///
+    /// `--api-disable-auth` turns the check off entirely. It is off by default and
+    /// leaves the fund-moving endpoints open to anyone who can reach the port.
+    ///
     /// # Shutdown
     ///
     /// Press Ctrl+C to initiate graceful shutdown. The daemon will:
@@ -233,6 +243,35 @@ pub enum Commands {
         /// TCP port for the REST API server.
         #[arg(long, help = "Port for the API server")]
         api_port: Option<u16>,
+
+        /// Interface the REST API binds to. Defaults to `127.0.0.1`.
+        ///
+        /// The API can spend funds, so binding a routable address exposes the
+        /// wallet to every host that can reach it. Only do so behind a reverse
+        /// proxy that terminates TLS.
+        #[arg(long, help = "Address for the API server to bind to (default: 127.0.0.1)")]
+        api_bind_address: Option<String>,
+
+        /// Token that REST API callers must present as `Authorization: Bearer <token>`
+        /// (or `X-API-Key: <token>`).
+        ///
+        /// Can also be supplied via the `MINOTARI_API_TOKEN` environment variable or
+        /// `api_token` in config.toml, which keep the secret out of the process list.
+        /// If none is set, the daemon generates a token at startup and prints it.
+        #[arg(long, help = "API token required by all API callers (env: MINOTARI_API_TOKEN)")]
+        api_token: Option<String>,
+
+        /// Serve the REST API with no authentication at all.
+        ///
+        /// Off by default. With this set, anyone who can reach the API port can
+        /// read the wallet's full history and call the fund-moving endpoints, so
+        /// it is only appropriate for local development against a throwaway
+        /// wallet. Can also be set with `api_disable_auth` in config.toml.
+        #[arg(
+            long,
+            help = "Disable API authentication entirely (DANGEROUS: anyone who can reach the port can spend funds)"
+        )]
+        api_disable_auth: bool,
     },
 
     /// Display the wallet balance.
@@ -756,6 +795,9 @@ pub struct BurnArgs {
 pub struct DaemonArgs {
     pub scan_interval_secs: Option<u64>,
     pub api_port: Option<u16>,
+    pub api_bind_address: Option<String>,
+    pub api_token: Option<String>,
+    pub api_disable_auth: bool,
 }
 
 pub trait ApplyArgs {

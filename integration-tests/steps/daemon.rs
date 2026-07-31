@@ -9,7 +9,7 @@ use tari_common::configuration::Network::LocalNet;
 use tari_common_types::tari_address::{TariAddress, TariAddressFeatures};
 use tokio::time::sleep;
 
-use super::common::{MinotariWorld, database_with_wallet};
+use super::common::{MinotariWorld, api_args, api_client, database_with_wallet};
 
 /// Generate a valid test Tari address from the wallet in world
 fn generate_test_address(world: &MinotariWorld) -> String {
@@ -34,9 +34,9 @@ fn generate_test_address(world: &MinotariWorld) -> String {
 /// so the daemon never collides with an unrelated service already bound to that
 /// port (e.g. a base node a developer is running locally).
 ///
-/// The daemon binds `0.0.0.0:<port>`, so we probe the same wildcard address —
-/// probing `127.0.0.1` would report a port as free even when another process
-/// holds `0.0.0.0:<port>`, and the daemon would then fail to bind.
+/// The daemon binds `127.0.0.1:<port>`, but we probe the wildcard address —
+/// probing `127.0.0.1` alone would report a port as free even when another
+/// process holds `0.0.0.0:<port>`, and the daemon would then fail to bind.
 fn find_free_port(start: u16, end: u16) -> u16 {
     for port in start..end {
         if std::net::TcpListener::bind(("0.0.0.0", port)).is_ok() {
@@ -46,13 +46,11 @@ fn find_free_port(start: u16, end: u16) -> u16 {
     panic!("No free port found in range {}..{}", start, end);
 }
 
-/// HTTP client with a bounded timeout so a hung or stale daemon fails fast with
-/// a clear error instead of blocking the whole scenario until CI times out.
+/// Authenticated HTTP client with a bounded timeout so a hung or stale daemon
+/// fails fast with a clear error instead of blocking the whole scenario until CI
+/// times out.
 fn http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .expect("Failed to build HTTP client")
+    api_client(Duration::from_secs(15))
 }
 
 /// Wait until the freshly-spawned daemon is actually serving its HTTP API before
@@ -60,10 +58,7 @@ fn http_client() -> reqwest::Client {
 /// finished starting (or that failed to bind its port), producing confusing
 /// downstream API failures instead of a clear, fast error.
 async fn wait_for_daemon_ready(child: &mut std::process::Child, port: u16) {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .expect("Failed to build HTTP client");
+    let client = api_client(Duration::from_secs(2));
     let url = format!("http://127.0.0.1:{}/version", port);
     for _ in 0..60 {
         // If the daemon process already exited, it never came up — fail loudly
@@ -83,8 +78,11 @@ async fn wait_for_daemon_ready(child: &mut std::process::Child, port: u16) {
     panic!("Daemon on port {port} did not become ready within 30s");
 }
 
-/// Start a daemon process with the given configuration
-async fn start_daemon_process(world: &mut MinotariWorld, port: u16, scan_interval: Option<u64>) {
+/// Start a daemon process with the given configuration.
+///
+/// `disable_auth` additionally passes `--api-disable-auth`; the API token arguments
+/// are still supplied so the scenario also pins down which of the two wins.
+async fn start_daemon_process(world: &mut MinotariWorld, port: u16, scan_interval: Option<u64>, disable_auth: bool) {
     world.setup_database();
     let (command, mut args) = world.get_minotari_command();
 
@@ -100,6 +98,10 @@ async fn start_daemon_process(world: &mut MinotariWorld, port: u16, scan_interva
     args.push(db_path.to_str().unwrap().to_string());
     args.push("--api-port".to_string());
     args.push(port.to_string());
+    args.extend(api_args());
+    if disable_auth {
+        args.push("--api-disable-auth".to_string());
+    }
 
     if let Some(interval) = scan_interval {
         args.push("--scan-interval-secs".to_string());
@@ -140,27 +142,34 @@ async fn running_daemon_with_wallet(world: &mut MinotariWorld) {
     database_with_wallet(world).await;
     // Start daemon on a free port (avoids collisions with other local services)
     let port = find_free_port(9000, 9200);
-    start_daemon_process(world, port, None).await;
+    start_daemon_process(world, port, None, false).await;
+}
+
+#[given("I have a running daemon with authentication disabled")]
+async fn running_daemon_with_auth_disabled(world: &mut MinotariWorld) {
+    database_with_wallet(world).await;
+    let port = find_free_port(9000, 9200);
+    start_daemon_process(world, port, None, true).await;
 }
 
 #[given("I have a running daemon")]
 async fn running_daemon(world: &mut MinotariWorld) {
     // Start daemon on a free port (avoids collisions with other local services)
     let port = find_free_port(9000, 9200);
-    start_daemon_process(world, port, None).await;
+    start_daemon_process(world, port, None, false).await;
 }
 
 #[when(regex = r#"^I start the daemon on port "([^"]*)"$"#)]
 async fn start_daemon_on_port(world: &mut MinotariWorld, port: String) {
     let port_num = port.parse::<u16>().expect("Invalid port number");
-    start_daemon_process(world, port_num, None).await;
+    start_daemon_process(world, port_num, None, false).await;
 }
 
 #[when(regex = r#"^I start the daemon with scan interval "([^"]*)" seconds$"#)]
 async fn start_daemon_with_interval(world: &mut MinotariWorld, interval: String) {
     let interval_num = interval.parse::<u64>().expect("Invalid scan interval");
     let port = find_free_port(9000, 9200);
-    start_daemon_process(world, port, Some(interval_num)).await;
+    start_daemon_process(world, port, Some(interval_num), false).await;
 }
 
 #[when(regex = r#"^I query the balance via the API for account "([^"]*)"$"#)]
@@ -309,6 +318,109 @@ async fn swagger_available(world: &mut MinotariWorld) {
         "Swagger UI should be available, got status: {}",
         response.status()
     );
+}
+
+/// The API can burn funds and exposes the wallet's full history, so an
+/// unauthenticated caller must get nowhere - not even to the endpoint listing.
+#[then("the API should reject requests without a token")]
+async fn api_rejects_unauthenticated_requests(world: &mut MinotariWorld) {
+    let port = world.api_port.expect("Daemon must be running");
+    // No default Authorization header on this client, unlike `http_client()`.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .expect("Failed to build HTTP client");
+
+    let address = generate_test_address(world);
+    let burn_body = serde_json::json!({ "amount": 1000, "claim_public_key": "00" });
+    let transaction_body = serde_json::json!({
+        "recipients": [{ "address": address, "amount": 1000, "payment_id": "unauthenticated" }],
+        "idempotency_key": "unauthenticated"
+    });
+
+    let get_paths = [
+        "/version",
+        "/openapi.json",
+        "/swagger-ui/",
+        "/accounts/default/balance",
+        "/accounts/default/address",
+        "/accounts/default/events",
+        "/accounts/default/displayed_transactions",
+    ];
+    for path in get_paths {
+        let url = format!("http://127.0.0.1:{}{}", port, path);
+        let response = client.get(&url).send().await.expect("Failed to call API");
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "GET {} should require an API token",
+            path
+        );
+    }
+
+    for (path, body) in [
+        ("/accounts/default/burn", &burn_body),
+        ("/accounts/default/lock_funds", &burn_body),
+        ("/accounts/default/create_unsigned_transaction", &transaction_body),
+    ] {
+        let url = format!("http://127.0.0.1:{}{}", port, path);
+        let response = client.post(&url).json(body).send().await.expect("Failed to call API");
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "POST {} should require an API token",
+            path
+        );
+    }
+}
+
+/// The opt-out has to actually serve unauthenticated callers, and it has to win
+/// over the API token the daemon was also started with.
+#[then("the API should serve requests without a token")]
+async fn api_serves_unauthenticated_requests(world: &mut MinotariWorld) {
+    let port = world.api_port.expect("Daemon must be running");
+    // No default Authorization header on this client, unlike `http_client()`.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .expect("Failed to build HTTP client");
+
+    for path in ["/version", "/openapi.json", "/accounts/default/balance"] {
+        let url = format!("http://127.0.0.1:{}{}", port, path);
+        let response = client.get(&url).send().await.expect("Failed to call API");
+        assert!(
+            response.status().is_success(),
+            "GET {} should succeed without a token, got {}",
+            path,
+            response.status()
+        );
+    }
+}
+
+/// A token that is not the daemon's must be refused just like no token at all.
+#[then("the API should reject requests with an incorrect token")]
+async fn api_rejects_wrong_token(world: &mut MinotariWorld) {
+    let port = world.api_port.expect("Daemon must be running");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .expect("Failed to build HTTP client");
+
+    let url = format!("http://127.0.0.1:{}/accounts/default/balance", port);
+    for header_value in ["Bearer not-the-configured-token", "Basic aW50ZWdyYXRpb246dGVzdA=="] {
+        let response = client
+            .get(&url)
+            .header(reqwest::header::AUTHORIZATION, header_value)
+            .send()
+            .await
+            .expect("Failed to call API");
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "'{}' should be rejected",
+            header_value
+        );
+    }
 }
 
 #[then("the daemon should scan periodically")]

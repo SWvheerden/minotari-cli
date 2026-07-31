@@ -83,7 +83,8 @@ pub struct EstimateFeeRequest {
 /// # Example Request
 ///
 /// ```bash
-/// curl -X POST http://localhost:8080/accounts/default/estimate_fees \
+/// curl -X POST http://127.0.0.1:9000/accounts/default/estimate_fees \
+///   -H "Authorization: Bearer $MINOTARI_API_TOKEN" \
 ///   -H "Content-Type: application/json" \
 ///   -d '{"amount": 1000000}'
 /// ```

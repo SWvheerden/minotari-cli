@@ -248,7 +248,8 @@ pub async fn api_get_address(
 /// # Example Request
 ///
 /// ```bash
-/// curl -X POST http://localhost:8080/accounts/default/address_with_payment_id \
+/// curl -X POST http://127.0.0.1:9000/accounts/default/address_with_payment_id \
+///   -H "Authorization: Bearer $MINOTARI_API_TOKEN" \
 ///   -H "Content-Type: application/json" \
 ///   -d '{"payment_id": "696e766f6963652d3132333435"}'
 /// ```

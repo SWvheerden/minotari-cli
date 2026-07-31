@@ -20,15 +20,15 @@ use tari_common_types::tari_address::{TariAddress, TariAddressFeatures};
 use tari_transaction_components::key_manager::wallet_types::WalletType;
 use tokio::time::sleep;
 
-use super::common::MinotariWorld;
 use super::common::test_support;
+use super::common::{MinotariWorld, api_args, api_client};
 
 // =============================
 // Helper Functions
 // =============================
 
-/// Find an unused port in a given range. The daemon binds `0.0.0.0:<port>`, so
-/// we probe the same wildcard address — probing `127.0.0.1` would report a port
+/// Find an unused port in a given range. The daemon binds `127.0.0.1:<port>`, but
+/// we probe the wildcard address — probing `127.0.0.1` alone would report a port
 /// as free even when another process holds `0.0.0.0:<port>`.
 fn find_free_port(start: u16, end: u16) -> u16 {
     for port in start..end {
@@ -39,13 +39,11 @@ fn find_free_port(start: u16, end: u16) -> u16 {
     panic!("No free port found in range {}..{}", start, end);
 }
 
-/// HTTP client with a bounded timeout so a hung or stale daemon fails fast with
-/// a clear error instead of blocking the whole scenario until CI times out.
+/// Authenticated HTTP client with a bounded timeout so a hung or stale daemon
+/// fails fast with a clear error instead of blocking the whole scenario until CI
+/// times out.
 fn http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .expect("Failed to build HTTP client")
+    api_client(Duration::from_secs(15))
 }
 
 /// Wait until the freshly-spawned daemon is actually serving its HTTP API before
@@ -53,10 +51,7 @@ fn http_client() -> reqwest::Client {
 /// never came up (e.g. it failed to bind its port because a stale daemon from a
 /// prior run is squatting on it), which hangs the next request indefinitely.
 async fn wait_for_daemon_ready(child: &mut std::process::Child, port: u16) {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .expect("Failed to build HTTP client");
+    let client = api_client(Duration::from_secs(2));
     let url = format!(
         "http://127.0.0.1:{}/accounts/default/displayed_transactions?limit=1",
         port
@@ -265,6 +260,7 @@ async fn start_daemon_on_free_port(world: &mut MinotariWorld) {
     args.push(db_path.to_str().unwrap().to_string());
     args.push("--api-port".to_string());
     args.push(port.to_string());
+    args.extend(api_args());
 
     // Connect to the first base node if available
     if !world.base_nodes.is_empty() {

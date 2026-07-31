@@ -19,6 +19,8 @@
 //! use std::path::PathBuf;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let (token, _generated) = minotari::api::resolve_api_token(None, None)?;
+//! let auth = minotari::api::ApiAuth::Required(token);
 //! let daemon = Daemon::new(
 //!     "password".to_string(),
 //!     "https://rpc.tari.com".to_string(),
@@ -26,7 +28,7 @@
 //!     100,    // max_blocks per scan
 //!     10,     // batch_size
 //!     60,     // scan_interval_secs
-//!     3000,   // api_port
+//!     ApiServerConfig { bind_address: "127.0.0.1".to_string(), port: 3000, auth },
 //!     Network::Esmeralda,
 //! );
 //!
@@ -54,7 +56,8 @@ use tokio::{signal, sync::broadcast, time::sleep};
 use tari_common::configuration::Network;
 
 use crate::{
-    api, db,
+    api::{self, ApiAuth},
+    db,
     http::WalletHttpClient,
     scan::{self, ScanError, ScanMode},
     tasks::{burn_proof_worker::BurnProofWorker, unlocker::TransactionUnlocker},
@@ -63,6 +66,58 @@ use crate::{
         worker::{WebhookWorker, WebhookWorkerConfig},
     },
 };
+
+/// How the daemon's REST API is exposed.
+///
+/// Bundled into one struct so the bind address and the authentication that guards
+/// it are always configured together - how far the API reaches and who may call it
+/// are one decision, not two.
+#[derive(Debug, Clone)]
+pub struct ApiServerConfig {
+    /// Interface to bind, e.g. `127.0.0.1` (default) or `0.0.0.0`.
+    pub bind_address: String,
+    /// TCP port to bind.
+    pub port: u16,
+    /// Token every caller must present, or [`ApiAuth::Disabled`].
+    pub auth: ApiAuth,
+}
+
+impl ApiServerConfig {
+    /// Socket address to bind, as `<address>:<port>`.
+    ///
+    /// A bare IPv6 address is wrapped in brackets, since `::1:9000` is itself a
+    /// valid IPv6 address and would otherwise be parsed as one rather than as an
+    /// address and a port.
+    fn socket_addr(&self) -> String {
+        let address = self.host();
+        if address.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("[{}]:{}", address, self.port)
+        } else {
+            format!("{}:{}", address, self.port)
+        }
+    }
+
+    /// Whether the API will be reachable from outside this host.
+    ///
+    /// A hostname that does not parse as an IP is treated as network-exposed:
+    /// it resolves through DNS and we cannot assume it is loopback.
+    fn is_network_exposed(&self) -> bool {
+        match self.host().parse::<std::net::IpAddr>() {
+            Ok(ip) => !ip.is_loopback(),
+            Err(_) => true,
+        }
+    }
+
+    /// The configured address with any surrounding IPv6 brackets removed, so
+    /// `::1` and `[::1]` are treated as the same address.
+    fn host(&self) -> &str {
+        let address = self.bind_address.trim();
+        address
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .unwrap_or(address)
+    }
+}
 
 /// Daemon for running the wallet in continuous background mode.
 ///
@@ -76,7 +131,7 @@ pub struct Daemon {
     max_blocks: u64,
     batch_size: u64,
     scan_interval: Duration,
-    api_port: u16,
+    api: ApiServerConfig,
     network: Network,
     required_confirmations: u64,
     webhook_config: WebhookWorkerConfig,
@@ -95,7 +150,7 @@ impl Daemon {
     /// * `max_blocks` - Maximum number of blocks to scan per iteration
     /// * `batch_size` - Number of blocks to scan per batch
     /// * `scan_interval_secs` - Seconds to wait between scan cycles
-    /// * `api_port` - Port to bind the HTTP API server to
+    /// * `api` - Bind address, port and authentication for the HTTP API server
     /// * `network` - Tari network configuration (Esmeralda, Nextnet, Mainnet, etc.)
     /// * `required_confirmations` - Required confirmations
     /// * `webhook_url` - Webhook URL
@@ -108,7 +163,7 @@ impl Daemon {
         max_blocks: u64,
         batch_size: u64,
         scan_interval_secs: u64,
-        api_port: u16,
+        api: ApiServerConfig,
         network: Network,
         required_confirmations: u64,
         webhook_url: Option<String>,
@@ -133,7 +188,7 @@ impl Daemon {
             max_blocks,
             batch_size,
             scan_interval: Duration::from_secs(scan_interval_secs),
-            api_port,
+            api,
             network,
             required_confirmations,
             webhook_config: webhook_worker_config,
@@ -190,13 +245,42 @@ impl Daemon {
             self.password.clone(),
             self.required_confirmations,
             self.base_url.clone(),
+            self.api.auth.clone(),
         );
-        let addr = format!("0.0.0.0:{}", self.api_port);
+        let addr = self.api.socket_addr();
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .map_err(|e| ScanError::Fatal(anyhow!("Failed to bind API server to {}: {}", addr, e)))?;
 
-        info!(address = &*addr; "API server listening");
+        let authenticated = !self.api.auth.is_disabled();
+        if self.api.is_network_exposed() {
+            warn!(
+                target: "audit",
+                address = &*addr,
+                authenticated = authenticated;
+                "API server is bound to a non-loopback address and is reachable from the network. Ensure access is \
+                 restricted (firewall or TLS-terminating reverse proxy)."
+            );
+        }
+        if !authenticated {
+            // Loud on both channels: this is the one configuration in which anyone
+            // who can reach the port can drain the wallet.
+            warn!(
+                target: "audit",
+                address = &*addr;
+                "API authentication is DISABLED. Every endpoint, including burn and transaction creation, will \
+                 answer any caller that can reach this address."
+            );
+            eprintln!(
+                "WARNING: API authentication is disabled ({addr}). Anyone who can reach this address can spend from \
+                 this wallet. Remove `--api-disable-auth` / `api_disable_auth` to re-enable it."
+            );
+        }
+        info!(
+            address = &*addr,
+            authenticated = authenticated;
+            "API server listening"
+        );
 
         let mut shutdown_rx_api = shutdown_tx.subscribe();
         let api_server_handle = tokio::spawn(async move {
@@ -353,6 +437,60 @@ impl Daemon {
                 info!("Scanner task received shutdown signal. Exiting gracefully.");
                 true
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(bind_address: &str) -> ApiServerConfig {
+        ApiServerConfig {
+            bind_address: bind_address.to_string(),
+            port: 9000,
+            auth: ApiAuth::Required(crate::api::ApiToken::new("daemon-test-token-0123456789").unwrap()),
+        }
+    }
+
+    #[test]
+    fn loopback_addresses_are_not_network_exposed() {
+        assert!(!config("127.0.0.1").is_network_exposed());
+        assert!(!config("127.0.0.2").is_network_exposed());
+        assert!(!config("::1").is_network_exposed());
+    }
+
+    #[test]
+    fn routable_and_unresolved_addresses_are_network_exposed() {
+        assert!(config("0.0.0.0").is_network_exposed());
+        assert!(config("192.168.1.10").is_network_exposed());
+        assert!(config("::").is_network_exposed());
+        // A hostname could resolve anywhere, so it is treated as exposed.
+        assert!(config("wallet.internal").is_network_exposed());
+    }
+
+    #[test]
+    fn socket_addr_joins_address_and_port() {
+        assert_eq!(config("127.0.0.1").socket_addr(), "127.0.0.1:9000");
+        assert_eq!(config("localhost").socket_addr(), "localhost:9000");
+    }
+
+    #[test]
+    fn socket_addr_brackets_ipv6_addresses() {
+        assert_eq!(config("::1").socket_addr(), "[::1]:9000");
+        assert_eq!(config("::").socket_addr(), "[::]:9000");
+        // Already bracketed input is left alone rather than double-wrapped.
+        assert_eq!(config("[::1]").socket_addr(), "[::1]:9000");
+    }
+
+    #[test]
+    fn socket_addr_parses_as_a_socket_address() {
+        for address in ["127.0.0.1", "0.0.0.0", "::1", "::"] {
+            let addr = config(address).socket_addr();
+            assert!(
+                addr.parse::<std::net::SocketAddr>().is_ok(),
+                "{addr} should parse as a socket address"
+            );
         }
     }
 }

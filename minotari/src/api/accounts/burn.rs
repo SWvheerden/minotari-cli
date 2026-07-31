@@ -100,7 +100,8 @@ pub struct BurnFundsResponse {
 /// # Example Request
 ///
 /// ```bash
-/// curl -X POST http://localhost:9000/accounts/default/burn \
+/// curl -X POST http://127.0.0.1:9000/accounts/default/burn \
+///   -H "Authorization: Bearer $MINOTARI_API_TOKEN" \
 ///   -H "Content-Type: application/json" \
 ///   -d '{"amount": 1000000, "claim_public_key": "a3f9..."}'
 /// ```
