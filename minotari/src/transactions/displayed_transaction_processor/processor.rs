@@ -14,7 +14,7 @@ use tari_common_types::transaction::TxId;
 use tari_common_types::types::FixedHash;
 use tari_common_types::types::PrivateKey;
 use tari_transaction_components::MicroMinotari;
-use tari_transaction_components::transaction_components::OutputType;
+use tari_transaction_components::transaction_components::{OutputType, WalletOutput};
 use tari_utilities::ByteArray;
 
 /// Processes balance changes into user-displayable transactions.
@@ -234,9 +234,12 @@ impl DisplayedTransactionProcessor {
             if let Some((_sender, amount, _tx_type, _one_sided)) =
                 output.1.output.payment_id().get_transaction_info_details()
             {
-                let total_send =
-                    amount + output.1.output.value() + output.1.output.payment_id().get_fee().unwrap_or_default();
-                targets.push((total_send, i));
+                if let Some(total_send) = Self::claimed_total_send(&output.1.output, amount) {
+                    targets.push((total_send, i));
+                } else {
+                    debug!("Claimed send total overflows u64, treating output as unmatched");
+                    unmatched_index.push(i);
+                }
             } else {
                 unmatched_index.push(i);
             }
@@ -271,8 +274,8 @@ impl DisplayedTransactionProcessor {
                 .payment_id()
                 .get_transaction_info_details()
                 .ok_or(ProcessorError::MissingError("Missing Output details".to_string()))?;
-            let total_send = amount + output.output.value() + output.output.payment_id().get_fee().unwrap_or_default();
-            if total_send != balance {
+            let total_send = Self::claimed_total_send(&output.output, amount);
+            if total_send != Some(balance) {
                 unmatched_index.push(output_index);
                 debug!("Output does not have a matching input solution");
                 continue;
@@ -325,6 +328,20 @@ impl DisplayedTransactionProcessor {
         result.append(&mut self.handle_unmatched_inputs_outputs(inputs, &outputs, &unmatched_index, accumulator)?);
 
         Ok(result)
+    }
+
+    /// The total value the sender claims left their wallet for this transaction: the amount the memo says was paid to
+    /// the recipient, plus the change output we received, plus the claimed fee.
+    ///
+    /// The claimed amount and fee are decrypted verbatim from the sender-controlled memo and are never validated
+    /// against the commitment, so both can be any `u64`. The sum is therefore done with `checked_add`: a memo claiming
+    /// `u64::MAX` would otherwise overflow and panic the scanner, and since the output stays on chain forever every
+    /// subsequent rescan would panic again. `None` means the claim is not representable and so can never be matched by
+    /// a real set of inputs; callers treat the output as unmatched.
+    fn claimed_total_send(output: &WalletOutput, claimed_amount: MicroMinotari) -> Option<MicroMinotari> {
+        claimed_amount
+            .checked_add(output.value())?
+            .checked_add(output.payment_id().get_fee().unwrap_or_default())
     }
 
     pub fn solve_back_track(
@@ -1861,5 +1878,125 @@ mod tests {
         let result = processor.search_inputs(inputs, outputs, &accumulator).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].status, TransactionDisplayStatus::Unconfirmed);
+    }
+
+    // ── Hostile memo claims ─────────────────────────────────────────────────────
+
+    /// Builds an output whose memo carries a `TransactionInfo` claim. Both the claimed amount and the claimed fee are
+    /// chosen by whoever sent the output, so tests use this to feed arbitrary values through the matcher.
+    fn mock_output_claiming(
+        value: u64,
+        claimed_amount: u64,
+        claimed_fee: u64,
+        hash_byte: u8,
+        height: u64,
+    ) -> DetectedOutput {
+        use tari_common_types::tari_address::TariAddress;
+        use tari_common_types::types::{ComAndPubSignature, CompressedPublicKey};
+        use tari_script::{ExecutionStack, TariScript};
+        use tari_transaction_components::{
+            key_manager::TariKeyId,
+            transaction_components::{
+                EncryptedData, MemoField, OutputFeatures, TransactionOutputVersion, WalletOutput, covenants::Covenant,
+                memo_field::TxType,
+            },
+        };
+
+        let memo = MemoField::transaction_info_unchecked(
+            TariAddress::default(),
+            true,
+            MicroMinotari::from(claimed_amount),
+            MicroMinotari::from(claimed_fee),
+            TxType::PaymentToOther,
+            vec![],
+            vec![],
+        );
+
+        let output = WalletOutput::new_from_parts(
+            TransactionOutputVersion::default(),
+            MicroMinotari::from(value),
+            TariKeyId::default(),
+            OutputFeatures::default(),
+            TariScript::default(),
+            ExecutionStack::default(),
+            TariKeyId::default(),
+            CompressedPublicKey::default(),
+            ComAndPubSignature::default(),
+            0,
+            Covenant::default(),
+            EncryptedData::default(),
+            MicroMinotari::from(0),
+            None,
+            memo,
+            mock_fixed_hash(0),
+            Default::default(),
+        );
+
+        DetectedOutput {
+            height,
+            mined_in_block_hash: mock_fixed_hash(hash_byte),
+            output,
+        }
+    }
+
+    #[test]
+    fn test_claimed_total_send_sums_amount_value_and_fee() {
+        let output = mock_output_claiming(200, 1000, 25, 1, 50);
+        assert_eq!(
+            DisplayedTransactionProcessor::claimed_total_send(&output.output, MicroMinotari::from(1000)),
+            Some(MicroMinotari::from(1225))
+        );
+    }
+
+    #[test]
+    fn test_claimed_total_send_returns_none_on_overflow() {
+        // Claimed amount alone saturates u64, so adding our own output value overflows.
+        let output = mock_output_claiming(1, u64::MAX, 0, 1, 50);
+        assert_eq!(
+            DisplayedTransactionProcessor::claimed_total_send(&output.output, MicroMinotari::from(u64::MAX)),
+            None
+        );
+
+        // Amount plus value fits, but the claimed fee pushes it over.
+        let output = mock_output_claiming(1, u64::MAX - 1, 5, 1, 50);
+        assert_eq!(
+            DisplayedTransactionProcessor::claimed_total_send(&output.output, MicroMinotari::from(u64::MAX - 1)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_search_inputs_survives_memo_claiming_max_amount() {
+        // A sender can put any amount in the memo; it is decrypted verbatim and never checked against the
+        // commitment. Summing it unchecked used to panic the scanner, and because the output stays on chain every
+        // rescan panicked again.
+        let processor = DisplayedTransactionProcessor::new(100, 3, PrivateKey::default());
+        let accumulator = BlockEventAccumulator::new(1, 50, vec![0u8; 32]);
+
+        let inputs = vec![(create_debit_balance_change(1, 100, 50), mock_spent_input(100, 1))];
+        let outputs = vec![(
+            create_credit_balance_change(1, 1, 50),
+            mock_output_claiming(1, u64::MAX, u64::MAX, 2, 50),
+        )];
+
+        let result = processor.search_inputs(inputs, outputs, &accumulator).unwrap();
+        // The unmatchable output and the leftover input each become their own transaction.
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_create_new_updated_survives_memo_claiming_max_amount() {
+        let processor = DisplayedTransactionProcessor::new(100, 3, PrivateKey::default());
+        let mut accumulator = BlockEventAccumulator::new(1, 50, vec![0u8; 32]);
+        accumulator.add_credit_change(
+            create_credit_balance_change(1, 1, 50),
+            mock_output_claiming(1, u64::MAX, 0, 2, 50),
+        );
+
+        let (updated, new) = processor
+            .create_new_updated_display_transactions(&accumulator, &[])
+            .unwrap();
+        assert!(updated.is_empty());
+        assert_eq!(new.len(), 1);
     }
 }
