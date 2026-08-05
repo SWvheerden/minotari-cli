@@ -210,8 +210,12 @@ pub fn create_burn_tx(
     // Generate the ownership proof: a Schnorr signature binding the commitment to
     // the claim public key. Needed by L2 to verify the burn.
     let new_burn_proof = if let Some(cpk) = params.claim_public_key {
-        let ownership_proof =
-            key_manager.generate_burn_claim_signature(&commitment_mask_key.key_id, params.amount.as_u64(), &cpk)?;
+        let ownership_proof = key_manager.generate_burn_claim_signature(
+            &commitment_mask_key.key_id,
+            params.amount.as_u64(),
+            &cpk,
+            None,
+        )?;
 
         let kernel = finalized
             .transaction

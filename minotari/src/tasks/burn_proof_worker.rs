@@ -286,6 +286,7 @@ mod tests {
             block_hash: FixedHash::default(),
             encoded_merkle_proof: vec![1, 2, 3],
             leaf_index: 42,
+            block_height: Some(1),
         }
     }
 
