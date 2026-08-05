@@ -67,7 +67,8 @@ use minotari::{
     scan::{self, reorg::rollback_from_height},
     transactions::{
         fund_locker::FundLocker,
-        one_sided_transaction::{OneSidedTransaction, Recipient},
+        idempotency::{IdempotencyBinding, IdempotencyOperation, RequestFingerprint},
+        one_sided_transaction::{OneSidedTransaction, Recipient, unsigned_transaction_binding},
     },
     utils::{self, crypto::PasswordCipher},
     webhooks::WebhookTriggerConfig,
@@ -772,6 +773,16 @@ fn handle_create_unsigned_transaction(
     let fee_per_gram = MicroMinotari(5);
     let estimated_output_size = None;
 
+    // Same binding the REST endpoint builds, so a key means the same thing
+    // whichever way the request arrives.
+    let idempotency = unsigned_transaction_binding(
+        idempotency_key,
+        account.id,
+        &recipients,
+        fee_per_gram,
+        seconds_to_lock,
+        confirmation_window,
+    );
     let lock_amount = FundLocker::new(pool.clone());
     let locked_funds = lock_amount
         .lock(
@@ -780,7 +791,7 @@ fn handle_create_unsigned_transaction(
             num_outputs,
             fee_per_gram,
             estimated_output_size,
-            idempotency_key,
+            idempotency,
             seconds_to_lock,
             confirmation_window,
         )
@@ -809,17 +820,38 @@ fn handle_lock_funds(
     let conn = pool.get()?;
     let account =
         db::get_account_by_name(&conn, &account_name)?.ok_or_else(|| anyhow!("Account not found: {}", account_name))?;
+    let num_outputs = request.num_outputs.expect("must be present");
+    let fee_per_gram = request.fee_per_gram.expect("must be present");
+    let seconds_to_lock_utxos = request.seconds_to_lock_utxos.expect("must be present");
+    let confirmation_window = request.confirmation_window.expect("must be present");
+    // Mirrors the fingerprint built by `api_lock_funds`, so the same key and the
+    // same parameters mean the same reservation from either entry point.
+    let idempotency = IdempotencyBinding::new(
+        request.idempotency_key,
+        IdempotencyOperation::LockFunds,
+        RequestFingerprint::new(IdempotencyOperation::LockFunds)
+            .field("account_id", account.id.to_le_bytes())
+            .field("amount", request.amount.as_u64().to_le_bytes())
+            .field("num_outputs", (num_outputs as u64).to_le_bytes())
+            .field("fee_per_gram", fee_per_gram.as_u64().to_le_bytes())
+            .optional_field(
+                "estimated_output_size",
+                request.estimated_output_size.map(|s| (s as u64).to_le_bytes()),
+            )
+            .field("seconds_to_lock_utxos", seconds_to_lock_utxos.to_le_bytes())
+            .field("confirmation_window", confirmation_window.to_le_bytes()),
+    );
     let lock_amount = FundLocker::new(pool.clone());
     let result = lock_amount
         .lock(
             account.id,
             request.amount,
-            request.num_outputs.expect("must be present"),
-            request.fee_per_gram.expect("must be present"),
+            num_outputs,
+            fee_per_gram,
             request.estimated_output_size,
-            request.idempotency_key,
-            request.seconds_to_lock_utxos.expect("must be present"),
-            request.confirmation_window.expect("must be present"),
+            idempotency,
+            seconds_to_lock_utxos,
+            confirmation_window,
         )
         .map_err(|e| anyhow!("Failed to lock funds: {}", e))?;
 

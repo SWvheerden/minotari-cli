@@ -59,6 +59,11 @@ pub struct BurnFundsRequest {
     pub payment_id: Option<String>,
 
     /// Optional idempotency key to prevent duplicate burn requests.
+    ///
+    /// The key is bound to this burn's parameters and to the burn operation
+    /// itself, so a key issued elsewhere (for example at `lock_funds`) cannot be
+    /// redeemed here, and reusing a burn key with different parameters is
+    /// rejected with 409 Conflict.
     pub idempotency_key: Option<String>,
 
     /// Seconds to lock input UTXOs (default: 86400 = 24 h, max: 31536000 = 365 days).
@@ -121,6 +126,7 @@ pub struct BurnFundsResponse {
         (status = 200, description = "Burn transaction broadcast successfully", body = BurnFundsResponse),
         (status = 400, description = "Invalid request parameters", body = ApiError),
         (status = 404, description = "Account not found", body = ApiError),
+        (status = 409, description = "Idempotency key reused for a different request", body = ApiError),
         (status = 500, description = "Burn failed", body = ApiError),
     ),
     params(

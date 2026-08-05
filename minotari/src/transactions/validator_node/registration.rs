@@ -32,6 +32,7 @@ use tari_transaction_components::{
 
 use super::common::build_vn_pay_to_self_tx;
 use crate::db::{AccountRow, SqlitePool};
+use crate::transactions::idempotency::IdempotencyOperation;
 
 /// Parameters for validator node registration
 ///
@@ -112,6 +113,6 @@ pub fn create_validator_node_registration_tx(
         idempotency_key,
         seconds_to_lock,
         confirmation_window,
-        "validator node registration",
+        IdempotencyOperation::ValidatorNodeRegistration,
     )
 }

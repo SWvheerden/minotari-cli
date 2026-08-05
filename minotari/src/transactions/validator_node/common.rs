@@ -4,6 +4,7 @@
 //! minimum deposit and build a single pay-to-self output with operation-specific
 //! [`OutputFeatures`]. This module extracts that common pattern.
 
+use anyhow::anyhow;
 use log::info;
 use tari_common::configuration::Network;
 use tari_common_types::transaction::TxId;
@@ -20,7 +21,10 @@ use tari_transaction_components::{
 
 use crate::{
     db::{AccountRow, SqlitePool},
-    transactions::fund_locker::FundLocker,
+    transactions::{
+        fund_locker::FundLocker,
+        idempotency::{IdempotencyBinding, IdempotencyOperation, RequestFingerprint},
+    },
 };
 
 /// Locks the VN registration deposit and prepares a pay-to-self transaction for signing.
@@ -28,6 +32,9 @@ use crate::{
 /// Used by all three VN operations (registration, exit, eviction) which share the same
 /// transaction shape: one output sent back to the sender, carrying operation-specific
 /// `output_features`.
+///
+/// `operation` both names the transaction in the audit log and scopes the
+/// idempotency key, so a registration key cannot be redeemed for an exit.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_vn_pay_to_self_tx(
     account: &AccountRow,
@@ -40,7 +47,7 @@ pub(crate) fn build_vn_pay_to_self_tx(
     idempotency_key: Option<String>,
     seconds_to_lock: u64,
     confirmation_window: u64,
-    tx_description: &str,
+    operation: IdempotencyOperation,
 ) -> Result<PrepareOneSidedTransactionForSigningResult, anyhow::Error> {
     let consensus_constants = ConsensusConstantsBuilder::new(network).build();
     let deposit_amount = consensus_constants.validator_node_registration_min_deposit_amount();
@@ -48,7 +55,26 @@ pub(crate) fn build_vn_pay_to_self_tx(
     info!(
         target: "audit",
         deposit_amount = deposit_amount.as_u64();
-        "Creating {} transaction", tx_description
+        "Creating {} transaction", operation.description()
+    );
+
+    // `output_features` carries everything that distinguishes one VN operation
+    // from another — the node public key, its signature, the claim key, the max
+    // epoch, the eviction proof — so hashing its canonical encoding binds the
+    // key to the specific node action being requested.
+    let encoded_features = serde_json::to_vec(&output_features)
+        .map_err(|e| anyhow!("Failed to encode validator node output features: {}", e))?;
+    let idempotency = IdempotencyBinding::new(
+        idempotency_key,
+        operation,
+        RequestFingerprint::new(operation)
+            .field("account_id", account.id.to_le_bytes())
+            .field("deposit_amount", deposit_amount.as_u64().to_le_bytes())
+            .field("output_features", encoded_features)
+            .field("fee_per_gram", fee_per_gram.as_u64().to_le_bytes())
+            .optional_field("payment_id", payment_id)
+            .field("seconds_to_lock", seconds_to_lock.to_le_bytes())
+            .field("confirmation_window", confirmation_window.to_le_bytes()),
     );
 
     let sender_address = account.get_address(network, password)?;
@@ -59,7 +85,7 @@ pub(crate) fn build_vn_pay_to_self_tx(
         1,
         fee_per_gram,
         None,
-        idempotency_key,
+        idempotency,
         seconds_to_lock,
         confirmation_window,
     )?;

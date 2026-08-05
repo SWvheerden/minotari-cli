@@ -93,6 +93,7 @@ use crate::{
             TransactionInput, TransactionSource,
         },
         fund_locker::lock_expiry_at,
+        idempotency::{IdempotencyBinding, IdempotencyOperation, RequestFingerprint},
         input_selector::{InputSelector, UtxoSelection},
         one_sided_transaction::Recipient,
     },
@@ -151,6 +152,25 @@ impl ProcessedTransaction {
     /// Updates the transaction ID after the pending transaction is created.
     pub fn update_id(&mut self, id: String) {
         self.id = Some(id);
+    }
+
+    /// Binds this transaction's idempotency key to the payment it describes.
+    ///
+    /// Without the recipient in the fingerprint, replaying the key with a
+    /// different address would return this transaction's reserved UTXOs and
+    /// build a payment to whoever the replay named.
+    fn idempotency_binding(&self, account_id: i64) -> IdempotencyBinding {
+        let operation = IdempotencyOperation::SendTransaction;
+        IdempotencyBinding::new(
+            Some(self.idempotency_key.clone()),
+            operation,
+            RequestFingerprint::new(operation)
+                .field("account_id", account_id.to_le_bytes())
+                .field("recipient_address", self.recipient.address.to_base58())
+                .field("recipient_amount", self.recipient.amount.as_u64().to_le_bytes())
+                .optional_field("recipient_payment_id", self.recipient.payment_id.as_deref())
+                .field("seconds_to_lock_utxos", self.seconds_to_lock_utxos.to_le_bytes()),
+        )
     }
 }
 
@@ -368,6 +388,7 @@ impl TransactionSender {
         let pending_tx_id = db::create_pending_transaction(
             &transaction,
             &processed_transaction.idempotency_key,
+            &processed_transaction.idempotency_binding(self.account.id),
             self.account.id,
             utxo_selection.requires_change_output,
             utxo_selection.total_value,
@@ -398,13 +419,18 @@ impl TransactionSender {
     ) -> Result<String, anyhow::Error> {
         let connection = self.get_connection()?;
 
-        let response = db::find_pending_transaction_by_idempotency_key(
+        let response = db::find_pending_transaction_record_by_idempotency_key(
             &connection,
             &processed_transaction.idempotency_key,
             self.account.id,
         )?;
-        if let Some(pending_tx) = response {
-            Ok(pending_tx.id.to_string())
+        if let Some(record) = response {
+            // The key alone does not entitle this request to that reservation:
+            // it must be the same operation with the same recipient and amount.
+            processed_transaction
+                .idempotency_binding(self.account.id)
+                .check_matches(&record.operation, &record.request_hash)?;
+            Ok(record.id)
         } else {
             let pending_tx_id = self.create_pending_transaction(processed_transaction)?;
             Ok(pending_tx_id)

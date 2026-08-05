@@ -73,6 +73,7 @@ pub mod burn;
 pub mod displayed_transaction_processor;
 pub mod fee_estimator;
 pub mod fund_locker;
+pub mod idempotency;
 pub mod input_selector;
 pub mod manager;
 pub mod monitor;
