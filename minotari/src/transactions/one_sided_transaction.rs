@@ -41,6 +41,7 @@
 //! ```
 
 use crate::db::SqlitePool;
+use crate::transactions::idempotency::{IdempotencyBinding, IdempotencyOperation, RequestFingerprint};
 use crate::{api::types::LockFundsResult, db::AccountRow};
 use anyhow::anyhow;
 use log::info;
@@ -86,6 +87,39 @@ pub struct Recipient {
     pub amount: MicroMinotari,
     /// Optional payment identifier or memo attached to the transaction.
     pub payment_id: Option<String>,
+}
+
+/// Binds an idempotency key to an unsigned-transaction request.
+///
+/// The recipients are the whole point of the binding. Without them, replaying a
+/// client's key with a different `recipients` list would return that client's
+/// locked UTXOs and build an unsigned transaction paying whoever the replay
+/// named. Every caller of `create_unsigned_transaction` must build its binding
+/// here so no entry point can forget a field.
+pub fn unsigned_transaction_binding(
+    idempotency_key: Option<String>,
+    account_id: i64,
+    recipients: &[Recipient],
+    fee_per_gram: MicroMinotari,
+    seconds_to_lock_utxos: u64,
+    confirmation_window: u64,
+) -> IdempotencyBinding {
+    let operation = IdempotencyOperation::CreateUnsignedTransaction;
+    let mut fingerprint = RequestFingerprint::new(operation)
+        .field("account_id", account_id.to_le_bytes())
+        .field("fee_per_gram", fee_per_gram.as_u64().to_le_bytes())
+        .field("seconds_to_lock_utxos", seconds_to_lock_utxos.to_le_bytes())
+        .field("confirmation_window", confirmation_window.to_le_bytes())
+        // Bound the list itself, so dropping or appending a recipient cannot be
+        // hidden by the remaining entries hashing the same.
+        .field("recipient_count", (recipients.len() as u64).to_le_bytes());
+    for recipient in recipients {
+        fingerprint = fingerprint
+            .field("recipient_address", recipient.address.to_base58())
+            .field("recipient_amount", recipient.amount.as_u64().to_le_bytes())
+            .optional_field("recipient_payment_id", recipient.payment_id.as_deref());
+    }
+    IdempotencyBinding::new(idempotency_key, operation, fingerprint)
 }
 
 /// Builder for creating unsigned one-sided transactions.

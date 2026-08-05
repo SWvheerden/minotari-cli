@@ -19,7 +19,8 @@ use crate::{
     log::mask_amount,
     transactions::{
         fund_locker::{FundLocker, MAX_SECONDS_TO_LOCK_UTXOS, validate_seconds_to_lock},
-        one_sided_transaction::{OneSidedTransaction, Recipient},
+        idempotency::{IdempotencyBinding, IdempotencyOperation, RequestFingerprint},
+        one_sided_transaction::{OneSidedTransaction, Recipient, unsigned_transaction_binding},
     },
 };
 
@@ -105,9 +106,13 @@ pub struct LockFundsRequest {
 
     /// Optional idempotency key to prevent duplicate requests.
     ///
-    /// If provided, subsequent requests with the same key will return the
-    /// cached result from the original request rather than locking additional
-    /// funds.
+    /// If provided, a later request with the same key returns the cached result
+    /// from the original request rather than locking additional funds.
+    ///
+    /// The key is bound to this request: reusing it with any field changed, or
+    /// at a different endpoint, is rejected with 409 Conflict instead of
+    /// returning the original lock. A key whose transaction has completed or
+    /// expired cannot be reused either.
     pub idempotency_key: Option<String>,
 
     /// Number of confirmations required before spending locked UTXOs.
@@ -200,8 +205,10 @@ pub struct CreateTransactionRequest {
 
     /// Optional idempotency key to prevent duplicate transactions.
     ///
-    /// If the same key is used in multiple requests, subsequent requests will
-    /// return the original transaction rather than creating a new one.
+    /// Reusing the key returns the original transaction rather than creating a
+    /// new one. The key is bound to the recipients, amounts and payment ids
+    /// below: a request that reuses the key with a different recipient list is
+    /// rejected with 409 Conflict, never served from the original lock.
     idempotency_key: Option<String>,
 
     #[schema(schema_with = confirmation_window_schema)]
@@ -259,6 +266,7 @@ pub struct CreateTransactionRequest {
         (status = 200, description = "Funds locked successfully", body = LockFundsResult),
         (status = 400, description = "Bad request", body = ApiError),
         (status = 404, description = "Account not found", body = ApiError),
+        (status = 409, description = "Idempotency key reused for a different request", body = ApiError),
         (status = 500, description = "Internal server error", body = ApiError),
     ),
     params(
@@ -299,6 +307,24 @@ pub async fn api_lock_funds(
 
         let lock_amount = FundLocker::new(pool);
         let confirmation_window = body.confirmation_window.unwrap_or(default_confirmations);
+        // Every field below changes which UTXOs get reserved or for how long, so
+        // all of them are bound to the key: a replay that alters any of them is
+        // a different request and must not inherit this reservation.
+        let idempotency = IdempotencyBinding::new(
+            body.idempotency_key,
+            IdempotencyOperation::LockFunds,
+            RequestFingerprint::new(IdempotencyOperation::LockFunds)
+                .field("account_id", account.id.to_le_bytes())
+                .field("amount", body.amount.as_u64().to_le_bytes())
+                .field("num_outputs", (num_outputs as u64).to_le_bytes())
+                .field("fee_per_gram", fee_per_gram.as_u64().to_le_bytes())
+                .optional_field(
+                    "estimated_output_size",
+                    body.estimated_output_size.map(|s| (s as u64).to_le_bytes()),
+                )
+                .field("seconds_to_lock_utxos", seconds_to_lock_utxos.to_le_bytes())
+                .field("confirmation_window", confirmation_window.to_le_bytes()),
+        );
         lock_amount
             .lock(
                 account.id,
@@ -306,11 +332,11 @@ pub async fn api_lock_funds(
                 num_outputs,
                 fee_per_gram,
                 body.estimated_output_size,
-                body.idempotency_key,
+                idempotency,
                 seconds_to_lock_utxos,
                 confirmation_window,
             )
-            .map_err(|e| ApiError::FailedToLockFunds(e.to_string()))
+            .map_err(|e| ApiError::from_transaction_error(e, ApiError::FailedToLockFunds))
     })
     .await
     .map_err(|e| ApiError::InternalServerError(format!("Task join error: {}", e)))??;
@@ -382,6 +408,7 @@ pub async fn api_lock_funds(
         (status = 200, description = "Unsigned transaction created successfully", body = JsonValue),
         (status = 400, description = "Bad request", body = ApiError),
         (status = 404, description = "Account not found", body = ApiError),
+        (status = 409, description = "Idempotency key reused for a different request", body = ApiError),
         (status = 500, description = "Internal server error", body = ApiError),
     ),
     params(
@@ -434,6 +461,17 @@ pub async fn api_create_unsigned_transaction(
         let estimated_output_size = None;
 
         let confirmation_window = body.confirmation_window.unwrap_or(default_confirmations);
+        // Bind the key to the recipients this request names. A replay carrying
+        // different recipients is rejected here rather than being handed the
+        // original request's locked UTXOs to pay them out of.
+        let idempotency = unsigned_transaction_binding(
+            body.idempotency_key,
+            account.id,
+            &recipients,
+            fee_per_gram,
+            seconds_to_lock_utxos,
+            confirmation_window,
+        );
         let lock_amount = FundLocker::new(pool.clone());
         let locked_funds = lock_amount
             .lock(
@@ -442,11 +480,11 @@ pub async fn api_create_unsigned_transaction(
                 num_outputs,
                 fee_per_gram,
                 estimated_output_size,
-                body.idempotency_key,
+                idempotency,
                 seconds_to_lock_utxos,
                 confirmation_window,
             )
-            .map_err(|e| ApiError::FailedToLockFunds(e.to_string()))?;
+            .map_err(|e| ApiError::from_transaction_error(e, ApiError::FailedToLockFunds))?;
         let one_sided_tx = OneSidedTransaction::new(pool, network, password);
         one_sided_tx
             .create_unsigned_transaction(&account, locked_funds, recipients, fee_per_gram)

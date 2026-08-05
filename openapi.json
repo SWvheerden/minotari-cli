@@ -252,6 +252,16 @@
               }
             }
           },
+          "409": {
+            "description": "Idempotency key reused for a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Burn failed",
             "content": {
@@ -455,6 +465,16 @@
           },
           "404": {
             "description": "Account not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Idempotency key reused for a different request",
             "content": {
               "application/json": {
                 "schema": {
@@ -829,6 +849,16 @@
               }
             }
           },
+          "409": {
+            "description": "Idempotency key reused for a different request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Internal server error",
             "content": {
@@ -1113,6 +1143,19 @@
           },
           {
             "type": "object",
+            "description": "The request conflicts with something the wallet has already recorded.\n\nReturned when an idempotency key is replayed with a different operation\nor a different request body, or when it belongs to a transaction that is\nalready completed or no longer active. Returns HTTP 409 Conflict.\n\n# Example\n\n```json\n{\n  \"error\": \"idempotency key 'abc' was already used for a different unsigned transaction request; a key may only be retried with the exact request that created it\"\n}\n```",
+            "required": [
+              "Conflict"
+            ],
+            "properties": {
+              "Conflict": {
+                "type": "string",
+                "description": "The request conflicts with something the wallet has already recorded.\n\nReturned when an idempotency key is replayed with a different operation\nor a different request body, or when it belongs to a transaction that is\nalready completed or no longer active. Returns HTTP 409 Conflict.\n\n# Example\n\n```json\n{\n  \"error\": \"idempotency key 'abc' was already used for a different unsigned transaction request; a key may only be retried with the exact request that created it\"\n}\n```"
+              }
+            }
+          },
+          {
+            "type": "object",
             "description": "Failed to lock funds for a transaction.\n\nThis typically occurs when there are insufficient available funds\nor when UTXO selection fails. Returns HTTP 500 Internal Server Error.\n\n# Common Causes\n\n- Insufficient balance in the account\n- All UTXOs are already locked by other pending transactions\n- UTXO selection algorithm could not find suitable inputs",
             "required": [
               "FailedToLockFunds"
@@ -1212,7 +1255,7 @@
               "string",
               "null"
             ],
-            "description": "Optional idempotency key to prevent duplicate burn requests."
+            "description": "Optional idempotency key to prevent duplicate burn requests.\n\nThe key is bound to this burn's parameters and to the burn operation\nitself, so a key issued elsewhere (for example at `lock_funds`) cannot be\nredeemed here, and reusing a burn key with different parameters is\nrejected with 409 Conflict."
           },
           "payment_id": {
             "type": [
@@ -1410,7 +1453,7 @@
               "string",
               "null"
             ],
-            "description": "Optional idempotency key to prevent duplicate transactions.\n\nIf the same key is used in multiple requests, subsequent requests will\nreturn the original transaction rather than creating a new one."
+            "description": "Optional idempotency key to prevent duplicate transactions.\n\nReusing the key returns the original transaction rather than creating a\nnew one. The key is bound to the recipients, amounts and payment ids\nbelow: a request that reuses the key with a different recipient list is\nrejected with 409 Conflict, never served from the original lock."
           },
           "recipients": {
             "type": "array",
@@ -1694,7 +1737,7 @@
               "string",
               "null"
             ],
-            "description": "Optional idempotency key to prevent duplicate requests.\n\nIf provided, subsequent requests with the same key will return the\ncached result from the original request rather than locking additional\nfunds."
+            "description": "Optional idempotency key to prevent duplicate requests.\n\nIf provided, a later request with the same key returns the cached result\nfrom the original request rather than locking additional funds.\n\nThe key is bound to this request: reusing it with any field changed, or\nat a different endpoint, is rejected with 409 Conflict instead of\nreturning the original lock. A key whose transaction has completed or\nexpired cannot be reused either."
           },
           "num_outputs": {
             "type": [

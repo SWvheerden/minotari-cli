@@ -19,9 +19,16 @@
 //! Lock operations support idempotency keys, allowing clients to safely retry requests
 //! without accidentally locking additional funds. If a lock request with the same
 //! idempotency key already exists, the original result is returned.
+//!
+//! A key alone is not enough to authorise that short-circuit. Every caller must
+//! supply an [`IdempotencyBinding`], which ties the key to the operation and the
+//! exact request that created the lock; a replay that does not match is rejected
+//! as an [`IdempotencyConflict`] instead of being handed the reservation. See
+//! [`crate::transactions::idempotency`] for what that prevents.
 
 use chrono::{DateTime, TimeDelta, Utc};
 use log::{info, warn};
+use rusqlite::Connection;
 use std::sync::Mutex;
 use tari_transaction_components::tari_amount::MicroMinotari;
 use thiserror::Error;
@@ -31,7 +38,11 @@ use crate::{
     api::types::LockFundsResult,
     db::{self, SqlitePool},
     log::mask_amount,
-    transactions::input_selector::InputSelector,
+    models::PendingTransactionStatus,
+    transactions::{
+        idempotency::{IdempotencyBinding, IdempotencyConflict},
+        input_selector::InputSelector,
+    },
 };
 
 /// Upper bound, in seconds, on how long UTXOs may be locked (365 days).
@@ -95,6 +106,70 @@ pub fn lock_expiry_at(now: DateTime<Utc>, seconds_to_lock_utxos: u64) -> Result<
 /// that is no longer unspent.
 static FUND_LOCK_MUTEX: Mutex<()> = Mutex::new(());
 
+/// What an idempotency key is entitled to on the current request.
+enum Replay {
+    /// Nothing is reserved under this key; select and lock UTXOs as normal.
+    Fresh,
+    /// This request is an exact retry of the one that took the reservation, so
+    /// it gets that reservation back.
+    Existing(Box<LockFundsResult>),
+}
+
+/// Decides whether `binding`'s key may short-circuit onto an existing reservation.
+///
+/// The key by itself proves nothing: it is a client-chosen string, and the
+/// stored reservation was taken for whatever request first presented it. So the
+/// stored scope is checked against this request's before any UTXO is handed
+/// back, and a key whose transaction is already completed — or expired, or
+/// cancelled — is refused outright rather than being quietly treated as a
+/// brand-new request.
+///
+/// A request without a key is always [`Replay::Fresh`]: nothing to replay onto.
+fn resolve_replay(conn: &Connection, binding: &IdempotencyBinding, account_id: i64) -> Result<Replay, anyhow::Error> {
+    let Some(key) = binding.key() else {
+        return Ok(Replay::Fresh);
+    };
+    let Some(record) = db::find_pending_transaction_record_by_idempotency_key(conn, key, account_id)? else {
+        return Ok(Replay::Fresh);
+    };
+
+    // Rejects a replay carrying different recipients or amounts, a replay
+    // arriving at a different endpoint, and — because their stored scope is the
+    // empty string — any row written before scopes were recorded.
+    binding.check_matches(&record.operation, &record.request_hash)?;
+
+    match record.status {
+        PendingTransactionStatus::Pending => {
+            info!(
+                target: "audit",
+                idempotency_key = key,
+                operation = binding.operation().as_str();
+                "Found existing pending transaction lock"
+            );
+            Ok(Replay::Existing(Box::new(db::locked_funds_for_pending_transaction(
+                conn, &record,
+            )?)))
+        },
+        // The UTXOs behind this key are already spent by a broadcast
+        // transaction. Re-locking them would build a transaction that can never
+        // confirm; handing them back would be worse.
+        PendingTransactionStatus::Completed => Err(IdempotencyConflict::AlreadyCompleted {
+            key: key.to_string(),
+            operation: binding.operation(),
+        }
+        .into()),
+        // Expired or cancelled: the reservation is gone. Falling through to a
+        // fresh selection would collide with the unique (account, key) index
+        // anyway, so say plainly why.
+        status => Err(IdempotencyConflict::NoLongerActive {
+            key: key.to_string(),
+            operation: binding.operation(),
+            status: status.to_string(),
+        }
+        .into()),
+    }
+}
+
 /// Manages temporary locking of UTXOs during transaction construction.
 ///
 /// `FundLocker` ensures that UTXOs selected for a transaction cannot be used
@@ -124,7 +199,12 @@ static FUND_LOCK_MUTEX: Mutex<()> = Mutex::new(());
 ///     1,                         // number of outputs
 ///     MicroMinotari(5),          // fee per gram
 ///     None,                      // use default output size estimate
-///     Some("unique-key".into()), // idempotency key
+///     IdempotencyBinding::new(   // key, bound to this operation and request
+///         Some("unique-key".into()),
+///         IdempotencyOperation::LockFunds,
+///         RequestFingerprint::new(IdempotencyOperation::LockFunds)
+///             .field("amount", 1_000_000u64.to_le_bytes()),
+///     ),
 ///     300,                       // lock for 5 minutes
 /// ).await?;
 ///
@@ -165,8 +245,9 @@ impl FundLocker {
     /// * `fee_per_gram` - Fee rate in MicroMinotari per gram of transaction weight
     /// * `estimated_output_size` - Optional override for output size estimation; if `None`,
     ///   uses default calculation based on standard output features
-    /// * `idempotency_key` - Optional unique key for idempotent operations; if provided and
-    ///   a matching lock exists, returns the existing result
+    /// * `idempotency` - The client's idempotency key bound to the operation and request that
+    ///   issued it. A key only returns an existing lock when the operation *and* the request
+    ///   fingerprint match what that lock was created for
     /// * `seconds_to_lock_utxos` - Duration in seconds before the lock expires;
     ///   must not exceed [`MAX_SECONDS_TO_LOCK_UTXOS`]
     ///
@@ -183,6 +264,9 @@ impl FundLocker {
     /// Returns an error if:
     /// - `seconds_to_lock_utxos` exceeds [`MAX_SECONDS_TO_LOCK_UTXOS`]
     ///   ([`InvalidLockDuration`])
+    /// - The idempotency key was already used for a different operation or a different
+    ///   request, or belongs to a transaction that is completed or no longer active
+    ///   ([`IdempotencyConflict`])
     /// - Database connection fails
     /// - Insufficient funds are available
     /// - UTXO selection fails due to serialization errors
@@ -196,7 +280,7 @@ impl FundLocker {
     ///     1,
     ///     MicroMinotari(5),
     ///     None,
-    ///     Some("tx-123".to_string()),
+    ///     binding, // an `IdempotencyBinding` built from the request
     ///     600, // 10 minute lock
     /// ).await?;
     ///
@@ -210,13 +294,14 @@ impl FundLocker {
         num_outputs: usize,
         fee_per_gram: MicroMinotari,
         estimated_output_size: Option<usize>,
-        idempotency_key: Option<String>,
+        idempotency: IdempotencyBinding,
         seconds_to_lock_utxos: u64,
         confirmation_window: u64,
     ) -> Result<LockFundsResult, anyhow::Error> {
         info!(
             target: "audit",
             account_id = account_id,
+            operation = idempotency.operation().as_str(),
             amount = &*mask_amount(amount);
             "Locking funds"
         );
@@ -230,17 +315,10 @@ impl FundLocker {
         let mut conn = self.db_pool.get()?;
         // Fast idempotency check (without the global mutex).  If the pending
         // transaction already exists we can return immediately without waiting
-        // for any concurrent `lock()` call to finish.
-        if let Some(idempotency_key_str) = &idempotency_key
-            && let Some(response) =
-                db::find_pending_transaction_locked_funds_by_idempotency_key(&conn, idempotency_key_str, account_id)?
-        {
-            info!(
-                target: "audit",
-                idempotency_key = idempotency_key_str.as_str();
-                "Found existing pending transaction lock"
-            );
-            return Ok(response);
+        // for any concurrent `lock()` call to finish.  A key that does not match
+        // the stored scope fails here, before any UTXO is looked at.
+        if let Replay::Existing(response) = resolve_replay(&conn, &idempotency, account_id)? {
+            return Ok(*response);
         }
 
         // Acquire the global mutex so that the idempotency re-check, UTXO
@@ -266,16 +344,8 @@ impl FundLocker {
         // that passed the fast-path check above may have created the pending
         // transaction while we were waiting for the lock; if so we return its
         // result rather than selecting UTXOs a second time.
-        if let Some(idempotency_key_str) = &idempotency_key
-            && let Some(response) =
-                db::find_pending_transaction_locked_funds_by_idempotency_key(&conn, idempotency_key_str, account_id)?
-        {
-            info!(
-                target: "audit",
-                idempotency_key = idempotency_key_str.as_str();
-                "Found existing pending transaction lock (re-check)"
-            );
-            return Ok(response);
+        if let Replay::Existing(response) = resolve_replay(&conn, &idempotency, account_id)? {
+            return Ok(*response);
         }
 
         // BEGIN IMMEDIATE: acquire the write lock up front rather than upgrading
@@ -296,19 +366,8 @@ impl FundLocker {
         // Re-check idempotency once more inside the write transaction: a
         // concurrent writer may have created the pending transaction after our
         // check above but before we acquired the write lock.
-        if let Some(idempotency_key_str) = &idempotency_key
-            && let Some(response) = db::find_pending_transaction_locked_funds_by_idempotency_key(
-                &transaction,
-                idempotency_key_str,
-                account_id,
-            )?
-        {
-            info!(
-                target: "audit",
-                idempotency_key = idempotency_key_str.as_str();
-                "Found existing pending transaction lock (write-transaction re-check)"
-            );
-            return Ok(response);
+        if let Replay::Existing(response) = resolve_replay(&transaction, &idempotency, account_id)? {
+            return Ok(*response);
         }
 
         let input_selector = InputSelector::new(account_id, confirmation_window);
@@ -323,10 +382,14 @@ impl FundLocker {
         // Already validated above; `lock_expiry_at` is total, so a surprising
         // value returns an error rather than panicking under the held mutex.
         let expires_at = lock_expiry_at(Utc::now(), seconds_to_lock_utxos)?;
-        let idempotency_key = idempotency_key.unwrap_or_else(|| Uuid::new_v4().to_string());
+        // No client key means no replay is possible, so any unique key will do.
+        let idempotency_key = idempotency
+            .key()
+            .map_or_else(|| Uuid::new_v4().to_string(), str::to_string);
         let pending_tx_id = db::create_pending_transaction(
             &transaction,
             &idempotency_key,
+            &idempotency,
             account_id,
             utxo_selection.requires_change_output,
             utxo_selection.total_value,
@@ -371,8 +434,12 @@ mod tests {
     #![allow(clippy::indexing_slicing)]
 
     use super::*;
-    use crate::db::{create_account, get_account_by_name, init_db, insert_scanned_tip_block};
-    use rusqlite::{Connection, named_params};
+    use crate::{
+        db::{create_account, get_account_by_name, init_db, insert_scanned_tip_block},
+        transactions::idempotency::{IdempotencyOperation, RequestFingerprint},
+    };
+    use anyhow::Error;
+    use rusqlite::named_params;
     use std::collections::HashSet;
     use tari_common_types::{
         seeds::cipher_seed::CipherSeed,
@@ -484,6 +551,52 @@ mod tests {
         (pool, account_id, temp)
     }
 
+    /// A lock-funds binding for `key` over a request identified by `amount`.
+    ///
+    /// `amount` stands in for the whole request body: two calls with the same
+    /// key and the same `amount` are retries of one request, and changing it
+    /// models a client replaying the key with a different body.
+    fn test_binding(key: Option<&str>, amount: u64) -> IdempotencyBinding {
+        scoped_test_binding(key, IdempotencyOperation::LockFunds, amount)
+    }
+
+    /// As [`test_binding`], but for a caller claiming to be a different operation.
+    fn scoped_test_binding(key: Option<&str>, operation: IdempotencyOperation, amount: u64) -> IdempotencyBinding {
+        IdempotencyBinding::new(
+            key.map(str::to_string),
+            operation,
+            RequestFingerprint::new(operation).field("amount", amount.to_le_bytes()),
+        )
+    }
+
+    /// Locks 100_000 µT under `binding`, with everything else held constant.
+    fn lock_with(pool: &SqlitePool, account_id: i64, binding: IdempotencyBinding) -> Result<LockFundsResult, Error> {
+        FundLocker::new(pool.clone()).lock(
+            account_id,
+            MicroMinotari(100_000),
+            1,
+            MicroMinotari(0),
+            Some(1000),
+            binding,
+            3600,
+            100,
+        )
+    }
+
+    /// The set of outputs currently reserved in the database, by value.
+    ///
+    /// The seeded outputs have distinct values, so a value identifies a row.
+    fn locked_values(pool: &SqlitePool) -> HashSet<i64> {
+        pool.get()
+            .expect("conn")
+            .prepare("SELECT value FROM outputs WHERE status = 'LOCKED'")
+            .expect("prepare")
+            .query_map([], |row| row.get::<_, i64>(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("collect")
+    }
+
     // -----------------------------------------------------------------------
     // Tests
     // -----------------------------------------------------------------------
@@ -501,7 +614,7 @@ mod tests {
                 1,
                 MicroMinotari(0),
                 Some(1000),
-                None,
+                test_binding(None, 1),
                 3600,
                 100, // confirmation_window = 100 → tip(200) − 100 = 100 ≥ mined(100)
             )
@@ -514,7 +627,7 @@ mod tests {
                 1,
                 MicroMinotari(0),
                 Some(1000),
-                None,
+                test_binding(None, 1),
                 3600,
                 100,
             )
@@ -557,7 +670,7 @@ mod tests {
                 1,
                 MicroMinotari(0),
                 Some(1000),
-                Some(key),
+                test_binding(Some(&key), 1),
                 3600,
                 100,
             )
@@ -570,7 +683,7 @@ mod tests {
                 1,
                 MicroMinotari(0),
                 Some(1000),
-                Some(key2),
+                test_binding(Some(&key2), 1),
                 3600,
                 100,
             )
@@ -618,7 +731,7 @@ mod tests {
                 1,
                 MicroMinotari(0),
                 Some(1000),
-                None,
+                test_binding(None, 1),
                 3600,
                 100,
             )
@@ -630,7 +743,7 @@ mod tests {
                 1,
                 MicroMinotari(0),
                 Some(1000),
-                None,
+                test_binding(None, 1),
                 3600,
                 100,
             )
@@ -659,7 +772,7 @@ mod tests {
                 1,
                 MicroMinotari(0),
                 Some(1000),
-                None,
+                test_binding(None, 1),
                 3600,
                 100,
             )
@@ -695,7 +808,7 @@ mod tests {
                 1,
                 MicroMinotari(0),
                 Some(1000),
-                None,
+                test_binding(None, 1),
                 3600,
                 100,
             )
@@ -723,7 +836,7 @@ mod tests {
                 1,
                 MicroMinotari(0),
                 Some(1000),
-                None,
+                test_binding(None, 1),
                 3600,
                 100,
             )
@@ -736,7 +849,7 @@ mod tests {
                 1,
                 MicroMinotari(0),
                 Some(1000),
-                Some("doomed-key".to_string()),
+                test_binding(Some("doomed-key"), 1),
                 3600,
                 100,
             )
@@ -808,7 +921,7 @@ mod tests {
                 1,
                 MicroMinotari(0),
                 Some(1000),
-                None,
+                test_binding(None, 1),
                 10_000_000_000_000,
                 100,
             )
@@ -828,7 +941,7 @@ mod tests {
                 1,
                 MicroMinotari(0),
                 Some(1000),
-                None,
+                test_binding(None, 1),
                 3600,
                 100,
             )
@@ -856,11 +969,182 @@ mod tests {
                 1,
                 MicroMinotari(0),
                 Some(1000),
-                None,
+                test_binding(None, 1),
                 3600,
                 100,
             )
             .expect("lock recovers from a poisoned mutex");
         assert!(!result.utxos.is_empty(), "lock selected UTXOs after recovery");
+    }
+
+    // -----------------------------------------------------------------------
+    // Idempotency key scoping
+    // -----------------------------------------------------------------------
+
+    fn conflict(err: &Error) -> &IdempotencyConflict {
+        err.downcast_ref::<IdempotencyConflict>()
+            .unwrap_or_else(|| panic!("expected an IdempotencyConflict, got: {err}"))
+    }
+
+    #[test]
+    fn an_exact_retry_returns_the_original_reservation() {
+        let (pool, account_id, _temp) = setup_test_env(3, 1_000_000);
+
+        let first = lock_with(&pool, account_id, test_binding(Some("k"), 1)).expect("first lock");
+        let retry = lock_with(&pool, account_id, test_binding(Some("k"), 1)).expect("retry is idempotent");
+
+        let first_hashes: HashSet<FixedHash> = first.utxos.iter().map(|u| u.output_hash()).collect();
+        let retry_hashes: HashSet<FixedHash> = retry.utxos.iter().map(|u| u.output_hash()).collect();
+        assert_eq!(first_hashes, retry_hashes, "a retry gets the same UTXOs back");
+        assert_eq!(first.total_value, retry.total_value);
+        assert_eq!(
+            locked_values(&pool).len(),
+            first.utxos.len(),
+            "a retry must not reserve anything further",
+        );
+    }
+
+    #[test]
+    fn replaying_a_key_with_a_different_request_is_rejected() {
+        // The reported attack: take a client's key, resend it with a different
+        // body, and collect the UTXOs the client reserved. The changed body must
+        // make the key unusable rather than short-circuit onto that reservation.
+        let (pool, account_id, _temp) = setup_test_env(3, 1_000_000);
+
+        let victim = lock_with(&pool, account_id, test_binding(Some("k"), 1)).expect("victim's lock");
+        let reserved = locked_values(&pool);
+
+        let err = lock_with(&pool, account_id, test_binding(Some("k"), 2))
+            .expect_err("a replay with a different request must not be served");
+        assert!(
+            matches!(conflict(&err), IdempotencyConflict::RequestMismatch { .. }),
+            "expected a request mismatch, got: {err}",
+        );
+
+        // The victim's reservation is untouched: same rows, still locked to it.
+        assert_eq!(
+            locked_values(&pool),
+            reserved,
+            "the original lock must survive the replay"
+        );
+        let retry = lock_with(&pool, account_id, test_binding(Some("k"), 1)).expect("the victim can still retry");
+        let victim_hashes: HashSet<FixedHash> = victim.utxos.iter().map(|u| u.output_hash()).collect();
+        let retry_hashes: HashSet<FixedHash> = retry.utxos.iter().map(|u| u.output_hash()).collect();
+        assert_eq!(victim_hashes, retry_hashes);
+    }
+
+    #[test]
+    fn a_key_cannot_be_redeemed_at_a_different_operation() {
+        // A `/lock_funds` key replayed at `/burn` used to hand the burn the
+        // reserved UTXOs and destroy them.
+        let (pool, account_id, _temp) = setup_test_env(3, 1_000_000);
+
+        lock_with(&pool, account_id, test_binding(Some("k"), 1)).expect("lock_funds reservation");
+        let reserved = locked_values(&pool);
+
+        let err = lock_with(
+            &pool,
+            account_id,
+            scoped_test_binding(Some("k"), IdempotencyOperation::BurnFunds, 1),
+        )
+        .expect_err("a lock_funds key must not be redeemable as a burn");
+        assert!(
+            matches!(conflict(&err), IdempotencyConflict::OperationMismatch { .. }),
+            "expected an operation mismatch, got: {err}",
+        );
+        assert_eq!(locked_values(&pool), reserved, "the reservation must be untouched");
+    }
+
+    #[test]
+    fn a_completed_key_cannot_be_replayed() {
+        // Once the transaction is broadcast its inputs are spent. Replaying the
+        // key must fail rather than hand back UTXOs that no longer exist.
+        let (pool, account_id, _temp) = setup_test_env(3, 1_000_000);
+
+        lock_with(&pool, account_id, test_binding(Some("k"), 1)).expect("initial lock");
+        let conn = pool.get().expect("conn");
+        let pending_id: String = conn
+            .query_row(
+                "SELECT id FROM pending_transactions WHERE idempotency_key = :key",
+                named_params! { ":key": "k" },
+                |row| row.get(0),
+            )
+            .expect("pending transaction exists");
+        crate::db::update_pending_transaction_status(&conn, &pending_id, PendingTransactionStatus::Completed)
+            .expect("mark completed");
+        drop(conn);
+
+        let err = lock_with(&pool, account_id, test_binding(Some("k"), 1))
+            .expect_err("a completed key must not be replayable");
+        assert!(
+            matches!(conflict(&err), IdempotencyConflict::AlreadyCompleted { .. }),
+            "expected an already-completed conflict, got: {err}",
+        );
+    }
+
+    #[test]
+    fn an_expired_key_reports_why_instead_of_colliding() {
+        let (pool, account_id, _temp) = setup_test_env(3, 1_000_000);
+
+        lock_with(&pool, account_id, test_binding(Some("k"), 1)).expect("initial lock");
+        let conn = pool.get().expect("conn");
+        let pending_id: String = conn
+            .query_row(
+                "SELECT id FROM pending_transactions WHERE idempotency_key = :key",
+                named_params! { ":key": "k" },
+                |row| row.get(0),
+            )
+            .expect("pending transaction exists");
+        crate::db::update_pending_transaction_status(&conn, &pending_id, PendingTransactionStatus::Expired)
+            .expect("mark expired");
+        drop(conn);
+
+        let err =
+            lock_with(&pool, account_id, test_binding(Some("k"), 1)).expect_err("an expired key cannot be reused");
+        assert!(
+            matches!(conflict(&err), IdempotencyConflict::NoLongerActive { .. }),
+            "expected a no-longer-active conflict, got: {err}",
+        );
+    }
+
+    #[test]
+    fn a_legacy_row_without_a_recorded_scope_is_never_replayed_onto() {
+        // Rows written before scopes existed carry empty strings. Their key must
+        // not be usable, because there is nothing to check the request against.
+        let (pool, account_id, _temp) = setup_test_env(3, 1_000_000);
+
+        lock_with(&pool, account_id, test_binding(Some("k"), 1)).expect("initial lock");
+        let conn = pool.get().expect("conn");
+        conn.execute(
+            "UPDATE pending_transactions SET operation = '', request_hash = '' WHERE idempotency_key = :key",
+            named_params! { ":key": "k" },
+        )
+        .expect("blank the scope the way a pre-migration row would be");
+        drop(conn);
+
+        let err = lock_with(&pool, account_id, test_binding(Some("k"), 1))
+            .expect_err("a row with no recorded scope cannot be matched");
+        assert!(
+            matches!(conflict(&err), IdempotencyConflict::OperationMismatch { .. }),
+            "expected an operation mismatch, got: {err}",
+        );
+    }
+
+    #[test]
+    fn requests_without_a_key_never_share_a_reservation() {
+        // Each keyless request gets its own generated key, so two of them must
+        // select disjoint UTXOs rather than collapsing onto one reservation.
+        let (pool, account_id, _temp) = setup_test_env(3, 1_000_000);
+
+        let first = lock_with(&pool, account_id, test_binding(None, 1)).expect("first lock");
+        let second = lock_with(&pool, account_id, test_binding(None, 1)).expect("second lock");
+
+        let first_hashes: HashSet<FixedHash> = first.utxos.iter().map(|u| u.output_hash()).collect();
+        for utxo in &second.utxos {
+            assert!(
+                !first_hashes.contains(&utxo.output_hash()),
+                "a keyless request reused another request's reservation",
+            );
+        }
     }
 }

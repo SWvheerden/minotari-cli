@@ -45,7 +45,10 @@ use serde_json::json;
 use thiserror::Error;
 use utoipa::ToSchema;
 
-use crate::{db::WalletDbError, transactions::fund_locker::InvalidLockDuration};
+use crate::{
+    db::WalletDbError,
+    transactions::{fund_locker::InvalidLockDuration, idempotency::IdempotencyConflict},
+};
 
 /// Represents all possible errors returned by the REST API.
 ///
@@ -141,6 +144,22 @@ pub enum ApiError {
     #[error("{0}")]
     BadRequest(String),
 
+    /// The request conflicts with something the wallet has already recorded.
+    ///
+    /// Returned when an idempotency key is replayed with a different operation
+    /// or a different request body, or when it belongs to a transaction that is
+    /// already completed or no longer active. Returns HTTP 409 Conflict.
+    ///
+    /// # Example
+    ///
+    /// ```json
+    /// {
+    ///   "error": "idempotency key 'abc' was already used for a different unsigned transaction request; a key may only be retried with the exact request that created it"
+    /// }
+    /// ```
+    #[error("{0}")]
+    Conflict(String),
+
     /// Failed to lock funds for a transaction.
     ///
     /// This typically occurs when there are insufficient available funds
@@ -188,6 +207,31 @@ pub enum ApiError {
 impl From<WalletDbError> for ApiError {
     fn from(err: WalletDbError) -> Self {
         ApiError::DbError(err.to_string())
+    }
+}
+
+impl ApiError {
+    /// Converts a fund-moving failure into an API error.
+    ///
+    /// An [`IdempotencyConflict`] anywhere in the chain is the client replaying
+    /// a key that does not belong to this request — a 409, not a 500. Routing
+    /// it through `fallback` would report a server fault and invite the client
+    /// to retry the very request that was just refused.
+    pub fn from_transaction_error(err: anyhow::Error, fallback: impl FnOnce(String) -> ApiError) -> ApiError {
+        match err.downcast::<IdempotencyConflict>() {
+            Ok(conflict) => ApiError::Conflict(conflict.to_string()),
+            Err(err) => fallback(err.to_string()),
+        }
+    }
+}
+
+/// Converts an idempotency conflict into a client error.
+///
+/// The key names a request the wallet has already seen and this is not it, so
+/// 409 Conflict is the honest status: retrying unchanged will never succeed.
+impl From<IdempotencyConflict> for ApiError {
+    fn from(err: IdempotencyConflict) -> Self {
+        ApiError::Conflict(err.to_string())
     }
 }
 
@@ -242,6 +286,7 @@ impl From<serde_json::Error> for ApiError {
 /// | `AccountNotFound` | 404 |
 /// | `NotFound` | 404 |
 /// | `BadRequest` | 400 |
+/// | `Conflict` | 409 |
 /// | `FailedToLockFunds` | 500 |
 /// | `FailedCreateUnsignedTx` | 500 |
 impl IntoResponse for ApiError {
@@ -266,6 +311,10 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(msg) => {
                 warn!(message = msg.as_str(); "API: Bad Request");
                 (StatusCode::BAD_REQUEST, msg.clone())
+            },
+            ApiError::Conflict(msg) => {
+                warn!(target: "audit", message = msg.as_str(); "API: Conflict");
+                (StatusCode::CONFLICT, msg.clone())
             },
             ApiError::FailedToLockFunds(e) => {
                 error!(target: "audit", error = e.as_str(); "API: Failed to lock funds");

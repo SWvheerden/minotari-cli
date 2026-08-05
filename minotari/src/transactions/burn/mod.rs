@@ -37,7 +37,10 @@ use tari_utilities::{ByteArray, hex::Hex};
 use crate::{
     db::{AccountRow, NewBurnProof, SqlitePool},
     models::PendingTransactionStatus,
-    transactions::fund_locker::FundLocker,
+    transactions::{
+        fund_locker::FundLocker,
+        idempotency::{IdempotencyBinding, IdempotencyOperation, RequestFingerprint},
+    },
 };
 
 /// Result returned from a successful burn transaction build.
@@ -65,6 +68,38 @@ pub struct BurnTxParams {
     pub idempotency_key: Option<String>,
     pub seconds_to_lock: u64,
     pub confirmation_window: u64,
+}
+
+impl BurnTxParams {
+    /// Binds this burn's idempotency key to the burn it was issued for.
+    ///
+    /// A burn is irreversible, so the binding matters twice over: it stops a key
+    /// minted at `/lock_funds` from being redeemed here (which would broadcast a
+    /// burn over UTXOs the client only meant to reserve), and it stops a burn
+    /// key from being replayed with a different amount or a different L2 claim
+    /// key.
+    fn idempotency_binding(&self) -> IdempotencyBinding {
+        let operation = IdempotencyOperation::BurnFunds;
+        let fingerprint = RequestFingerprint::new(operation)
+            .field("account_id", self.account_id.to_le_bytes())
+            .field("amount", self.amount.as_u64().to_le_bytes())
+            .optional_field("claim_public_key", self.claim_public_key.as_ref().map(|k| k.to_hex()))
+            // The deployment key decides which sidechain may claim the burn, so
+            // it is part of the request even though it is a secret. Only its
+            // derived public key is hashed; the fingerprint is stored in the
+            // database and read back in error paths.
+            .optional_field(
+                "sidechain_deployment_public_key",
+                self.sidechain_deployment_key
+                    .as_ref()
+                    .map(|k| CompressedPublicKey::from_secret_key(k).to_hex()),
+            )
+            .field("fee_per_gram", self.fee_per_gram.as_u64().to_le_bytes())
+            .optional_field("payment_id", self.payment_id.as_deref())
+            .field("seconds_to_lock", self.seconds_to_lock.to_le_bytes())
+            .field("confirmation_window", self.confirmation_window.to_le_bytes());
+        IdempotencyBinding::new(self.idempotency_key.clone(), operation, fingerprint)
+    }
 }
 
 /// Builds, signs, and returns a burn transaction along with its partial proof data.
@@ -95,7 +130,7 @@ pub fn create_burn_tx(
         1,
         params.fee_per_gram,
         None,
-        params.idempotency_key,
+        params.idempotency_binding(),
         params.seconds_to_lock,
         params.confirmation_window,
     )?;

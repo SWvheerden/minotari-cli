@@ -2,6 +2,7 @@ use std::str::FromStr;
 
 use crate::db::error::{WalletDbError, WalletDbResult};
 use crate::log::mask_amount;
+use crate::transactions::idempotency::IdempotencyBinding;
 use crate::{
     api::types::LockFundsResult, db::outputs::fetch_outputs_by_lock_request_id, models::PendingTransactionStatus,
 };
@@ -25,10 +26,18 @@ pub struct PendingTransaction {
     pub created_at: DateTime<Utc>,
 }
 
+/// Creates the pending transaction that owns a UTXO reservation.
+///
+/// `binding` records *what* the key was issued for: its operation and a
+/// fingerprint of the originating request. Both are persisted so a later replay
+/// of `idempotency_key` can be checked against them rather than being handed
+/// this reservation on the strength of the key alone — see
+/// [`crate::transactions::idempotency`].
 #[allow(clippy::too_many_arguments)]
 pub fn create_pending_transaction(
     conn: &Connection,
     idempotency_key: &str,
+    binding: &IdempotencyBinding,
     account_id: i64,
     requires_change_output: bool,
     total_value: MicroMinotari,
@@ -40,6 +49,7 @@ pub fn create_pending_transaction(
         target: "audit",
         account_id = account_id,
         idempotency_key = idempotency_key,
+        operation = binding.operation().as_str(),
         total_value = &*mask_amount(total_value);
         "DB: Creating pending transaction"
     );
@@ -58,6 +68,8 @@ pub fn create_pending_transaction(
         INSERT INTO pending_transactions (
             id,
             idempotency_key,
+            operation,
+            request_hash,
             account_id,
             status,
             requires_change_output,
@@ -69,6 +81,8 @@ pub fn create_pending_transaction(
         VALUES (
             :id,
             :key,
+            :operation,
+            :request_hash,
             :acc_id,
             :status,
             :change,
@@ -81,6 +95,8 @@ pub fn create_pending_transaction(
         named_params! {
             ":id": id,
             ":key": idempotency_key,
+            ":operation": binding.operation().as_str(),
+            ":request_hash": binding.request_hash(),
             ":acc_id": account_id,
             ":status": status_pending,
             ":change": requires_change_output,
@@ -160,29 +176,60 @@ pub fn update_pending_transaction_status(
     Ok(())
 }
 
-pub fn find_pending_transaction_locked_funds_by_idempotency_key(
+/// Everything the fund locker needs to decide what an idempotency key may do.
+///
+/// Deliberately carries the row's `status`, `operation` and `request_hash` as
+/// well as the reservation itself: whether a replay may be served is a decision
+/// about all four together, and a lookup that filtered on status or scope in SQL
+/// would report "no such key" for a key that does exist under a different
+/// scope — which is exactly the case that must be rejected loudly.
+pub struct PendingTransactionRecord {
+    /// The pending transaction's id, which is also the lock request id.
+    pub id: String,
+    pub status: PendingTransactionStatus,
+    /// The operation this key was issued for; empty for rows written before
+    /// idempotency keys were scoped.
+    pub operation: String,
+    /// Fingerprint of the originating request; empty for pre-scoping rows.
+    pub request_hash: String,
+    pub requires_change_output: bool,
+    pub total_value: MicroMinotari,
+    pub fee_without_change: MicroMinotari,
+    pub fee_with_change: MicroMinotari,
+}
+
+/// Looks up the pending transaction for an idempotency key, whatever its state.
+///
+/// Returns rows in *any* status, because a completed or expired key must
+/// produce a conflict rather than silently falling through to a fresh
+/// reservation under a key the wallet has already spent.
+pub fn find_pending_transaction_record_by_idempotency_key(
     conn: &Connection,
     idempotency_key: &str,
     account_id: i64,
-) -> WalletDbResult<Option<LockFundsResult>> {
-    let status_pending = PendingTransactionStatus::Pending.to_string();
-
+) -> WalletDbResult<Option<PendingTransactionRecord>> {
     let mut stmt = conn.prepare_cached(
         r#"
         SELECT
             id,
+            status,
+            operation,
+            request_hash,
             requires_change_output,
             total_value,
             fee_without_change,
             fee_with_change
         FROM pending_transactions
-        WHERE idempotency_key = :key AND account_id = :acc_id AND status = :status
+        WHERE idempotency_key = :key AND account_id = :acc_id
         "#,
     )?;
 
     #[derive(Deserialize)]
-    struct LockFundsRow {
+    struct PendingTransactionRow {
         id: String,
+        status: String,
+        operation: String,
+        request_hash: String,
         requires_change_output: bool,
         total_value: i64,
         fee_without_change: i64,
@@ -192,16 +239,18 @@ pub fn find_pending_transaction_locked_funds_by_idempotency_key(
     let rows = stmt.query(named_params! {
         ":key": idempotency_key,
         ":acc_id": account_id,
-        ":status": status_pending
     })?;
 
-    let row = from_rows::<LockFundsRow>(rows).next().transpose()?;
+    let row = from_rows::<PendingTransactionRow>(rows).next().transpose()?;
 
     match row {
         Some(row) => {
-            let utxos = fetch_outputs_by_lock_request_id(conn, &row.id)?;
-            Ok(Some(LockFundsResult {
-                utxos: utxos.into_iter().map(|db_out| db_out.output).collect(),
+            let status = PendingTransactionStatus::from_str(&row.status).map_err(WalletDbError::Decoding)?;
+            Ok(Some(PendingTransactionRecord {
+                id: row.id,
+                status,
+                operation: row.operation,
+                request_hash: row.request_hash,
                 requires_change_output: row.requires_change_output,
                 total_value: MicroMinotari::from(row.total_value as u64),
                 fee_without_change: MicroMinotari::from(row.fee_without_change as u64),
@@ -210,6 +259,25 @@ pub fn find_pending_transaction_locked_funds_by_idempotency_key(
         },
         None => Ok(None),
     }
+}
+
+/// Rebuilds the [`LockFundsResult`] a pending transaction is currently holding.
+///
+/// Only meaningful for a record whose scope has already been checked against the
+/// caller's binding; see
+/// [`FundLocker::lock`](crate::transactions::fund_locker::FundLocker::lock).
+pub fn locked_funds_for_pending_transaction(
+    conn: &Connection,
+    record: &PendingTransactionRecord,
+) -> WalletDbResult<LockFundsResult> {
+    let utxos = fetch_outputs_by_lock_request_id(conn, &record.id)?;
+    Ok(LockFundsResult {
+        utxos: utxos.into_iter().map(|db_out| db_out.output).collect(),
+        requires_change_output: record.requires_change_output,
+        total_value: record.total_value,
+        fee_without_change: record.fee_without_change,
+        fee_with_change: record.fee_with_change,
+    })
 }
 
 pub fn find_pending_transaction_by_idempotency_key(

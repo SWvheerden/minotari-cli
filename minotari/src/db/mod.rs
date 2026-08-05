@@ -84,10 +84,11 @@ pub use outputs::{
 
 mod pending_transactions;
 pub use pending_transactions::{
-    PendingTransaction, cancel_pending_transactions_by_ids, check_if_transaction_is_expired_by_idempotency_key,
-    check_if_transaction_was_already_completed_by_idempotency_key, create_pending_transaction,
-    find_expired_pending_transactions, find_pending_transaction_by_idempotency_key,
-    find_pending_transaction_locked_funds_by_idempotency_key, update_pending_transaction_status,
+    PendingTransaction, PendingTransactionRecord, cancel_pending_transactions_by_ids,
+    check_if_transaction_is_expired_by_idempotency_key, check_if_transaction_was_already_completed_by_idempotency_key,
+    create_pending_transaction, find_expired_pending_transactions, find_pending_transaction_by_idempotency_key,
+    find_pending_transaction_record_by_idempotency_key, locked_funds_for_pending_transaction,
+    update_pending_transaction_status,
 };
 
 mod completed_transactions;
