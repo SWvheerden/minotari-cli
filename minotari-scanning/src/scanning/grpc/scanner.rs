@@ -29,6 +29,32 @@ use tokio::sync::mpsc;
 use tonic::{Request, transport::Channel};
 use tracing::debug;
 use tracing::log::error;
+
+/// Hard upper bound on the number of block heights requested in a single `get_blocks` call.
+///
+/// The scan range is derived from the tip height claimed by the base node, which is untrusted. A
+/// node claiming a tip near `u64::MAX` would otherwise make us build a height vector of that size,
+/// which aborts the process (allocation failure is not unwindable).
+const MAX_HEIGHTS_PER_REQUEST: u64 = 1000;
+
+/// Number of heights requested per `get_blocks` call when the scan config does not specify one.
+const DEFAULT_HEIGHTS_PER_REQUEST: u64 = 100;
+
+/// Number of heights to request per `get_blocks` call for the given configured batch size.
+fn heights_per_request(batch_size: Option<u64>) -> u64 {
+    match batch_size {
+        Some(size) if size > 0 => size.min(MAX_HEIGHTS_PER_REQUEST),
+        _ => DEFAULT_HEIGHTS_PER_REQUEST,
+    }
+}
+
+/// Inclusive end height of the chunk starting at `chunk_start`, never exceeding `end_height`.
+fn chunk_end_height(chunk_start: u64, end_height: u64, heights_per_request: u64) -> u64 {
+    chunk_start
+        .saturating_add(heights_per_request.saturating_sub(1))
+        .min(end_height)
+}
+
 /// GRPC client for connecting to Tari base node
 #[derive(Clone)]
 pub struct GrpcBlockchainScanner<KM> {
@@ -353,6 +379,30 @@ where
         Ok(blocks)
     }
 
+    /// Request the blocks in the inclusive height range `chunk_start..=chunk_end` and return the
+    /// response stream.
+    ///
+    /// The caller is responsible for keeping the range bounded, see [`MAX_HEIGHTS_PER_REQUEST`].
+    async fn open_blocks_stream(
+        client: &mut tari_rpc::base_node_client::BaseNodeClient<Channel>,
+        chunk_start: u64,
+        chunk_end: u64,
+    ) -> WalletResult<tonic::Streaming<tari_rpc::HistoricalBlock>> {
+        debug!("Requesting blocks {} to {} from the base node", chunk_start, chunk_end);
+        let heights: Vec<u64> = (chunk_start..=chunk_end).collect();
+        let request = tari_rpc::GetBlocksRequest { heights };
+        let stream = client
+            .get_blocks(Request::new(request))
+            .await
+            .map_err(|e| {
+                WalletError::ScanningError(crate::errors::ScanningError::blockchain_connection_failed(&format!(
+                    "GRPC error: {e}"
+                )))
+            })?
+            .into_inner();
+        Ok(stream)
+    }
+
     /// Convert GRPC tip info to lightweight tip info
     fn convert_tip_info(grpc_tip: &tari_rpc::TipInfoResponse) -> TipInfo {
         let metadata = grpc_tip.metadata.as_ref();
@@ -428,25 +478,27 @@ where
             config.end_height.unwrap_or(tip_info.best_block_height),
             tip_info.best_block_height,
         );
-        let heights: Vec<u64> = (config.start_height..=end_height).collect();
-        let request = tari_rpc::GetBlocksRequest { heights };
-        let mut stream = self
-            .client
-            .clone()
-            .get_blocks(Request::new(request))
-            .await
-            .map_err(|e| {
-                WalletError::ScanningError(crate::errors::ScanningError::blockchain_connection_failed(&format!(
-                    "GRPC error: {e}"
-                )))
-            })?
-            .into_inner();
+        if config.start_height > end_height {
+            debug!(
+                "Nothing to scan, start height {} is beyond the end height {}",
+                config.start_height, end_height
+            );
+            return Ok(rec_scan_result);
+        }
+        // `end_height` is bounded by the tip height claimed by the base node, which is untrusted and
+        // can be arbitrarily large. Request the range in fixed size chunks so that the vector of
+        // heights sent to the node always stays small, regardless of what the node claims.
+        let heights_per_request = heights_per_request(config.batch_size);
+        let mut chunk_end = chunk_end_height(config.start_height, end_height, heights_per_request);
+        let mut client = self.client.clone();
+        let mut stream = Self::open_blocks_stream(&mut client, config.start_height, chunk_end).await?;
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(self.number_processing_threads)
             .build()
             .map_err(|e| WalletError::ConfigurationError(format!("Failed to build thread pool: {e}")))?;
         let config = config.clone();
         tokio::spawn(async move {
+            let mut blocks_in_chunk = 0u64;
             loop {
                 let grpc_block_response = stream.message().await;
                 let grpc_block = match grpc_block_response {
@@ -461,9 +513,28 @@ where
                         return;
                     },
                     Ok(None) => {
-                        return;
+                        // The current chunk is exhausted, continue with the next one. A chunk that
+                        // returned nothing means the node cannot serve this range, so stop there
+                        // instead of walking to a tip height it only claims to have.
+                        if chunk_end >= end_height || blocks_in_chunk == 0 {
+                            return;
+                        }
+                        let chunk_start = chunk_end.saturating_add(1);
+                        chunk_end = chunk_end_height(chunk_start, end_height, heights_per_request);
+                        blocks_in_chunk = 0;
+                        stream = match Self::open_blocks_stream(&mut client, chunk_start, chunk_end).await {
+                            Ok(stream) => stream,
+                            Err(e) => {
+                                let _unused = send_scan_result.send(Err(e)).await.inspect_err(|e| {
+                                    error!("Failed to send download result with error: {}", e);
+                                });
+                                return;
+                            },
+                        };
+                        continue;
                     },
                 };
+                blocks_in_chunk = blocks_in_chunk.saturating_add(1);
                 let tari_block: Block = match grpc_block.block.map(|b| b.try_into()) {
                     Some(Ok(block)) => block,
                     Some(Err(e)) => {
@@ -674,5 +745,77 @@ where
             },
             None => GrpcBlockchainScanner::new(base_url, self.key_managers, self.number_processing_threads).await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_HEIGHTS_PER_REQUEST, MAX_HEIGHTS_PER_REQUEST, chunk_end_height, heights_per_request};
+
+    #[test]
+    fn heights_per_request_uses_the_configured_batch_size() {
+        assert_eq!(heights_per_request(Some(1)), 1);
+        assert_eq!(heights_per_request(Some(50)), 50);
+        assert_eq!(
+            heights_per_request(Some(MAX_HEIGHTS_PER_REQUEST)),
+            MAX_HEIGHTS_PER_REQUEST
+        );
+    }
+
+    #[test]
+    fn heights_per_request_falls_back_to_the_default() {
+        assert_eq!(heights_per_request(None), DEFAULT_HEIGHTS_PER_REQUEST);
+        assert_eq!(heights_per_request(Some(0)), DEFAULT_HEIGHTS_PER_REQUEST);
+    }
+
+    #[test]
+    fn heights_per_request_is_capped() {
+        assert_eq!(heights_per_request(Some(u64::MAX)), MAX_HEIGHTS_PER_REQUEST);
+        assert_eq!(
+            heights_per_request(Some(MAX_HEIGHTS_PER_REQUEST + 1)),
+            MAX_HEIGHTS_PER_REQUEST
+        );
+    }
+
+    #[test]
+    fn chunk_end_height_covers_a_full_chunk() {
+        assert_eq!(chunk_end_height(0, 1_000, 100), 99);
+        assert_eq!(chunk_end_height(100, 1_000, 100), 199);
+        assert_eq!(chunk_end_height(10, 10, 1), 10);
+    }
+
+    #[test]
+    fn chunk_end_height_is_clamped_to_the_end_height() {
+        assert_eq!(chunk_end_height(950, 1_000, 100), 1_000);
+        assert_eq!(chunk_end_height(1_000, 1_000, 100), 1_000);
+    }
+
+    /// A base node claiming a tip near `u64::MAX` must not translate into a huge height vector.
+    #[test]
+    fn chunk_end_height_does_not_overflow_for_a_bogus_tip() {
+        let heights_per_request = heights_per_request(Some(u64::MAX));
+        let chunk_end = chunk_end_height(0, u64::MAX, heights_per_request);
+        assert_eq!(chunk_end, MAX_HEIGHTS_PER_REQUEST - 1);
+        assert_eq!(chunk_end_height(u64::MAX - 1, u64::MAX, heights_per_request), u64::MAX);
+        assert_eq!(chunk_end_height(u64::MAX, u64::MAX, heights_per_request), u64::MAX);
+    }
+
+    /// Walking the chunks must always make progress and terminate on the end height.
+    #[test]
+    fn chunks_tile_the_whole_range() {
+        let (start, end, per_request) = (7_u64, 1_009_u64, 100_u64);
+        let mut chunk_start = start;
+        let mut covered = 0_u64;
+        loop {
+            let chunk_end = chunk_end_height(chunk_start, end, per_request);
+            assert!(chunk_end >= chunk_start);
+            assert!(chunk_end - chunk_start < per_request);
+            covered += chunk_end - chunk_start + 1;
+            if chunk_end >= end {
+                break;
+            }
+            chunk_start = chunk_end + 1;
+        }
+        assert_eq!(covered, end - start + 1);
     }
 }
