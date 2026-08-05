@@ -59,6 +59,7 @@ use chrono::Utc;
 use log::{error, info, warn};
 use r2d2::PooledConnection;
 use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::Connection;
 use tari_common::configuration::Network;
 use tari_common_types::types::FixedHash;
 use tari_common_types::{tari_address::TariAddressFeatures, transaction::TxId};
@@ -320,18 +321,23 @@ impl TransactionSender {
         Ok(())
     }
 
+    /// Selects UTXOs covering the requested amount plus fees.
+    ///
+    /// Takes the connection from the caller rather than pulling a fresh one from
+    /// the pool: the selection is only meaningful when it runs inside the same
+    /// write transaction that goes on to lock the chosen outputs.
     fn create_utxo_selection(
         &self,
+        connection: &Connection,
         processed_transaction: &ProcessedTransaction,
     ) -> Result<UtxoSelection, anyhow::Error> {
-        let connection = self.get_connection()?;
         let amount = processed_transaction.recipient.amount;
         let num_outputs = 1;
         let estimated_output_size = None;
 
         let input_selector = InputSelector::new(self.account.id, self.confirmation_window);
         let utxo_selection = input_selector.fetch_unspent_outputs(
-            &connection,
+            connection,
             amount,
             num_outputs,
             self.fee_per_gram,
@@ -344,15 +350,23 @@ impl TransactionSender {
         &self,
         processed_transaction: &mut ProcessedTransaction,
     ) -> Result<String, anyhow::Error> {
-        let connection = self.get_connection()?;
+        let mut connection = self.get_connection()?;
         // `seconds_to_lock_utxos` is untrusted (JSON body / CLI argument), so use
         // the checked helper: `Utc::now() + Duration::seconds(..)` panics on
         // overflow. See `MAX_SECONDS_TO_LOCK_UTXOS`.
         let expires_at = lock_expiry_at(Utc::now(), processed_transaction.seconds_to_lock_utxos)?;
-        let utxo_selection = self.create_utxo_selection(processed_transaction)?;
+
+        // BEGIN IMMEDIATE takes the database's write lock before we look at any
+        // output, so nothing else — another CLI process, the daemon's scan loop,
+        // the unlocker — can spend or reserve one of the selected UTXOs between
+        // selection and locking. Without it the selection is a stale read and
+        // `lock_output`'s conditional update loses the race.
+        let transaction = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+        let utxo_selection = self.create_utxo_selection(&transaction, processed_transaction)?;
 
         let pending_tx_id = db::create_pending_transaction(
-            &connection,
+            &transaction,
             &processed_transaction.idempotency_key,
             self.account.id,
             utxo_selection.requires_change_output,
@@ -362,9 +376,14 @@ impl TransactionSender {
             expires_at,
         )?;
 
+        // A failed lock means the output is no longer ours to reserve; `?` skips
+        // the commit below so the pending transaction and every lock taken so
+        // far roll back together.
         for utxo in &utxo_selection.utxos {
-            db::lock_output(&connection, utxo.id, &pending_tx_id, expires_at)?;
+            db::lock_output(&transaction, utxo.id, &pending_tx_id, expires_at)?;
         }
+
+        transaction.commit()?;
 
         if processed_transaction.selected_utxos.is_empty() {
             processed_transaction.selected_utxos = utxo_selection.utxos.clone();

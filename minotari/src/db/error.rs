@@ -32,6 +32,17 @@ pub enum WalletDbError {
     #[error("Duplicate entry: {0}")]
     DuplicateEntry(String),
 
+    /// A UTXO could not be reserved because it was no longer `Unspent` when the
+    /// conditional `UPDATE` ran.
+    ///
+    /// This means another writer (a second CLI invocation, the daemon's scan
+    /// loop marking the output spent, or the unlocker) won the race between
+    /// output selection and locking. The caller must abandon the selection —
+    /// handing back a UTXO it does not own would let two transactions spend the
+    /// same output.
+    #[error("Output {output_id} is no longer unspent and cannot be locked for request {request_id}")]
+    OutputLockConflict { output_id: i64, request_id: String },
+
     #[error("Key decryption failed: {0}")]
     DecryptionFailed(String),
 

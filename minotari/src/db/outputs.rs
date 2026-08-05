@@ -512,6 +512,18 @@ pub fn update_output_status(conn: &Connection, output_id: i64, status: OutputSta
     Ok(())
 }
 
+/// Reserves an output for `locked_by_request_id`, but only if it is still `Unspent`.
+///
+/// The `AND status = :unspent_status` clause makes this a compare-and-swap: the
+/// row transitions `Unspent → Locked` exactly once, no matter how many writers
+/// race for it. The result of that comparison is the whole point of the
+/// statement, so a no-op update is reported as
+/// [`WalletDbError::OutputLockConflict`] rather than being swallowed — silently
+/// returning `Ok(())` on zero rows would hand the caller a UTXO that some other
+/// writer already owns, and both would go on to spend it.
+///
+/// Callers should run this inside the same write transaction that selected the
+/// output, so that a conflict rolls back the whole reservation.
 pub fn lock_output(
     conn: &Connection,
     output_id: i64,
@@ -528,7 +540,7 @@ pub fn lock_output(
     let locked_status = OutputStatus::Locked.to_string();
     let unspent_status = OutputStatus::Unspent.to_string();
 
-    conn.execute(
+    let rows_locked = conn.execute(
         r#"
         UPDATE outputs
         SET status = :locked_status, locked_by_request_id = :req_id, locked_at = :locked_at
@@ -542,6 +554,19 @@ pub fn lock_output(
             ":unspent_status": unspent_status,
         },
     )?;
+
+    if rows_locked == 0 {
+        warn!(
+            target: "audit",
+            output_id = output_id,
+            request_id = locked_by_request_id;
+            "DB: Output is no longer unspent; lock lost the race"
+        );
+        return Err(WalletDbError::OutputLockConflict {
+            output_id,
+            request_id: locked_by_request_id.to_string(),
+        });
+    }
 
     Ok(())
 }
@@ -1046,5 +1071,107 @@ mod tests {
         assert_eq!(totals.available, MicroMinotari::from(1_000));
         assert_eq!(totals.immature, MicroMinotari::from(9_000 + 5_000));
         assert_eq!(totals.unavailable, MicroMinotari::from(9_000 + 5_000));
+    }
+
+    /// Read back the `(status, locked_by_request_id)` pair for an output.
+    fn output_lock_state(conn: &Connection, output_id: i64) -> (String, Option<String>) {
+        conn.query_row(
+            "SELECT status, locked_by_request_id FROM outputs WHERE id = :id",
+            named_params! { ":id": output_id },
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read output lock state")
+    }
+
+    fn only_output_id(conn: &Connection, account_id: i64) -> i64 {
+        conn.query_row(
+            "SELECT id FROM outputs WHERE account_id = :account_id",
+            named_params! { ":account_id": account_id },
+            |row| row.get(0),
+        )
+        .expect("read output id")
+    }
+
+    #[test]
+    fn lock_output_rejects_an_output_that_is_no_longer_unspent() {
+        // The conditional UPDATE matches no row when the output has already been
+        // spent. Reporting success there would hand the caller a UTXO that is
+        // gone, so it must be an error.
+        let temp = tempdir().expect("temp dir");
+        let pool = init_db(temp.path().join("lock_conflict.db")).expect("init db");
+        let conn = pool.get().expect("conn");
+        let account_id = create_test_account(&conn);
+
+        insert_synthetic_output(&conn, account_id, 1, 1_000, 50, true, OutputStatus::Spent, 0);
+        let output_id = only_output_id(&conn, account_id);
+
+        let err = lock_output(&conn, output_id, "req-1", Utc::now()).expect_err("spent output cannot be locked");
+        assert!(
+            matches!(&err, WalletDbError::OutputLockConflict { output_id: id, request_id } if *id == output_id && request_id == "req-1"),
+            "expected OutputLockConflict, got: {err}"
+        );
+
+        // The losing request must not have stamped its id onto the row.
+        let (status, locked_by) = output_lock_state(&conn, output_id);
+        assert_eq!(status, OutputStatus::Spent.to_string());
+        assert_eq!(locked_by, None);
+    }
+
+    #[test]
+    fn only_one_request_can_lock_an_output() {
+        // Two requests racing for the same UTXO: the first wins, the second is
+        // told it lost rather than being allowed to believe it owns the output.
+        let temp = tempdir().expect("temp dir");
+        let pool = init_db(temp.path().join("lock_race.db")).expect("init db");
+        let conn = pool.get().expect("conn");
+        let account_id = create_test_account(&conn);
+
+        insert_synthetic_output(&conn, account_id, 1, 1_000, 50, true, OutputStatus::Unspent, 0);
+        let output_id = only_output_id(&conn, account_id);
+
+        lock_output(&conn, output_id, "req-winner", Utc::now()).expect("first lock succeeds");
+        let err = lock_output(&conn, output_id, "req-loser", Utc::now()).expect_err("second lock is refused");
+        assert!(matches!(err, WalletDbError::OutputLockConflict { .. }), "got: {err}");
+
+        // Ownership still belongs to the winner.
+        let (status, locked_by) = output_lock_state(&conn, output_id);
+        assert_eq!(status, OutputStatus::Locked.to_string());
+        assert_eq!(locked_by.as_deref(), Some("req-winner"));
+    }
+
+    #[test]
+    fn a_lock_conflict_rolls_back_the_whole_reservation() {
+        // Callers lock a set of outputs inside one write transaction. If any
+        // single lock loses its race the transaction must not commit, otherwise
+        // the caller gets a half-reserved selection it will still try to spend.
+        let temp = tempdir().expect("temp dir");
+        let pool = init_db(temp.path().join("lock_rollback.db")).expect("init db");
+        let mut conn = pool.get().expect("conn");
+        let account_id = create_test_account(&conn);
+
+        insert_synthetic_output(&conn, account_id, 1, 1_000, 50, true, OutputStatus::Unspent, 0);
+        insert_synthetic_output(&conn, account_id, 2, 2_000, 50, true, OutputStatus::Spent, 0);
+        let mut ids: Vec<i64> = conn
+            .prepare("SELECT id FROM outputs WHERE account_id = :account_id ORDER BY id")
+            .expect("prepare")
+            .query_map(named_params! { ":account_id": account_id }, |row| row.get(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("collect ids");
+        ids.sort_unstable();
+        let (unspent_id, spent_id) = (ids[0], ids[1]);
+
+        let transaction = conn.transaction().expect("begin");
+        lock_output(&transaction, unspent_id, "req-1", Utc::now()).expect("first output locks");
+        lock_output(&transaction, spent_id, "req-1", Utc::now()).expect_err("second output is already spent");
+        drop(transaction); // no commit → rollback
+
+        let (status, locked_by) = output_lock_state(&conn, unspent_id);
+        assert_eq!(
+            status,
+            OutputStatus::Unspent.to_string(),
+            "the successful lock must roll back with the failed one"
+        );
+        assert_eq!(locked_by, None);
     }
 }

@@ -81,14 +81,18 @@ pub fn lock_expiry_at(now: DateTime<Utc>, seconds_to_lock_utxos: u64) -> Result<
 
 /// Global mutex that serializes all [`FundLocker::lock`] calls.
 ///
-/// The idempotency check and UTXO selection are not atomic at the database level;
-/// without this mutex two concurrent requests could both pass the idempotency
-/// check, select the same set of "unspent" outputs, and then race to lock them.
+/// Without it two concurrent requests in this process could both pass the
+/// idempotency check, select the same set of "unspent" outputs, and then race to
+/// lock them. Serialising the critical section (idempotency check → UTXO
+/// selection → pending-transaction creation → output locking) eliminates the
+/// race described in <https://github.com/anomalyco/minotari-cli/issues/125>.
 ///
-/// The mutex ensures that only one thread executes the critical section
-/// (idempotency check → UTXO selection → pending-transaction creation →
-/// output locking) at a time, eliminating the race condition described in
-/// <https://github.com/anomalyco/minotari-cli/issues/125>.
+/// This mutex is **process-local**, so it is not on its own sufficient: a second
+/// CLI invocation running against the same database file has its own copy. The
+/// cross-process guarantee comes from doing the selection and the locking inside
+/// one `BEGIN IMMEDIATE` transaction (see [`FundLocker::lock`]), backed by the
+/// conditional update in [`db::lock_output`], which refuses to reserve an output
+/// that is no longer unspent.
 static FUND_LOCK_MUTEX: Mutex<()> = Mutex::new(());
 
 /// Manages temporary locking of UTXOs during transaction construction.
@@ -274,16 +278,48 @@ impl FundLocker {
             return Ok(response);
         }
 
-        let input_selector = InputSelector::new(account_id, confirmation_window);
-        let utxo_selection =
-            input_selector.fetch_unspent_outputs(&conn, amount, num_outputs, fee_per_gram, estimated_output_size)?;
-
         // BEGIN IMMEDIATE: acquire the write lock up front rather than upgrading
         // a read->write inside the transaction. Under concurrent writers in WAL
         // mode (e.g. the background unlocker task), a deferred transaction can
         // dead-lock with SQLITE_BUSY_SNAPSHOT — surfaced as "database is locked"
         // — which busy_timeout will not retry.
+        //
+        // Taking the write lock *before* selecting outputs is what makes the
+        // selection trustworthy across processes. `FUND_LOCK_MUTEX` only
+        // serialises threads in this process; a second CLI invocation or the
+        // daemon's own scan loop is a different process entirely. Holding the
+        // database's single write lock for the whole select → lock sequence is
+        // the only thing that stops another writer from spending or reserving
+        // one of these outputs in between.
         let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+        // Re-check idempotency once more inside the write transaction: a
+        // concurrent writer may have created the pending transaction after our
+        // check above but before we acquired the write lock.
+        if let Some(idempotency_key_str) = &idempotency_key
+            && let Some(response) = db::find_pending_transaction_locked_funds_by_idempotency_key(
+                &transaction,
+                idempotency_key_str,
+                account_id,
+            )?
+        {
+            info!(
+                target: "audit",
+                idempotency_key = idempotency_key_str.as_str();
+                "Found existing pending transaction lock (write-transaction re-check)"
+            );
+            return Ok(response);
+        }
+
+        let input_selector = InputSelector::new(account_id, confirmation_window);
+        let utxo_selection = input_selector.fetch_unspent_outputs(
+            &transaction,
+            amount,
+            num_outputs,
+            fee_per_gram,
+            estimated_output_size,
+        )?;
+
         // Already validated above; `lock_expiry_at` is total, so a surprising
         // value returns an error rather than panicking under the held mutex.
         let expires_at = lock_expiry_at(Utc::now(), seconds_to_lock_utxos)?;
@@ -299,6 +335,11 @@ impl FundLocker {
             expires_at,
         )?;
 
+        // Each lock is a conditional `Unspent → Locked` update. Under the write
+        // lock taken above these cannot fail, but the check is not redundant: if
+        // one ever does, `?` propagates before `commit()` and the whole
+        // reservation — pending transaction included — rolls back, rather than
+        // returning UTXOs this caller does not own.
         for utxo in &utxo_selection.utxos {
             db::lock_output(&transaction, utxo.id, &pending_tx_id, expires_at)?;
         }
@@ -601,6 +642,115 @@ mod tests {
         // Both should succeed (no double-spend errors) and select at least one UTXO
         assert!(!r_a.utxos.is_empty(), "A got UTXOs");
         assert!(!r_b.utxos.is_empty(), "B got UTXOs");
+    }
+
+    #[test]
+    fn locked_utxos_are_committed_as_locked_and_are_not_selectable_again() {
+        // The result the caller receives must match what is durably reserved in
+        // the database: every returned UTXO is LOCKED under this request's id,
+        // and no later call can select it again.
+        let (pool, account_id, _temp) = setup_test_env(2, 1_000_000);
+        let locker = FundLocker::new(pool.clone());
+
+        let first = locker
+            .lock(
+                account_id,
+                MicroMinotari(100_000),
+                1,
+                MicroMinotari(0),
+                Some(1000),
+                None,
+                3600,
+                100,
+            )
+            .expect("first lock");
+
+        // The seeded outputs have distinct values, so value identifies the row.
+        let conn = pool.get().expect("conn");
+        let locked_values: HashSet<i64> = conn
+            .prepare("SELECT value FROM outputs WHERE status = 'LOCKED' AND locked_by_request_id IS NOT NULL")
+            .expect("prepare")
+            .query_map([], |row| row.get::<_, i64>(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("collect");
+
+        assert_eq!(
+            locked_values.len(),
+            first.utxos.len(),
+            "exactly the returned UTXOs should be reserved",
+        );
+        for utxo in &first.utxos {
+            assert!(
+                locked_values.contains(&(utxo.value().as_u64() as i64)),
+                "returned UTXO is not LOCKED in the database",
+            );
+        }
+
+        // A second lock must pick from what is left, never from the reserved set.
+        let second = locker
+            .lock(
+                account_id,
+                MicroMinotari(100_000),
+                1,
+                MicroMinotari(0),
+                Some(1000),
+                None,
+                3600,
+                100,
+            )
+            .expect("second lock");
+        let first_hashes: HashSet<FixedHash> = first.utxos.iter().map(|u| u.output_hash()).collect();
+        for utxo in &second.utxos {
+            assert!(
+                !first_hashes.contains(&utxo.output_hash()),
+                "second lock handed back an already-reserved UTXO",
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_lock_leaves_no_pending_transaction_behind() {
+        // Selection happens inside the write transaction, so when it fails
+        // (here: nothing left to select) nothing at all is committed.
+        let (pool, account_id, _temp) = setup_test_env(1, 1_000_000);
+        let locker = FundLocker::new(pool.clone());
+
+        locker
+            .lock(
+                account_id,
+                MicroMinotari(500_000),
+                1,
+                MicroMinotari(0),
+                Some(1000),
+                None,
+                3600,
+                100,
+            )
+            .expect("first lock consumes the only UTXO");
+
+        locker
+            .lock(
+                account_id,
+                MicroMinotari(500_000),
+                1,
+                MicroMinotari(0),
+                Some(1000),
+                Some("doomed-key".to_string()),
+                3600,
+                100,
+            )
+            .expect_err("no spendable UTXOs remain");
+
+        let conn = pool.get().expect("conn");
+        let doomed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_transactions WHERE idempotency_key = :key",
+                named_params! { ":key": "doomed-key" },
+                |row| row.get(0),
+            )
+            .expect("count pending transactions");
+        assert_eq!(doomed, 0, "a failed lock must not leave a pending transaction");
     }
 
     // -----------------------------------------------------------------------
