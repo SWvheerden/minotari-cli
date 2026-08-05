@@ -40,6 +40,13 @@ const MAX_HEIGHTS_PER_REQUEST: u64 = 1000;
 /// Number of heights requested per `get_blocks` call when the scan config does not specify one.
 const DEFAULT_HEIGHTS_PER_REQUEST: u64 = 100;
 
+/// Widest `accumulated_difficulty` we can represent, in bytes.
+///
+/// The field arrives as an unbounded protobuf `bytes` value and `U512::from_big_endian` asserts
+/// that the slice fits in 64 bytes, so an over-long value from an untrusted base node would panic
+/// the scanner instead of surfacing as an error.
+const MAX_ACCUMULATED_DIFFICULTY_BYTES: usize = 64;
+
 /// Number of heights to request per `get_blocks` call for the given configured batch size.
 fn heights_per_request(batch_size: Option<u64>) -> u64 {
     match batch_size {
@@ -53,6 +60,31 @@ fn chunk_end_height(chunk_start: u64, end_height: u64, heights_per_request: u64)
     chunk_start
         .saturating_add(heights_per_request.saturating_sub(1))
         .min(end_height)
+}
+
+/// Decimal representation of a big-endian `accumulated_difficulty` reported by a base node.
+///
+/// Leading zero bytes carry no magnitude and are stripped before the width check, so a padded but
+/// otherwise representable value is still accepted. Anything wider than
+/// [`MAX_ACCUMULATED_DIFFICULTY_BYTES`] is rejected rather than passed to `U512::from_big_endian`,
+/// which would panic on it.
+fn parse_accumulated_difficulty(bytes: &[u8]) -> WalletResult<String> {
+    let significant = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .and_then(|first| bytes.get(first..))
+        .unwrap_or_default();
+
+    if significant.len() > MAX_ACCUMULATED_DIFFICULTY_BYTES {
+        return Err(WalletError::ScanningError(
+            crate::errors::ScanningError::ScanDataCorruption(format!(
+                "Accumulated difficulty is {} bytes wide, the maximum is {MAX_ACCUMULATED_DIFFICULTY_BYTES}",
+                significant.len()
+            )),
+        ));
+    }
+
+    Ok(U512::from_big_endian(significant).to_string())
 }
 
 /// GRPC client for connecting to Tari base node
@@ -404,19 +436,22 @@ where
     }
 
     /// Convert GRPC tip info to lightweight tip info
-    fn convert_tip_info(grpc_tip: &tari_rpc::TipInfoResponse) -> TipInfo {
+    fn convert_tip_info(grpc_tip: &tari_rpc::TipInfoResponse) -> WalletResult<TipInfo> {
         let metadata = grpc_tip.metadata.as_ref();
 
-        TipInfo {
+        let accumulated_difficulty = match metadata {
+            Some(m) => parse_accumulated_difficulty(&m.accumulated_difficulty)?,
+            None => String::new(),
+        };
+
+        Ok(TipInfo {
             best_block_height: metadata.map_or(0, |m| m.best_block_height),
             best_block_hash: FixedHash::try_from(metadata.map(|m| m.best_block_hash.clone()).unwrap_or_default())
                 .unwrap_or_default(),
-            accumulated_difficulty: metadata
-                .map(|m| U512::from_big_endian(&m.accumulated_difficulty).to_string())
-                .unwrap_or_default(),
+            accumulated_difficulty,
             pruned_height: metadata.map_or(0, |m| m.pruned_height),
             timestamp: metadata.map_or(0, |m| m.timestamp),
-        }
+        })
     }
 
     pub async fn update_scan_config(&mut self, config: &ScanConfig) -> WalletResult<()> {
@@ -607,7 +642,7 @@ where
         })?;
 
         let tip_info = response.into_inner();
-        Ok(Self::convert_tip_info(&tip_info))
+        Self::convert_tip_info(&tip_info)
     }
 
     async fn get_blocks_by_heights(&mut self, heights: Vec<u64>) -> WalletResult<Vec<Block>> {
@@ -750,7 +785,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_HEIGHTS_PER_REQUEST, MAX_HEIGHTS_PER_REQUEST, chunk_end_height, heights_per_request};
+    use super::{
+        DEFAULT_HEIGHTS_PER_REQUEST, MAX_ACCUMULATED_DIFFICULTY_BYTES, MAX_HEIGHTS_PER_REQUEST, chunk_end_height,
+        heights_per_request, parse_accumulated_difficulty,
+    };
 
     #[test]
     fn heights_per_request_uses_the_configured_batch_size() {
@@ -817,5 +855,39 @@ mod tests {
             chunk_start = chunk_end + 1;
         }
         assert_eq!(covered, end - start + 1);
+    }
+
+    #[test]
+    fn accumulated_difficulty_is_parsed_as_big_endian() {
+        assert_eq!(parse_accumulated_difficulty(&[]).unwrap(), "0");
+        assert_eq!(parse_accumulated_difficulty(&[0; 64]).unwrap(), "0");
+        assert_eq!(parse_accumulated_difficulty(&[1, 0]).unwrap(), "256");
+        assert_eq!(parse_accumulated_difficulty(&[0, 0, 0, 1, 0]).unwrap(), "256");
+        assert_eq!(
+            parse_accumulated_difficulty(&[0xff; MAX_ACCUMULATED_DIFFICULTY_BYTES]).unwrap(),
+            primitive_types::U512::MAX.to_string()
+        );
+    }
+
+    /// An over-long value from an untrusted base node must be an error, never a panic.
+    #[test]
+    fn accumulated_difficulty_wider_than_a_u512_is_rejected() {
+        let too_wide = vec![0xff; MAX_ACCUMULATED_DIFFICULTY_BYTES + 1];
+        let err = parse_accumulated_difficulty(&too_wide).unwrap_err();
+        assert!(err.to_string().contains("65 bytes wide"), "unexpected error: {err}");
+
+        // The protobuf field is unbounded, so the oversize case is not limited to one stray byte.
+        assert!(parse_accumulated_difficulty(&vec![0xff; 16 * 1024 * 1024]).is_err());
+    }
+
+    /// Zero padding is insignificant, so a padded but representable value must still be accepted.
+    #[test]
+    fn accumulated_difficulty_ignores_leading_zero_padding() {
+        let mut padded = vec![0; 128];
+        padded.extend_from_slice(&[0xff; MAX_ACCUMULATED_DIFFICULTY_BYTES]);
+        assert_eq!(
+            parse_accumulated_difficulty(&padded).unwrap(),
+            primitive_types::U512::MAX.to_string()
+        );
     }
 }
