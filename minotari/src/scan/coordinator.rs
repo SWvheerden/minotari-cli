@@ -1065,8 +1065,11 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
         // failure cannot leave a half-written spend (an input without its debit
         // balance change, or a status update without a matching input).
         let mut conn = self.pool.get().map_err(|e| ScanError::DbError(e.into()))?;
+        // BEGIN IMMEDIATE for the same reason as everywhere else in this crate: a
+        // deferred read->write upgrade can fail with SQLITE_BUSY_SNAPSHOT in WAL
+        // mode, which `busy_timeout` does not retry.
         let tx = conn
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| ScanError::DbError(WalletDbError::from(e)))?;
         let mut marked_unspent = 0u64;
         let mut confirmed_spent = 0u64;
