@@ -32,6 +32,15 @@ impl WebhookSender {
         let client = Client::builder()
             .timeout(Duration::from_secs(HTTP_TIMEOUT))
             .user_agent("minotari-wallet/1.0")
+            // Never follow redirects. reqwest replays the request — method, body and
+            // all headers, including `X-Minotari-Signature` — at whatever `Location`
+            // the endpoint names. That turns the configured webhook URL into an
+            // open request forwarder running inside the daemon's own network
+            // namespace: a 302 to `http://127.0.0.1:9000/accounts/default/burn`, to a
+            // cloud metadata endpoint, or to anything else only this host can reach,
+            // and the valid signature header travels with it. The operator picked one
+            // destination; deliver to that destination or fail.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("Failed to build HTTP client");
 
@@ -65,6 +74,13 @@ impl WebhookSender {
                 let status = response.status();
                 if status.is_success() {
                     DeliveryResult::Success
+                } else if status.is_redirection() {
+                    // Redirects are not followed (see `new`). Retrying cannot change
+                    // the answer, so fail permanently and say why.
+                    DeliveryResult::PermanentFailure(format!(
+                        "Endpoint responded with redirect {}; webhooks are delivered only to the configured URL",
+                        status
+                    ))
                 } else if status.is_client_error() {
                     // 400-499: The receiver rejected us
                     let body = response
@@ -176,6 +192,37 @@ mod tests {
 
         // Should be Retryable
         assert!(matches!(result, DeliveryResult::RetryableFailure(_)));
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_not_followed_and_is_not_retried() {
+        // reqwest replays a redirected request in full — method, body and every
+        // header, including the valid `X-Minotari-Signature`. Following one would let
+        // whoever controls the webhook endpoint aim a signed request at anything the
+        // daemon can reach, its own unauthenticated API included.
+        let redirect_target = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&redirect_target)
+            .await;
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", &*format!("{}/", redirect_target.uri())))
+            .mount(&mock_server)
+            .await;
+
+        let sender = WebhookSender::new();
+        let result = sender.send(&mock_server.uri(), "secret", "{}").await;
+
+        assert!(
+            matches!(result, DeliveryResult::PermanentFailure(_)),
+            "a redirect must fail permanently, got: {result:?}"
+        );
+        assert!(
+            redirect_target.received_requests().await.unwrap().is_empty(),
+            "the signed request must never reach the redirect target"
+        );
     }
 
     #[tokio::test]
