@@ -32,6 +32,18 @@ const HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_BACKOFF_EXPONENT: u32 = 5;
 pub const MAX_BACKOFF_SECONDS: u64 = 60;
 
+/// Number of pages the scanner will accept for a single starting header before it
+/// gives up on the peer.
+///
+/// The download loop keeps requesting the next page for as long as the node answers
+/// `has_next_page: true`. Nothing else bounds it: a node that always sets the flag
+/// (whether broken or hostile) keeps the wallet paging and buffering blocks forever,
+/// never reaching the tip. There is a guard against the node returning the same
+/// *header* twice, but none against it returning pages without end. One header covers
+/// at most a few hundred blocks in practice, so this ceiling is only ever reached by
+/// a peer that is not making progress.
+const MAX_PAGES_PER_HEADER: u64 = 10_000;
+
 /// HTTP client for connecting to Tari base node
 #[derive(Clone)]
 pub struct HttpBlockchainScanner<KM> {
@@ -383,6 +395,19 @@ where
             .and_then(|c| c.batch_size)
             .unwrap_or(SYNC_UTXOS_BY_BLOCK_PAGE_LIMIT);
         let page = self.current_in_progress.page();
+        // Paging is driven entirely by the node's `has_next_page` flag, so a node that
+        // never clears it keeps this loop running forever. Stop asking after
+        // MAX_PAGES_PER_HEADER pages against the same starting header rather than
+        // paging (and buffering) without end.
+        if page >= MAX_PAGES_PER_HEADER {
+            self.current_in_progress.clear();
+            return Err(WalletError::ScanningError(
+                crate::errors::ScanningError::blockchain_connection_failed(&format!(
+                    "Base node returned more than {MAX_PAGES_PER_HEADER} pages for header \
+                     {current_header_hash} without advancing; aborting scan"
+                )),
+            ));
+        }
         let sync_response = self
             .sync_utxos_by_block(&current_header_hash, limit, page, exclude_spent, exclude_inputs)
             .await?;
