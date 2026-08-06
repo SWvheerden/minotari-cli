@@ -113,6 +113,20 @@ pub fn create_burn_tx(
     password: &str,
     params: BurnTxParams,
 ) -> Result<BurnTxResult, anyhow::Error> {
+    // The claim key is the only route back to these funds, and a burn cannot be
+    // undone. `CompressedPublicKey::from_canonical_bytes` accepts the Ristretto
+    // identity element (32 zero bytes) — a valid point that nobody holds the secret
+    // scalar for — so an all-zero claim key parses cleanly and produces a burn proof
+    // that can never be redeemed. Refuse it here, before anything is built, rather
+    // than at claim time when the money is already gone.
+    if let Some(cpk) = &params.claim_public_key
+        && crate::utils::crypto::is_identity_public_key(cpk)
+    {
+        return Err(anyhow!(
+            "claim_public_key is the identity element; a burn to it could never be claimed"
+        ));
+    }
+
     let consensus_constants = ConsensusConstantsBuilder::new(network).build();
 
     info!(

@@ -105,6 +105,30 @@ pub fn parse_public_key_hex(s: &str) -> Result<CompressedPublicKey, anyhow::Erro
     CompressedPublicKey::from_canonical_bytes(&bytes).map_err(|e| anyhow!("Invalid public key: {}", e))
 }
 
+/// Decodes a hex string into a [`CompressedPublicKey`] that has to be a real,
+/// spendable public key — one somebody holds the secret scalar for.
+///
+/// `from_canonical_bytes` accepts the Ristretto identity element (32 zero bytes): it
+/// is a canonical encoding of a valid point, just not one anybody has a discrete log
+/// for. Where that key is the sole route to funds — the L2 claim key of a burn — an
+/// identity key makes the burn permanently unclaimable, and the burn is irreversible
+/// by construction, so this has to be rejected before the transaction is built rather
+/// than discovered when the claim fails.
+pub fn parse_claimable_public_key_hex(s: &str) -> Result<CompressedPublicKey, anyhow::Error> {
+    let key = parse_public_key_hex(s)?;
+    if is_identity_public_key(&key) {
+        return Err(anyhow!(
+            "Public key is the identity element; no one holds its secret key, so funds sent to it are unrecoverable"
+        ));
+    }
+    Ok(key)
+}
+
+/// True when `key` is the Ristretto identity element (the canonical all-zero encoding).
+pub fn is_identity_public_key(key: &CompressedPublicKey) -> bool {
+    key.as_bytes().iter().all(|b| *b == 0)
+}
+
 /// Decodes a hex string into a [`PrivateKey`].
 pub fn parse_private_key_hex(s: &str) -> Result<PrivateKey, anyhow::Error> {
     let bytes = hex::decode(s).map_err(|e| anyhow!("Invalid private key hex: {}", e))?;
@@ -114,6 +138,7 @@ pub fn parse_private_key_hex(s: &str) -> Result<PrivateKey, anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tari_utilities::hex::Hex;
 
     #[test]
     fn password_cipher_never_reuses_a_nonce() {
@@ -165,6 +190,34 @@ mod tests {
         assert!(!encrypted.salt_bytes.is_empty());
         assert_eq!(decrypt_data(&encrypted, "hunter2").unwrap(), b"seed words go here");
         assert!(decrypt_data(&encrypted, "wrong password").is_err());
+    }
+
+    #[test]
+    fn the_identity_element_is_refused_as_a_claimable_key() {
+        // The Ristretto identity element is 32 zero bytes and decodes as a perfectly
+        // valid point — but no one holds its discrete log. As the L2 claim key of a
+        // burn it produces a proof that can never be redeemed, and the burn cannot be
+        // undone, so it has to be caught before the transaction is built.
+        let identity = "00".repeat(32);
+        let err = parse_claimable_public_key_hex(&identity).expect_err("identity must be refused");
+        assert!(
+            err.to_string().contains("identity"),
+            "the error should say why, got: {err}"
+        );
+
+        // The plain parser still accepts it — the restriction belongs to keys that
+        // funds are sent to, not to every public key the wallet reads.
+        assert!(parse_public_key_hex(&identity).is_ok());
+    }
+
+    #[test]
+    fn an_ordinary_public_key_is_still_accepted_as_claimable() {
+        // Scalar 1 (little-endian), so the public key is the Ristretto base point.
+        let secret = parse_private_key_hex(&format!("01{}", "00".repeat(31))).expect("canonical scalar");
+        let key = CompressedPublicKey::from_secret_key(&secret);
+        let parsed = parse_claimable_public_key_hex(&key.to_hex()).expect("a real key is accepted");
+        assert_eq!(parsed, key);
+        assert!(!is_identity_public_key(&parsed));
     }
 
     #[test]

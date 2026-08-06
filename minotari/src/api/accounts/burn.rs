@@ -16,7 +16,7 @@ use crate::{
         burn::{BurnTxParams, create_burn_tx, persist_burn_records},
         fund_locker::validate_seconds_to_lock,
     },
-    utils::crypto::{parse_private_key_hex, parse_public_key_hex},
+    utils::crypto::{parse_claimable_public_key_hex, parse_private_key_hex},
 };
 
 use super::params::{
@@ -160,7 +160,7 @@ pub async fn api_burn_funds(
         let claim_public_key = body
             .claim_public_key
             .as_deref()
-            .map(parse_public_key_hex)
+            .map(parse_claimable_public_key_hex)
             .transpose()
             .map_err(|e| ApiError::BadRequest(format!("Invalid claim_public_key: {}", e)))?;
 

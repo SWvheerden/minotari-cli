@@ -15,7 +15,7 @@ use crate::{
     db::{self, init_db},
     http::WalletHttpClient,
     transactions::burn::{BurnTxParams, BurnTxResult, create_burn_tx, persist_burn_records},
-    utils::crypto::{parse_private_key_hex, parse_public_key_hex},
+    utils::crypto::{parse_claimable_public_key_hex, parse_private_key_hex},
 };
 
 /// Parameters consumed by [`handle_burn_funds`].
@@ -37,7 +37,7 @@ pub async fn handle_burn_funds(
 ) -> Result<(), anyhow::Error> {
     let claim_public_key = claim_public_key
         .as_deref()
-        .map(parse_public_key_hex)
+        .map(parse_claimable_public_key_hex)
         .transpose()
         .map_err(|e| anyhow!("Invalid claim-public-key: {}", e))?;
     let sidechain_deployment_key = sidechain_deployment_key
