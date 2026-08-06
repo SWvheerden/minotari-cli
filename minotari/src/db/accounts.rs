@@ -330,7 +330,36 @@ pub struct AccountBalance {
     pub max_date: Option<String>,
 }
 
+/// Reads the three sources a balance is derived from under one consistent snapshot.
+///
+/// `total` comes from the `balance_changes` ledger while `locked`/`unconfirmed`/
+/// `immature` come from the `outputs` table and `tip_height` from
+/// `scanned_tip_blocks`. Read on three separate WAL snapshots, a scan committing
+/// between them can be observed half-applied: the credit for a new output is
+/// visible in the ledger while the output row that makes it `unconfirmed` is not,
+/// and `available = total - unavailable` reports funds that cannot be spent. That
+/// same number is copied into every webhook payload, so a consumer acting on it
+/// would act on a balance the wallet never actually had.
+///
+/// A deferred read transaction pins one snapshot for all three reads. When the
+/// caller is already inside a transaction (webhook enrichment runs inside the scan's
+/// write transaction) the snapshot is pinned already and this is a plain read.
 pub fn get_balance(conn: &Connection, account_id: i64) -> WalletDbResult<AccountBalance> {
+    if !conn.is_autocommit() {
+        return get_balance_in_snapshot(conn, account_id);
+    }
+
+    conn.execute_batch("BEGIN DEFERRED")?;
+    let result = get_balance_in_snapshot(conn, account_id);
+    // Release the snapshot on both paths; the read transaction wrote nothing, so
+    // rolling back and committing are equivalent.
+    if let Err(e) = conn.execute_batch("COMMIT") {
+        warn!(error:% = e; "DB: Failed to close balance read transaction");
+    }
+    result
+}
+
+fn get_balance_in_snapshot(conn: &Connection, account_id: i64) -> WalletDbResult<AccountBalance> {
     debug!(
         account_id = account_id;
         "DB: Calculating account balance"
