@@ -25,6 +25,7 @@ use crate::utils::{
 use crate::{db::balance_changes::get_balance_aggregates_for_account, utils::crypto::FullEncryptedData};
 use tari_utilities::hex::Hex;
 use utoipa::openapi::{Object, Schema, Type};
+use zeroize::Zeroizing;
 
 pub fn micro_minotari_schema() -> Schema {
     Schema::Object(
@@ -48,8 +49,11 @@ pub fn create_account(
 
     let fingerprint = calculate_fingerprint(wallet);
     let birthday = i64::from(wallet.get_birthday().unwrap_or(0));
-    let wallet_json =
-        serde_json::to_string(wallet).map_err(|e| WalletDbError::Unexpected(format!("Serialization failed: {}", e)))?;
+    // The serialized wallet holds the cipher seed / view key in the clear. Keep it in a
+    // buffer that wipes itself so the only long-lived copy is the encrypted one.
+    let wallet_json = Zeroizing::new(
+        serde_json::to_string(wallet).map_err(|e| WalletDbError::Unexpected(format!("Serialization failed: {}", e)))?,
+    );
 
     let encrypted_data = encrypt_data(wallet_json.as_bytes(), password)
         .map_err(|e| WalletDbError::Unexpected(format!("Encryption failed: {}", e)))?;
@@ -285,13 +289,18 @@ impl AccountRow {
         }
     }
 
-    pub fn get_keys_hex(&self, password: &str) -> WalletDbResult<(String, String)> {
+    /// Returns `(private view key hex, public spend key hex)`.
+    ///
+    /// The view key is a secret — it reveals the whole transaction history — so it is
+    /// handed back in a buffer that wipes itself rather than as a plain `String` left
+    /// in the heap after printing.
+    pub fn get_keys_hex(&self, password: &str) -> WalletDbResult<(Zeroizing<String>, String)> {
         let wallet = self.decrypt_wallet_type(password)?;
 
         let view_key = wallet.get_view_key();
         let spend_key = wallet.get_public_spend_key();
 
-        Ok((view_key.to_hex(), spend_key.to_hex()))
+        Ok((Zeroizing::new(view_key.to_hex()), spend_key.to_hex()))
     }
 }
 

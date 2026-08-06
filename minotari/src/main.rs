@@ -90,6 +90,7 @@ use tari_transaction_components::key_manager::wallet_types::SeedWordsWallet;
 use tari_transaction_components::key_manager::wallet_types::WalletType;
 use tari_transaction_components::tari_amount::MicroMinotari;
 use tari_utilities::byte_array::ByteArray;
+use zeroize::Zeroizing;
 
 #[allow(clippy::too_many_lines)]
 #[tokio::main]
@@ -272,7 +273,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
             println!("---------------------------------------------------------");
             println!("Wallet           : {}", account.friendly_name);
-            println!("Private View Key : {}", view_key_hex);
+            println!("Private View Key : {}", view_key_hex.as_str());
             println!("Public Spend Key : {}", spend_key_hex);
             println!("---------------------------------------------------------");
             println!("WARNING: Keep your private view key safe. Anyone with it can see your transaction history.");
@@ -391,7 +392,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
             let max_blocks_to_scan = u64::MAX;
             let daemon = daemon::Daemon::new(
-                security.password,
+                Zeroizing::new(security.password),
                 wallet_config.base_url,
                 wallet_config.database_path,
                 max_blocks_to_scan,
@@ -800,7 +801,7 @@ fn handle_create_unsigned_transaction(
         )
         .map_err(|e| anyhow!("Failed to lock funds: {}", e))?;
 
-    let one_sided_tx = OneSidedTransaction::new(pool.clone(), network, password.clone());
+    let one_sided_tx = OneSidedTransaction::new(pool.clone(), network, Zeroizing::new(password.clone()));
     let result = one_sided_tx
         .create_unsigned_transaction(&account, locked_funds, recipients, fee_per_gram)
         .map_err(|e| anyhow!("Failed to create an unsigned transaction: {}", e))?;

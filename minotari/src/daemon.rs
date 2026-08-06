@@ -66,6 +66,7 @@ use crate::{
         worker::{WebhookWorker, WebhookWorkerConfig},
     },
 };
+use zeroize::Zeroizing;
 
 /// How the daemon's REST API is exposed.
 ///
@@ -125,7 +126,9 @@ impl ApiServerConfig {
 /// API server hosting, and transaction management. It handles graceful shutdown
 /// and error recovery for long-running operation.
 pub struct Daemon {
-    password: String,
+    /// Held for the daemon's whole lifetime, so it lives in a buffer that wipes
+    /// itself on shutdown rather than being left in freed heap memory.
+    password: Zeroizing<String>,
     base_url: String,
     database_file: PathBuf,
     max_blocks: u64,
@@ -157,7 +160,7 @@ impl Daemon {
     /// * `webhook_secret` - Webhook signing secret
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        password: String,
+        password: Zeroizing<String>,
         base_url: String,
         database_file: PathBuf,
         max_blocks: u64,
@@ -173,7 +176,7 @@ impl Daemon {
     ) -> Self {
         let webhook_worker_config = WebhookWorkerConfig {
             enabled: webhook_url.is_some() && webhook_secret.is_some(),
-            secret: webhook_secret,
+            secret: webhook_secret.map(Zeroizing::new),
             send_only_event_types: send_only_event_types.clone(),
         };
         let webhook_trigger_config = webhook_url.map(|url| WebhookTriggerConfig {

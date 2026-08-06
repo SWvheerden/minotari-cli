@@ -7,15 +7,24 @@ use chacha20poly1305::{
 use phc::Salt;
 use tari_common_types::types::{CompressedPublicKey, PrivateKey};
 use tari_utilities::byte_array::ByteArray;
+use zeroize::{Zeroize, Zeroizing};
 
+/// Derives the wallet encryption key from `password`.
+///
+/// The intermediate buffer is wiped before returning: it holds the same key as the
+/// returned `Key` but, unlike `Key` (which zeroizes on drop), a bare `[u8; 32]` would
+/// be left on the stack for whatever runs there next — or written out to a core dump
+/// or swap file.
 fn derive_key(password: &str, salt: &[u8]) -> Result<Key, anyhow::Error> {
     let params = Params::default();
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut key_bytes = [0u8; 32];
-    argon2
+    let derived = argon2
         .hash_password_into(password.as_bytes(), salt, &mut key_bytes)
-        .map_err(|e| anyhow!("Key derivation failed: {}", e))?;
-    Ok(Key::from(key_bytes))
+        .map_err(|e| anyhow!("Key derivation failed: {}", e));
+    let key = derived.map(|()| Key::from(key_bytes));
+    key_bytes.zeroize();
+    key
 }
 
 #[derive(Debug, Clone)]
@@ -82,7 +91,13 @@ pub fn encrypt_data(data: &[u8], password: &str) -> Result<FullEncryptedData, an
 }
 
 /// Decrypts data using XChaCha20-Poly1305.
-pub fn decrypt_data<S: AsRef<[u8]>>(data: &FullEncryptedData<S>, password: &str) -> Result<Vec<u8>, anyhow::Error> {
+///
+/// The plaintext is the wallet's own key material (view key, cipher seed), so it is
+/// returned in a [`Zeroizing`] buffer that wipes itself when the caller drops it.
+pub fn decrypt_data<S: AsRef<[u8]>>(
+    data: &FullEncryptedData<S>,
+    password: &str,
+) -> Result<Zeroizing<Vec<u8>>, anyhow::Error> {
     let salt = data.salt_bytes.as_ref();
     let key = derive_key(password, salt)?;
     let cipher = XChaCha20Poly1305::new(&key);
@@ -96,7 +111,7 @@ pub fn decrypt_data<S: AsRef<[u8]>>(data: &FullEncryptedData<S>, password: &str)
         .decrypt(&xnonce, data.ciphertext.as_ref())
         .map_err(|e| anyhow!("Decryption failed: {}", e))?;
 
-    Ok(plaintext)
+    Ok(Zeroizing::new(plaintext))
 }
 
 /// Decodes a hex string into a [`CompressedPublicKey`].
@@ -130,8 +145,11 @@ pub fn is_identity_public_key(key: &CompressedPublicKey) -> bool {
 }
 
 /// Decodes a hex string into a [`PrivateKey`].
+///
+/// The decoded hex is wiped when it drops: it is the same secret scalar as the
+/// returned key, which zeroizes itself.
 pub fn parse_private_key_hex(s: &str) -> Result<PrivateKey, anyhow::Error> {
-    let bytes = hex::decode(s).map_err(|e| anyhow!("Invalid private key hex: {}", e))?;
+    let bytes = Zeroizing::new(hex::decode(s).map_err(|e| anyhow!("Invalid private key hex: {}", e))?);
     PrivateKey::from_canonical_bytes(&bytes).map_err(|e| anyhow!("Invalid private key: {}", e))
 }
 
@@ -188,7 +206,10 @@ mod tests {
 
         assert_eq!(encrypted.nonce.len(), 24);
         assert!(!encrypted.salt_bytes.is_empty());
-        assert_eq!(decrypt_data(&encrypted, "hunter2").unwrap(), b"seed words go here");
+        assert_eq!(
+            decrypt_data(&encrypted, "hunter2").unwrap().as_slice(),
+            b"seed words go here"
+        );
         assert!(decrypt_data(&encrypted, "wrong password").is_err());
     }
 
@@ -225,11 +246,11 @@ mod tests {
         // The key is derived, not the raw password bytes, so length is irrelevant and a padded
         // short password is not equivalent to any other.
         let short = encrypt_data(b"data", "a").unwrap();
-        assert_eq!(decrypt_data(&short, "a").unwrap(), b"data");
+        assert_eq!(decrypt_data(&short, "a").unwrap().as_slice(), b"data");
         assert!(decrypt_data(&short, "a\0\0\0").is_err());
 
         let long = encrypt_data(b"data", &"z".repeat(200)).unwrap();
-        assert_eq!(decrypt_data(&long, &"z".repeat(200)).unwrap(), b"data");
+        assert_eq!(decrypt_data(&long, &"z".repeat(200)).unwrap().as_slice(), b"data");
         assert!(decrypt_data(&long, &"z".repeat(32)).is_err());
     }
 }
