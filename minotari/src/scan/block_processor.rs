@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use log::{error, info};
 use minotari_scanning::BlockScanResult;
 use rusqlite::Connection;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tari_common_types::payment_reference::generate_payment_reference;
 use tari_common_types::types::{FixedHash, PrivateKey};
 use tari_transaction_components::MicroMinotari;
@@ -362,7 +362,7 @@ impl<E: EventSender> BlockProcessor<E> {
                     None => continue, // Output already exists, skip events and balance changes
                 }
             } else {
-                db::insert_output(
+                let (output_id, newly_inserted) = db::insert_output(
                     tx,
                     account_id,
                     account_view_key,
@@ -375,7 +375,14 @@ impl<E: EventSender> BlockProcessor<E> {
                     memo.hex.clone(),
                     payment_reference,
                     is_burn,
-                )?
+                )?;
+                if !newly_inserted {
+                    // Seen before — the continuous scan re-reads the tip block on every
+                    // poll cycle. Its detection event, webhook and credit are already
+                    // recorded; repeating them would double-count the output.
+                    continue;
+                }
+                output_id
             };
 
             info!(
@@ -449,11 +456,11 @@ impl<E: EventSender> BlockProcessor<E> {
     ) -> Result<BalanceChange, BlockProcessorError> {
         let change = make_balance_change_for_output(account_id, output_id, block.mined_timestamp, block.height, output);
 
-        if self.backfill_mode {
-            db::insert_balance_change_if_not_exists(tx, &change)?;
-        } else {
-            db::insert_balance_change(tx, &change)?;
-        }
+        // Always idempotent, not just during backfill. `balance_changes` is the source
+        // of the account total, and an output can be presented more than once (the
+        // continuous scan deliberately rewinds one block per poll cycle, and a block
+        // may be split across several results). One output must credit the balance once.
+        db::insert_balance_change_if_not_exists(tx, &change)?;
 
         Ok(change)
     }
@@ -471,7 +478,20 @@ impl<E: EventSender> BlockProcessor<E> {
         block: &BlockScanResult,
         account_id: i64,
     ) -> Result<(), BlockProcessorError> {
+        // A block's input list is whatever the base node sent us. The same output hash
+        // appearing twice must debit the balance once: `insert_input` is idempotent
+        // (`INSERT OR IGNORE` behind a unique index on `output_id`) and hands back the
+        // existing row, so without this guard every repeat would still record another
+        // full-value debit against that one input. There is nothing bounding how many
+        // times a hash may be repeated, so an account's balance can be driven to zero
+        // by a single crafted block.
+        let mut seen_inputs = HashSet::with_capacity(block.inputs.len());
+
         for input_hash in &block.inputs {
+            if !seen_inputs.insert(*input_hash) {
+                continue;
+            }
+
             let Some((output_id, tx_id, output)) = db::get_output_info_by_hash_for_account(tx, account_id, input_hash)?
             else {
                 continue;
@@ -548,11 +568,9 @@ impl<E: EventSender> BlockProcessor<E> {
             is_reversed: false,
         };
 
-        if self.backfill_mode {
-            db::insert_balance_change_if_not_exists(tx, &change)?;
-        } else {
-            db::insert_balance_change(tx, &change)?;
-        }
+        // See `record_output_balance_change`: one input must debit the balance once,
+        // however many times the base node reports the spend.
+        db::insert_balance_change_if_not_exists(tx, &change)?;
         Ok(change)
     }
 
