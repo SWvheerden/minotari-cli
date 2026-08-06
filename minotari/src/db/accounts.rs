@@ -342,8 +342,21 @@ pub fn delete_account(conn: &Connection, friendly_name: &str) -> WalletDbResult<
         .ok_or_else(|| WalletDbError::InvalidInput(format!("Account '{}' not found", friendly_name)))?;
     let account_id = account.id;
 
+    // `webhook_queue` does not carry an account_id; it references `events(id)`, so its
+    // rows have to go before the events they point at. (The FK is ON DELETE SET NULL,
+    // which would otherwise leave this account's undelivered payloads queued forever
+    // with no way to tell whose they were.)
+    debug!(account_id = account_id; "Deleting from webhook_queue");
+    conn.execute(
+        "DELETE FROM webhook_queue WHERE event_id IN (SELECT id FROM events WHERE account_id = :id)",
+        named_params! { ":id": account_id },
+    )?;
+
     // The order of table deletion is important to respect foreign key constraints.
-    // The tables are ordered from child to parent.
+    // The tables are ordered from child to parent. Every table holding an
+    // `account_id` REFERENCES accounts(id) must appear here: `PRAGMA foreign_keys`
+    // is ON, so a single omitted table makes the final `DELETE FROM accounts` fail
+    // with a constraint violation and the account can never be deleted.
     let tables_to_clear = [
         "balance_changes",
         "inputs",
@@ -353,6 +366,8 @@ pub fn delete_account(conn: &Connection, friendly_name: &str) -> WalletDbResult<
         "scanned_tip_blocks",
         "events",
         "displayed_transactions",
+        "burn_proofs",
+        "payref_history",
     ];
 
     for table_name in tables_to_clear {
@@ -362,10 +377,16 @@ pub fn delete_account(conn: &Connection, friendly_name: &str) -> WalletDbResult<
     }
 
     debug!(account_id = account_id; "Deleting account record");
-    conn.execute(
+    let deleted = conn.execute(
         "DELETE FROM accounts WHERE id = :id",
         named_params! { ":id": account_id },
     )?;
+    if deleted == 0 {
+        return Err(WalletDbError::Unexpected(format!(
+            "Account '{}' was not deleted",
+            friendly_name
+        )));
+    }
 
     info!(target: "audit", account = friendly_name; "Account successfully deleted");
 
@@ -413,4 +434,70 @@ pub fn update_account_name(conn: &Connection, current_name: &str, new_name: &str
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{NewBurnProof, init_db, insert_burn_proof, save_payref_history};
+    use tari_common_types::seeds::cipher_seed::CipherSeed;
+    use tari_common_types::types::FixedHash;
+    use tempfile::tempdir;
+
+    fn make_wallet() -> WalletType {
+        let seeds = CipherSeed::random();
+        WalletType::SeedWords(
+            tari_transaction_components::key_manager::wallet_types::SeedWordsWallet::construct_new(seeds).unwrap(),
+        )
+    }
+
+    fn new_account(conn: &Connection, name: &str) -> AccountRow {
+        create_account(conn, name, &make_wallet(), "password").unwrap();
+        get_account_by_name(conn, name).unwrap().unwrap()
+    }
+
+    #[test]
+    fn an_account_is_deletable_even_once_it_owns_burn_proofs_and_payref_history() {
+        // `PRAGMA foreign_keys` is ON, so any table referencing accounts(id) that the
+        // deletion forgets makes `DELETE FROM accounts` fail on a constraint. Deleting
+        // a wallet then becomes impossible for exactly the accounts that have been used.
+        let temp = tempdir().expect("temp dir");
+        let pool = init_db(temp.path().join("delete.db")).expect("init db");
+        let conn = pool.get().expect("conn");
+        let account = new_account(&conn, "doomed");
+
+        insert_burn_proof(
+            &conn,
+            &NewBurnProof {
+                account_id: account.id,
+                output_hash: FixedHash::zero(),
+                commitment: vec![0u8; 32],
+                claim_public_key: "00".repeat(32),
+                ownership_proof_nonce: vec![0u8; 32],
+                ownership_proof_sig: vec![0u8; 32],
+                kernel_excess: vec![0u8; 32],
+                kernel_excess_nonce: vec![0u8; 32],
+                kernel_excess_sig: vec![0u8; 32],
+                sender_offset_public_key: vec![0u8; 32],
+                encrypted_data: vec![1, 2, 3],
+                value: 1_000,
+                kernel_fee: 10,
+                kernel_lock_height: 0,
+            },
+        )
+        .expect("insert burn proof");
+
+        save_payref_history(&conn, account.id, 42_u64.into(), "deadbeef", None).expect("save payref history");
+
+        delete_account(&conn, "doomed").expect("account is deletable");
+        assert!(get_account_by_name(&conn, "doomed").unwrap().is_none());
+
+        let burn_proofs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM burn_proofs", [], |r| r.get(0))
+            .unwrap();
+        let payrefs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM payref_history", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((burn_proofs, payrefs), (0, 0), "child rows must go with the account");
+    }
 }
