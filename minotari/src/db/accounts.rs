@@ -182,7 +182,42 @@ impl AccountRow {
         let wallet: WalletType = serde_json::from_slice(&plaintext_bytes)
             .map_err(|e| WalletDbError::Decoding(format!("Failed to deserialize wallet JSON: {}", e)))?;
 
+        // The fingerprint column is the only record of *which* wallet this row is
+        // supposed to hold. AEAD tells us the ciphertext was not tampered with under
+        // this password, but nothing stops an encrypted_wallet/cipher_nonce/salt triple
+        // belonging to a different account from being swapped into this row — the
+        // decryption still succeeds and the wallet silently starts scanning, addressing
+        // and spending under someone else's keys. Writing the fingerprint and never
+        // checking it makes that swap invisible, so check it on every load.
+        self.verify_fingerprint(&wallet)?;
+
         Ok(wallet)
+    }
+
+    /// Checks that the decrypted wallet is the one this row claims to hold.
+    ///
+    /// Rows written before the `fingerprint` column existed may carry an empty value;
+    /// those are accepted (there is nothing to compare against) rather than locking the
+    /// operator out of a legitimate wallet.
+    fn verify_fingerprint(&self, wallet: &WalletType) -> WalletDbResult<()> {
+        if self.fingerprint.is_empty() {
+            return Ok(());
+        }
+
+        let expected = calculate_fingerprint(wallet);
+        if expected != self.fingerprint {
+            warn!(
+                target: "audit",
+                account = &*self.friendly_name;
+                "DB: Wallet fingerprint mismatch — stored key material does not belong to this account"
+            );
+            return Err(WalletDbError::DecryptionFailed(format!(
+                "Wallet fingerprint mismatch for account '{}': the stored key material does not belong to this account",
+                self.friendly_name
+            )));
+        }
+
+        Ok(())
     }
 
     pub fn get_address(&self, network: Network, password: &str) -> WalletDbResult<TariAddress> {
@@ -499,5 +534,64 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM payref_history", [], |r| r.get(0))
             .unwrap();
         assert_eq!((burn_proofs, payrefs), (0, 0), "child rows must go with the account");
+    }
+
+    #[test]
+    fn a_wallet_swapped_into_another_accounts_row_is_refused() {
+        // The ciphertext is authenticated, but nothing binds it to *this* row. Copying
+        // another account's (encrypted_wallet, nonce, salt) triple over this one still
+        // decrypts cleanly under the same password — and the wallet would go on to
+        // scan, address and spend under someone else's keys. The fingerprint column
+        // exists to catch exactly that, so it has to be checked on load.
+        let temp = tempdir().expect("temp dir");
+        let pool = init_db(temp.path().join("fingerprint.db")).expect("init db");
+        let conn = pool.get().expect("conn");
+
+        let victim = new_account(&conn, "victim");
+        let attacker = new_account(&conn, "attacker");
+
+        victim.decrypt_wallet_type("password").expect("own wallet loads");
+
+        conn.execute(
+            "UPDATE accounts SET encrypted_wallet = :w, cipher_nonce = :n, salt = :s WHERE id = :id",
+            named_params! {
+                ":w": attacker.encrypted_wallet,
+                ":n": attacker.cipher_nonce,
+                ":s": attacker.salt,
+                ":id": victim.id,
+            },
+        )
+        .expect("swap key material");
+
+        let swapped = get_account_by_name(&conn, "victim").unwrap().unwrap();
+        let err = swapped
+            .decrypt_wallet_type("password")
+            .expect_err("foreign key material must be rejected");
+        assert!(
+            matches!(&err, WalletDbError::DecryptionFailed(m) if m.contains("fingerprint")),
+            "expected a fingerprint mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_legacy_row_without_a_fingerprint_still_loads() {
+        // Rows written before the column was populated have nothing to compare
+        // against; they must not be treated as tampered with.
+        let temp = tempdir().expect("temp dir");
+        let pool = init_db(temp.path().join("legacy.db")).expect("init db");
+        let conn = pool.get().expect("conn");
+        let account = new_account(&conn, "legacy");
+
+        conn.execute(
+            "UPDATE accounts SET fingerprint = :f WHERE id = :id",
+            named_params! { ":f": Vec::<u8>::new(), ":id": account.id },
+        )
+        .expect("clear fingerprint");
+
+        get_account_by_name(&conn, "legacy")
+            .unwrap()
+            .unwrap()
+            .decrypt_wallet_type("password")
+            .expect("legacy row still loads");
     }
 }
