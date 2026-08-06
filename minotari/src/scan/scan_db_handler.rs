@@ -71,10 +71,40 @@ impl<E: EventSender + Clone + Send + 'static> ScanDbHandler<E> {
                 .map_err(WalletDbError::from)?;
             let mut processor = block_processor;
 
+            // Heights must arrive in an unbroken run starting at `next_block_to_scan`.
+            // `block.height` is taken as the current chain tip for this account: it
+            // decides which outputs have reached the confirmation depth, which
+            // coinbases have matured, and which UTXOs the input selector will hand
+            // out. A base node that answers with a block claiming a height far ahead
+            // of the last one therefore ages every pending output to "confirmed and
+            // mature" in one step, and the wallet goes on to spend funds that were
+            // never confirmed. A skipped height is the mirror image: the outputs and
+            // inputs in it are never recorded, so the balance is wrong and the reorg
+            // check has no hash to compare that height against.
+            //
+            // A repeat of the previous height is legitimate and must be allowed: a
+            // block with more outputs than the node's chunk size is split across
+            // several `BlockScanResult`s that all carry the same height.
+            let mut last_height: Option<u64> = None;
+
             for block in blocks.iter() {
                 if block.height < next_block_to_scan {
                     continue;
                 }
+
+                let permitted = match last_height {
+                    None => block.height == next_block_to_scan,
+                    Some(last) => block.height == last || block.height == last.saturating_add(1),
+                };
+                if !permitted {
+                    return Err(WalletDbError::Unexpected(format!(
+                        "Base node returned a non-contiguous block batch for account {}: expected height {}, got {}",
+                        target_account_id,
+                        last_height.map_or(next_block_to_scan, |h| h.saturating_add(1)),
+                        block.height
+                    )));
+                }
+                last_height = Some(block.height);
 
                 processor
                     .process_block(&tx, block, target_account_id)
@@ -112,5 +142,96 @@ impl<E: EventSender + Clone + Send + 'static> ScanDbHandler<E> {
             ScanError::Fatal(err)
         })?
         .map_err(ScanError::DbError)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{create_account, get_account_by_name, init_db};
+    use crate::scan::events::NoopEventSender;
+    use minotari_scanning::BlockScanResult;
+    use tari_common_types::seeds::cipher_seed::CipherSeed;
+    use tari_common_types::types::FixedHash;
+    use tari_transaction_components::key_manager::wallet_types::{SeedWordsWallet, WalletType};
+    use tari_transaction_components::key_manager::{KeyManager, TransactionKeyManagerInterface};
+    use tempfile::TempDir;
+
+    fn block(height: u64) -> BlockScanResult {
+        BlockScanResult {
+            height,
+            #[allow(clippy::cast_possible_truncation)]
+            block_hash: FixedHash::from([height as u8; 32]),
+            wallet_outputs: Vec::new(),
+            inputs: Vec::new(),
+            mined_timestamp: 1_700_000_000,
+        }
+    }
+
+    fn handler(name: &str) -> (ScanDbHandler<NoopEventSender>, i64, TempDir) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pool = init_db(dir.path().join(name)).expect("init db");
+        let conn = pool.get().expect("conn");
+
+        let seeds = CipherSeed::random();
+        let wallet = WalletType::SeedWords(SeedWordsWallet::construct_new(seeds).unwrap());
+        create_account(&conn, "default", &wallet, "password").unwrap();
+        let account = get_account_by_name(&conn, "default").unwrap().unwrap();
+        let view_key = KeyManager::new(wallet).unwrap().get_private_view_key();
+        drop(conn);
+
+        let processor = BlockProcessor::with_event_sender(vec![(account.id, view_key)], NoopEventSender, false, 3);
+        (ScanDbHandler::new(pool, processor), account.id, dir)
+    }
+
+    #[tokio::test]
+    async fn a_batch_that_skips_ahead_is_refused() {
+        // `block.height` is treated as the chain tip: it drives confirmation depth and
+        // coinbase maturity. A node that jumps the height forward would age every
+        // pending output to "confirmed and mature" in one step, and the wallet would
+        // then spend outputs that were never confirmed.
+        let (mut handler, account_id, _dir) = handler("gap.db");
+
+        let blocks = Arc::new(vec![block(100), block(1_000_000)]);
+        let err = handler
+            .process_blocks(blocks, account_id, false, None, 100)
+            .await
+            .expect_err("a height gap must abort the batch");
+        assert!(
+            err.to_string().contains("non-contiguous"),
+            "the error should name the cause, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_that_does_not_start_where_the_scan_resumes_is_refused() {
+        let (mut handler, account_id, _dir) = handler("start.db");
+
+        let blocks = Arc::new(vec![block(105), block(106)]);
+        let err = handler
+            .process_blocks(blocks, account_id, false, None, 100)
+            .await
+            .expect_err("a batch starting past the resume height must abort");
+        assert!(err.to_string().contains("non-contiguous"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_contiguous_batch_is_processed_including_repeated_heights() {
+        // A block with more outputs than the node's chunk size arrives as several
+        // results carrying the same height, so repeats are legitimate.
+        let (mut handler, account_id, _dir) = handler("ok.db");
+
+        let blocks = Arc::new(vec![block(100), block(100), block(101), block(102)]);
+        handler
+            .process_blocks(blocks, account_id, false, None, 100)
+            .await
+            .expect("a contiguous batch is accepted");
+
+        // Blocks already behind the resume point are skipped, not rejected.
+        let blocks = Arc::new(vec![block(99), block(103)]);
+        handler
+            .process_blocks(blocks, account_id, false, None, 103)
+            .await
+            .expect("already-scanned blocks are skipped");
     }
 }
