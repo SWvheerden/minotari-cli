@@ -26,7 +26,7 @@ use crate::{
 
 use super::params::{
     DEFAULT_FEE_PER_GRAM, DEFAULT_NUM_OUTPUTS, DEFAULT_SECONDS_TO_LOCK_UTXOS, WalletParams, confirmation_window_schema,
-    default_fee_per_gram, default_num_outputs, default_seconds_to_lock_utxos,
+    default_fee_per_gram, default_num_outputs, default_seconds_to_lock_utxos, resolve_confirmation_window,
 };
 
 /// `utoipa`'s `maximum = ..` only accepts a literal, so it cannot reference
@@ -306,7 +306,7 @@ pub async fn api_lock_funds(
             .ok_or_else(|| ApiError::AccountNotFound(name.clone()))?;
 
         let lock_amount = FundLocker::new(pool);
-        let confirmation_window = body.confirmation_window.unwrap_or(default_confirmations);
+        let confirmation_window = resolve_confirmation_window(body.confirmation_window, default_confirmations)?;
         // Every field below changes which UTXOs get reserved or for how long, so
         // all of them are bound to the key: a replay that alters any of them is
         // a different request and must not inherit this reservation.
@@ -460,7 +460,7 @@ pub async fn api_create_unsigned_transaction(
         let fee_per_gram = DEFAULT_FEE_PER_GRAM;
         let estimated_output_size = None;
 
-        let confirmation_window = body.confirmation_window.unwrap_or(default_confirmations);
+        let confirmation_window = resolve_confirmation_window(body.confirmation_window, default_confirmations)?;
         // Bind the key to the recipients this request names. A replay carrying
         // different recipients is rejected here rather than being handed the
         // original request's locked UTXOs to pay them out of.

@@ -79,7 +79,31 @@ impl Default for WalletConfig {
     }
 }
 
+/// Smallest confirmation depth the wallet will spend at.
+///
+/// A window of `0` means the input selector treats outputs in the block it is
+/// currently scanning as spendable. A one-block reorg — routine on any chain — then
+/// erases an output the wallet has already built a transaction against. One
+/// confirmation is the floor; operators who want more can raise it.
+pub const MIN_CONFIRMATION_WINDOW: u64 = 1;
+
 impl WalletConfig {
+    /// Raises `confirmation_window` to [`MIN_CONFIRMATION_WINDOW`] if it was set lower.
+    ///
+    /// Called after the config file is read and again after CLI arguments are
+    /// applied, since either can set the value.
+    pub fn enforce_minimum_confirmation_window(&mut self) {
+        if self.confirmation_window < MIN_CONFIRMATION_WINDOW {
+            log::warn!(
+                target: "audit",
+                configured = self.confirmation_window,
+                minimum = MIN_CONFIRMATION_WINDOW;
+                "confirmation_window below the minimum would allow zero-confirmation spending; raising it"
+            );
+            self.confirmation_window = MIN_CONFIRMATION_WINDOW;
+        }
+    }
+
     pub fn effective_burn_proofs_dir(&self) -> PathBuf {
         self.burn_proofs_dir
             .clone()
@@ -119,6 +143,7 @@ impl ApplyArgs for WalletConfig {
         if let Some(confirmation_window) = args.confirmation_window {
             self.confirmation_window = confirmation_window;
         }
+        self.enforce_minimum_confirmation_window();
     }
 
     fn apply_burn(&mut self, args: &BurnArgs) {
@@ -146,5 +171,43 @@ impl ApplyArgs for WalletConfig {
         if args.api_disable_auth {
             self.api_disable_auth = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_zero_confirmation_window_is_raised_to_the_minimum() {
+        // `confirmation_window = 0` means the input selector treats outputs in the
+        // block currently being scanned as spendable, so a one-block reorg destroys
+        // funds a transaction has already been built against.
+        let mut config = WalletConfig {
+            confirmation_window: 0,
+            ..WalletConfig::default()
+        };
+        config.enforce_minimum_confirmation_window();
+        assert_eq!(config.confirmation_window, MIN_CONFIRMATION_WINDOW);
+    }
+
+    #[test]
+    fn a_configured_window_above_the_minimum_is_left_alone() {
+        let mut config = WalletConfig {
+            confirmation_window: 12,
+            ..WalletConfig::default()
+        };
+        config.enforce_minimum_confirmation_window();
+        assert_eq!(config.confirmation_window, 12);
+    }
+
+    #[test]
+    fn a_cli_argument_cannot_lower_the_window_below_the_minimum() {
+        let mut config = WalletConfig::default();
+        config.apply_transaction(&TransactionArgs {
+            idempotency_key: None,
+            confirmation_window: Some(0),
+        });
+        assert_eq!(config.confirmation_window, MIN_CONFIRMATION_WINDOW);
     }
 }

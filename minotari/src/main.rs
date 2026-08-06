@@ -98,6 +98,9 @@ async fn main() -> Result<(), anyhow::Error> {
     let cli = Cli::parse();
     let config_obj = load_configuration(&cli.config, cli.network)?;
     let mut wallet_config = WalletConfig::load_from(&config_obj)?;
+    // A config file setting `confirmation_window = 0` would let the wallet spend
+    // outputs from the block it is still scanning.
+    wallet_config.enforce_minimum_confirmation_window();
 
     match cli.command {
         Commands::CreateAddress { password, output_file } => {

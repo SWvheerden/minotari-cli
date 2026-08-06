@@ -46,6 +46,31 @@ pub(super) fn default_fee_per_gram() -> Option<MicroMinotari> {
     Some(DEFAULT_FEE_PER_GRAM)
 }
 
+/// Resolves the confirmation window for a request, refusing to go below the
+/// daemon's configured depth.
+///
+/// The window decides how deep an output must be buried before the input selector
+/// will spend it (`tip - confirmation_window`). It is a safety policy the operator
+/// sets, not a per-request preference: a caller passing `0` gets zero-conf
+/// selection, so the wallet will happily build and hand back a transaction spending
+/// an output from the block it is still scanning — one that a reorg one block deep
+/// erases, taking the "spent" funds with it. Anything below the configured depth is
+/// rejected outright rather than silently clamped, so a client that meant to relax
+/// the policy finds out it cannot instead of believing it did.
+pub(super) fn resolve_confirmation_window(
+    requested: Option<u64>,
+    configured: u64,
+) -> Result<u64, crate::api::error::ApiError> {
+    match requested {
+        None => Ok(configured),
+        Some(window) if window >= configured => Ok(window),
+        Some(window) => Err(crate::api::error::ApiError::BadRequest(format!(
+            "confirmation_window must be at least {} (the configured confirmation depth), got {}",
+            configured, window
+        ))),
+    }
+}
+
 pub(super) fn confirmation_window_schema() -> Schema {
     ObjectBuilder::new()
         .schema_type(SchemaType::new(Type::Integer))
@@ -96,4 +121,42 @@ pub struct PayrefParams {
     pub name: String,
     /// The payment reference to search for.
     pub payref: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::error::ApiError;
+
+    #[test]
+    fn a_request_cannot_ask_for_zero_confirmations() {
+        // The window decides how deep an output must be before the input selector will
+        // spend it. A caller-supplied `0` makes outputs in the block being scanned
+        // spendable, so a one-block reorg wipes out funds the wallet has already
+        // handed a transaction for.
+        let err = resolve_confirmation_window(Some(0), 3).expect_err("zero-conf must be refused");
+        assert!(
+            matches!(&err, ApiError::BadRequest(m) if m.contains("confirmation_window")),
+            "expected a 400 naming the field, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_request_may_raise_but_not_lower_the_configured_window() {
+        assert_eq!(
+            resolve_confirmation_window(None, 3).unwrap(),
+            3,
+            "absent means configured"
+        );
+        assert_eq!(resolve_confirmation_window(Some(3), 3).unwrap(), 3, "equal is allowed");
+        assert_eq!(
+            resolve_confirmation_window(Some(10), 3).unwrap(),
+            10,
+            "raising is allowed"
+        );
+        assert!(
+            resolve_confirmation_window(Some(2), 3).is_err(),
+            "lowering below the operator's policy is refused"
+        );
+    }
 }
