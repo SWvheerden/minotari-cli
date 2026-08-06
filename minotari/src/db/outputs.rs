@@ -19,16 +19,6 @@ use tari_transaction_components::transaction_components::WalletOutput;
 use tari_transaction_components::utxo_selection::UtxoValue;
 use tari_utilities::ByteArray;
 
-/// Records a detected output, returning `(output_id, newly_inserted)`.
-///
-/// `newly_inserted` is `false` when this output was already recorded. Callers must
-/// use it to decide whether to emit detection events and balance changes: the same
-/// output is presented more than once in normal operation — the continuous scan
-/// rewinds one block on every poll cycle so it can re-check the tip, and a block
-/// with many outputs arrives split across several results. Failing on the duplicate
-/// (a plain `INSERT` against the unique index on `output_hash`) would abort the whole
-/// scan batch; crediting it twice would inflate the balance. Neither is acceptable,
-/// so the insert is idempotent and the caller skips the rest of the work.
 #[allow(clippy::too_many_arguments)]
 pub fn insert_output(
     conn: &Connection,
@@ -43,7 +33,7 @@ pub fn insert_output(
     memo_hex: Option<String>,
     payment_reference: PaymentReference,
     is_burn: bool,
-) -> WalletDbResult<(i64, bool)> {
+) -> WalletDbResult<i64> {
     info!(
         target: "audit",
         account_id = account_id,
@@ -68,9 +58,9 @@ pub fn insert_output(
     let maturity = output.features().maturity as i64;
     let payment_reference_hex = hex::encode(payment_reference.as_slice());
 
-    let inserted = conn.execute(
+    conn.execute(
         r#"
-       INSERT OR IGNORE INTO outputs (
+       INSERT INTO outputs (
             account_id,
             tx_id,
             output_hash,
@@ -118,18 +108,7 @@ pub fn insert_output(
         },
     )?;
 
-    if inserted > 0 {
-        return Ok((conn.last_insert_rowid(), true));
-    }
-
-    // Already recorded. Hand back the existing row so the caller can link against it
-    // without re-crediting the balance.
-    let existing_id: i64 = conn.query_row(
-        "SELECT id FROM outputs WHERE output_hash = :output_hash AND deleted_at IS NULL",
-        named_params! { ":output_hash": output_hash },
-        |row| row.get(0),
-    )?;
-    Ok((existing_id, false))
+    Ok(conn.last_insert_rowid())
 }
 
 /// Inserts an output with `SpentUnconfirmed` status using `INSERT OR IGNORE`.

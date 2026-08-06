@@ -1111,10 +1111,7 @@ impl<E: EventSender + Clone + Send + 'static> ScanCoordinator<E> {
                         reversal_of_balance_change_id: None,
                         is_reversed: false,
                     };
-                    // `insert_input` is idempotent and returns the existing row when the
-                    // spend was already recorded, so the debit has to be idempotent too
-                    // — otherwise a re-run of the verification pass debits again.
-                    crate::db::insert_balance_change_if_not_exists(&tx, &change).map_err(ScanError::DbError)?;
+                    crate::db::insert_balance_change(&tx, &change).map_err(ScanError::DbError)?;
 
                     crate::db::update_output_status(&tx, *output_id, OutputStatus::Spent)
                         .map_err(ScanError::DbError)?;

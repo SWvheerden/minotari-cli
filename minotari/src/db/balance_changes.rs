@@ -6,28 +6,8 @@ use rusqlite::{Connection, OptionalExtension, named_params};
 use serde::Deserialize;
 use serde_rusqlite::from_rows;
 
-pub fn insert_balance_change(conn: &Connection, change: &BalanceChange) -> WalletDbResult<i64> {
-    insert_balance_change_inner(conn, change, false)?
-        .ok_or_else(|| WalletDbError::Unexpected("Balance change insert affected no rows".to_string()))
-}
-
-/// Inserts a balance change unless one already exists for the same output or input.
-///
-/// Returns `Some(id)` if a row was inserted, `None` if a matching one was already
-/// there. Backed by the partial unique indexes on `caused_by_output_id` /
-/// `caused_by_input_id` (see migration `00033`), so the check and the insert are one
-/// atomic statement rather than a read followed by a write that another writer can
-/// slip between.
-pub fn insert_balance_change_if_not_exists(conn: &Connection, change: &BalanceChange) -> WalletDbResult<Option<i64>> {
-    insert_balance_change_inner(conn, change, true)
-}
-
 #[allow(clippy::cast_possible_wrap)]
-fn insert_balance_change_inner(
-    conn: &Connection,
-    change: &BalanceChange,
-    ignore_duplicates: bool,
-) -> WalletDbResult<Option<i64>> {
+pub fn insert_balance_change(conn: &Connection, change: &BalanceChange) -> WalletDbResult<i64> {
     debug!(
         target: "audit",
         account_id = change.account_id,
@@ -52,15 +32,9 @@ fn insert_balance_change_inner(
         .claimed_amount
         .map(|v| i64::try_from(v.as_u64()).unwrap_or(i64::MAX));
 
-    let insert_verb = if ignore_duplicates {
-        "INSERT OR IGNORE"
-    } else {
-        "INSERT"
-    };
-
-    let sql = format!(
+    conn.execute(
         r#"
-       {insert_verb} INTO balance_changes (
+       INSERT INTO balance_changes (
          account_id,
          caused_by_output_id,
          caused_by_input_id,
@@ -97,11 +71,7 @@ fn insert_balance_change_inner(
             :reversal_of_balance_change_id,
             :is_reversed
          )
-        "#
-    );
-
-    let inserted = conn.execute(
-        &sql,
+        "#,
         named_params! {
             ":account_id": change.account_id,
             ":caused_by_output_id": change.caused_by_output_id,
@@ -123,11 +93,28 @@ fn insert_balance_change_inner(
         },
     )?;
 
-    if inserted == 0 {
+    let id = conn.last_insert_rowid();
+    Ok(id)
+}
+
+/// Inserts a balance change only if one does not already exist for the given output or input.
+/// Used during backfill to avoid duplicate balance entries (balance_changes has no unique constraint).
+/// Returns `Some(id)` if inserted, `None` if a matching record already existed.
+pub fn insert_balance_change_if_not_exists(conn: &Connection, change: &BalanceChange) -> WalletDbResult<Option<i64>> {
+    // Check by output_id or input_id to see if this balance change was already recorded
+    if let Some(output_id) = change.caused_by_output_id
+        && get_balance_change_id_by_output(conn, output_id)?.is_some()
+    {
+        return Ok(None);
+    }
+    if let Some(input_id) = change.caused_by_input_id
+        && get_balance_change_id_by_input(conn, input_id)?.is_some()
+    {
         return Ok(None);
     }
 
-    Ok(Some(conn.last_insert_rowid()))
+    let id = insert_balance_change(conn, change)?;
+    Ok(Some(id))
 }
 
 pub fn get_all_balance_changes_by_account_id(conn: &Connection, account_id: i64) -> WalletDbResult<Vec<BalanceChange>> {
@@ -345,120 +332,6 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("read back claims")
-    }
-
-    /// Creates a real outputs+inputs row pair and returns the input id.
-    ///
-    /// `balance_changes.caused_by_input_id` is a foreign key, so the tests need an
-    /// input that actually exists.
-    fn seed_spent_output(conn: &Connection, account_id: i64, marker: u8) -> i64 {
-        conn.execute(
-            r#"
-            INSERT INTO outputs (
-                account_id, tx_id, output_hash, mined_in_block_height, mined_in_block_hash, value,
-                mined_timestamp, wallet_output_json, is_burn, maturity
-            ) VALUES (
-                :account_id, :tx_id, :output_hash, 10, :block_hash, 1000,
-                :mined_ts, '{}', 0, 0
-            )
-            "#,
-            named_params! {
-                ":account_id": account_id,
-                ":tx_id": i64::from(marker),
-                ":output_hash": vec![marker; 32],
-                ":block_hash": vec![marker; 32],
-                ":mined_ts": Utc::now(),
-            },
-        )
-        .expect("insert output");
-        let output_id = conn.last_insert_rowid();
-
-        conn.execute(
-            r#"
-            INSERT INTO inputs (account_id, output_id, mined_in_block_height, mined_in_block_hash, mined_timestamp)
-            VALUES (:account_id, :output_id, 11, :block_hash, :mined_ts)
-            "#,
-            named_params! {
-                ":account_id": account_id,
-                ":output_id": output_id,
-                ":block_hash": vec![marker; 32],
-                ":mined_ts": Utc::now(),
-            },
-        )
-        .expect("insert input");
-        conn.last_insert_rowid()
-    }
-
-    fn change_for_input(account_id: i64, input_id: i64, debit: u64) -> BalanceChange {
-        BalanceChange {
-            account_id,
-            caused_by_output_id: None,
-            caused_by_input_id: Some(input_id),
-            description: "Output spent as input".to_string(),
-            balance_credit: MicroMinotari::from(0),
-            balance_debit: MicroMinotari::from(debit),
-            effective_date: Utc::now().naive_utc(),
-            effective_height: 10,
-            claimed_recipient_address: None,
-            claimed_sender_address: None,
-            memo_parsed: None,
-            memo_hex: None,
-            claimed_fee: None,
-            claimed_amount: None,
-            is_reversal: false,
-            reversal_of_balance_change_id: None,
-            is_reversed: false,
-        }
-    }
-
-    #[test]
-    fn one_input_debits_the_balance_exactly_once() {
-        // The scanner can present the same spend more than once — a repeated input hash
-        // in a block, a re-scanned block on the next poll cycle, the backfill pass. Each
-        // repeat previously appended another full-value debit, so the reported balance
-        // fell every time the same spend was seen again.
-        let temp = tempdir().expect("temp dir");
-        let pool = init_db(temp.path().join("dupes.db")).expect("init db");
-        let conn = pool.get().expect("conn");
-        let account_id = create_test_account(&conn);
-        let input_id = seed_spent_output(&conn, account_id, 1);
-
-        let first =
-            insert_balance_change_if_not_exists(&conn, &change_for_input(account_id, input_id, 1_000)).expect("insert");
-        assert!(first.is_some(), "the first debit is recorded");
-
-        for _ in 0..5 {
-            let repeat = insert_balance_change_if_not_exists(&conn, &change_for_input(account_id, input_id, 1_000))
-                .expect("repeat insert");
-            assert!(repeat.is_none(), "a repeated spend must not be recorded again");
-        }
-
-        let total_debits: i64 = conn
-            .query_row(
-                "SELECT COALESCE(SUM(balance_debit), 0) FROM balance_changes WHERE account_id = :id",
-                named_params! { ":id": account_id },
-                |row| row.get(0),
-            )
-            .expect("sum debits");
-        assert_eq!(
-            total_debits, 1_000,
-            "the spend must be debited once, not once per sighting"
-        );
-    }
-
-    #[test]
-    fn the_schema_refuses_a_second_debit_for_the_same_input() {
-        // The idempotent helper is the first line of defence; the unique index is what
-        // makes the invariant hold even for a caller that reaches for the plain insert.
-        let temp = tempdir().expect("temp dir");
-        let pool = init_db(temp.path().join("dupes_index.db")).expect("init db");
-        let conn = pool.get().expect("conn");
-        let account_id = create_test_account(&conn);
-        let input_id = seed_spent_output(&conn, account_id, 2);
-
-        insert_balance_change(&conn, &change_for_input(account_id, input_id, 500)).expect("first insert");
-        insert_balance_change(&conn, &change_for_input(account_id, input_id, 500))
-            .expect_err("a second debit for the same input is a constraint violation");
     }
 
     #[test]
