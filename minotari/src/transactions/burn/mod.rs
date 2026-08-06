@@ -262,20 +262,22 @@ pub fn create_burn_tx(
 /// Inserts the burn proof, then (if a matching pending transaction exists) updates
 /// its status to `Completed` and creates a completed-transaction record.
 ///
-/// Errors from the pending-transaction steps are logged as warnings rather than
-/// propagated: the burn proof is already safely stored at this point, so these
-/// failures must not cause the caller to report the burn as failed.
+/// All three writes go in one `IMMEDIATE` transaction and every error is propagated.
+/// They are not independent bookkeeping: the pending transaction is what holds this
+/// burn's UTXOs locked, and the completed-transaction row is what the monitor and the
+/// unlocker use to release them once the burn is mined. Committing the proof while
+/// dropping either of the others — which is what logging and continuing did — leaves
+/// the inputs reserved against a pending transaction that never completes, so those
+/// UTXOs are stranded for good. The caller must see the failure *before* it
+/// broadcasts, since the burn itself cannot be undone.
 ///
 /// Call this before broadcasting the transaction so the proof is never lost.
 pub fn persist_burn_records(
-    conn: &Connection,
+    conn: &mut Connection,
     result: &BurnTxResult,
     account_id: i64,
     idempotency_key: &str,
 ) -> Result<(), anyhow::Error> {
-    crate::db::insert_burn_proof(conn, &result.new_burn_proof)
-        .map_err(|e| anyhow!("Failed to insert burn proof: {}", e))?;
-
     let kernel_excess = result
         .transaction
         .body
@@ -288,40 +290,42 @@ pub fn persist_burn_records(
         serde_json::to_vec(&result.transaction).map_err(|e| anyhow!("Failed to serialize transaction: {}", e))?;
     let sent_output_hash = Some(hex::encode(result.output_hash));
 
-    match crate::db::find_pending_transaction_by_idempotency_key(conn, idempotency_key, account_id) {
-        Ok(Some(pending_tx)) => {
-            let pending_tx_id = pending_tx.id.to_string();
-            if let Err(e) =
-                crate::db::update_pending_transaction_status(conn, &pending_tx_id, PendingTransactionStatus::Completed)
-            {
-                warn!(
-                    "Burn tx succeeded but failed to update pending tx status (idempotency_key={}): {}",
-                    idempotency_key, e
-                );
-            }
-            if let Err(e) = crate::db::create_completed_transaction(
-                conn,
-                account_id,
-                &pending_tx_id,
-                &kernel_excess,
-                &serialized_tx,
-                sent_output_hash,
-                result.tx_id,
-            ) {
-                warn!(
-                    "Burn tx succeeded but failed to record completed transaction (idempotency_key={}): {}",
-                    idempotency_key, e
-                );
-            }
-        },
-        Ok(None) => {},
-        Err(e) => {
-            warn!(
-                "Burn tx succeeded but failed to look up pending transaction (idempotency_key={}): {}",
-                idempotency_key, e
-            );
-        },
+    // BEGIN IMMEDIATE: this reads the pending transaction and then rewrites it, and a
+    // deferred read->write upgrade can fail with SQLITE_BUSY_SNAPSHOT in WAL mode,
+    // which `busy_timeout` does not retry.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+    crate::db::insert_burn_proof(&tx, &result.new_burn_proof)
+        .map_err(|e| anyhow!("Failed to insert burn proof: {}", e))?;
+
+    let pending = crate::db::find_pending_transaction_by_idempotency_key(&tx, idempotency_key, account_id)
+        .map_err(|e| anyhow!("Failed to look up pending transaction for burn: {}", e))?;
+
+    if let Some(pending_tx) = pending {
+        let pending_tx_id = pending_tx.id.to_string();
+
+        crate::db::update_pending_transaction_status(&tx, &pending_tx_id, PendingTransactionStatus::Completed)
+            .map_err(|e| anyhow!("Failed to complete pending transaction for burn: {}", e))?;
+
+        crate::db::create_completed_transaction(
+            &tx,
+            account_id,
+            &pending_tx_id,
+            &kernel_excess,
+            &serialized_tx,
+            sent_output_hash,
+            result.tx_id,
+        )
+        .map_err(|e| anyhow!("Failed to record completed transaction for burn: {}", e))?;
+    } else {
+        warn!(
+            target: "audit",
+            idempotency_key = idempotency_key;
+            "Burn has no matching pending transaction; its inputs are not tracked by a lock record"
+        );
     }
+
+    tx.commit()?;
 
     Ok(())
 }

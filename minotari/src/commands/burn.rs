@@ -49,7 +49,7 @@ pub async fn handle_burn_funds(
     let idempotency_key = idempotency_key.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     let pool = init_db(database_file)?;
-    let conn = pool.get()?;
+    let mut conn = pool.get()?;
 
     let account = db::get_account_by_name(&conn, &account_name)?
         .ok_or_else(|| anyhow!("Account '{}' not found", account_name))?;
@@ -70,7 +70,7 @@ pub async fn handle_burn_funds(
         .map_err(|e| anyhow!("Failed to build burn transaction: {}", e))?;
 
     // Persist partial burn proof before broadcasting (so it's never lost).
-    persist_burn_records(&conn, &result, account.id, &idempotency_key)?;
+    persist_burn_records(&mut conn, &result, account.id, &idempotency_key)?;
     info!(
         target: "audit",
         output_hash = &*hex::encode(result.output_hash);
