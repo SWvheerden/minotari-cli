@@ -98,6 +98,7 @@ use crate::{
         one_sided_transaction::Recipient,
     },
 };
+use zeroize::Zeroizing;
 
 /// Represents a transaction being processed through the send flow.
 ///
@@ -224,7 +225,7 @@ pub struct TransactionSender {
     /// The sender's account.
     pub account: AccountRow,
     /// Password for key manager access.
-    pub password: String,
+    pub password: Zeroizing<String>,
     /// The transaction currently being processed.
     pub processed_transactions: ProcessedTransaction,
     /// Fee rate for this transaction.
@@ -269,7 +270,7 @@ impl TransactionSender {
     pub fn new(
         db_pool: SqlitePool,
         account_name: String,
-        password: String,
+        password: Zeroizing<String>,
         network: Network,
         confirmation_window: u64,
     ) -> Result<Self, anyhow::Error> {

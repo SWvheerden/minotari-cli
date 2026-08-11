@@ -73,7 +73,14 @@ pub async fn handle_reorgs(
             rollback_height = reorg_start_height;
             "REORG DETECTED. Rolling back chain state."
         );
-        let tx = conn.transaction()?;
+        // BEGIN IMMEDIATE: the rollback reads the rows it is about to rewrite, so a
+        // deferred transaction would start as a reader and then try to upgrade to a
+        // writer. In WAL mode that upgrade fails with SQLITE_BUSY_SNAPSHOT if another
+        // connection committed in the meantime — an error `busy_timeout` never retries,
+        // surfacing as "database is locked" and aborting the reorg recovery halfway
+        // through the scan loop. Taking the write lock up front makes the rollback
+        // wait for its turn instead.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let reorg_info = rollback_from_height(&tx, account_id, reorg_start_height, webhook_config)?;
         tx.commit()?;
         Ok(ReorgResult {

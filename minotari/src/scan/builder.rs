@@ -13,6 +13,7 @@ use crate::{
     },
     webhooks::WebhookTriggerConfig,
 };
+use zeroize::Zeroizing;
 
 /// Builder for configuring and executing blockchain scanning operations.
 ///
@@ -52,7 +53,7 @@ use crate::{
 /// scanner instances for concurrent scanning of different accounts.
 pub struct Scanner {
     /// Password for decrypting account key managers.
-    password: String,
+    password: Zeroizing<String>,
     /// Base URL for the blockchain node HTTP API.
     base_url: String,
     /// Path to the SQLite database file.
@@ -109,7 +110,7 @@ impl Scanner {
         required_confirmations: u64,
     ) -> Self {
         Self {
-            password: password.to_string(),
+            password: Zeroizing::new(password.to_string()),
             base_url: base_url.to_string(),
             database_file,
             account_name: None,

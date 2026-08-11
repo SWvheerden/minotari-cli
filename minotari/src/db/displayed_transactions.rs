@@ -11,6 +11,21 @@ use tari_common_types::transaction::TxId;
 use tari_common_types::types::FixedHash;
 use tari_utilities::hex::Hex;
 
+/// Upper bound on rows a single payref lookup may return.
+///
+/// A payment reference identifies one payment, so a handful of matches is already
+/// generous; the cap exists so a malformed or hostile query cannot make the wallet
+/// load and serialize every transaction it has.
+const MAX_PAYREF_MATCHES: i64 = 100;
+
+/// Escapes the LIKE metacharacters in `value` so it matches only itself.
+///
+/// Pairs with `ESCAPE '\'` on the query. The backslash must be escaped first,
+/// otherwise the backslashes this function introduces would themselves be escaped.
+fn escape_like_pattern(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
 /// Serialize the transaction's payrefs to the denormalized `payref` column as a
 /// JSON array of hex strings. This matches the hex form used by the `LIKE`
 /// payref lookup and the reorg-history parser (which reads `Vec<String>`).
@@ -568,23 +583,115 @@ pub fn get_displayed_transactions_by_payref(
         "DB: Fetching displayed transactions by payref"
     );
 
-    // The payref column stores a JSON array, so we use LIKE to search within it
-    // We search for the payref as a substring since it's stored as JSON
-    let search_pattern = format!("%{}%", payref);
+    // The payref column stores a JSON array, so we use LIKE to search within it: we
+    // look for the payref as a substring of the serialized array.
+    //
+    // `payref` comes straight off the URL path. Binding it as a parameter stops SQL
+    // injection but not *pattern* injection: `%` and `_` are wildcards inside a LIKE
+    // pattern, so a payref of `%` matches every row and returns the account's entire
+    // transaction history to a caller who knows no payment reference at all. Escape
+    // the wildcards so the pattern only ever matches the literal payref, and bound
+    // the result set so one request cannot ask the wallet to serialize an unbounded
+    // number of transactions.
+    let search_pattern = format!("%{}%", escape_like_pattern(payref));
 
     let mut stmt = conn.prepare_cached(
         r#"
         SELECT transaction_json
         FROM displayed_transactions
-        WHERE account_id = :account_id AND payref LIKE :pattern
+        WHERE account_id = :account_id AND payref LIKE :pattern ESCAPE '\'
         ORDER BY block_height DESC, timestamp DESC
+        LIMIT :limit
         "#,
     )?;
 
     let rows = stmt.query(named_params! {
         ":account_id": account_id,
-        ":pattern": search_pattern
+        ":pattern": search_pattern,
+        ":limit": MAX_PAYREF_MATCHES,
     })?;
 
     process_json_rows(from_rows::<TransactionJsonRow>(rows))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{create_account, get_account_by_name, init_db};
+    use crate::transactions::{BlockchainInfo, TransactionDetails, TransactionDirection, TransactionSource};
+    use tari_common_types::seeds::cipher_seed::CipherSeed;
+    use tari_transaction_components::MicroMinotari;
+    use tari_transaction_components::key_manager::wallet_types::{SeedWordsWallet, WalletType};
+    use tempfile::tempdir;
+
+    fn create_test_account(conn: &Connection) -> i64 {
+        let seeds = CipherSeed::random();
+        let wallet = WalletType::SeedWords(SeedWordsWallet::construct_new(seeds).unwrap());
+        create_account(conn, "default", &wallet, "password").unwrap();
+        get_account_by_name(conn, "default").unwrap().unwrap().id
+    }
+
+    /// A transaction whose only payref is `payref_byte` repeated 32 times.
+    fn transaction_with_payref(account_id: Id, id: u64, payref_byte: u8) -> DisplayedTransaction {
+        DisplayedTransaction {
+            id: TxId::from(id),
+            direction: TransactionDirection::Incoming,
+            source: TransactionSource::OneSided,
+            status: TransactionDisplayStatus::Confirmed,
+            amount: MicroMinotari::from(1_000),
+            message: None,
+            counterparty: None,
+            blockchain: BlockchainInfo {
+                block_height: 100,
+                timestamp: chrono::Utc::now().naive_utc(),
+                confirmations: 5,
+                block_hash: FixedHash::zero(),
+            },
+            fee: None,
+            details: TransactionDetails {
+                account_id,
+                total_credit: MicroMinotari::from(1_000),
+                total_debit: MicroMinotari::from(0),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                output_type: None,
+                coinbase_extra: None,
+                memo_hex: None,
+                sent_output_hashes: Vec::new(),
+                sent_payrefs: vec![FixedHash::from([payref_byte; 32])],
+            },
+            lock_height: 0,
+        }
+    }
+
+    #[test]
+    fn a_wildcard_payref_does_not_return_the_whole_history() {
+        // The payref arrives as a URL path segment and is interpolated into a LIKE
+        // pattern. Binding it as a parameter stops SQL injection but not pattern
+        // injection: `%` is a LIKE wildcard, so a caller who knows no payment
+        // reference at all could ask for `%` and be handed every transaction on the
+        // account.
+        let temp = tempdir().expect("temp dir");
+        let pool = init_db(temp.path().join("payref.db")).expect("init db");
+        let conn = pool.get().expect("conn");
+        let account_id = create_test_account(&conn);
+
+        insert_displayed_transaction(&conn, &transaction_with_payref(account_id, 1, 0xAA)).expect("insert 1");
+        insert_displayed_transaction(&conn, &transaction_with_payref(account_id, 2, 0xBB)).expect("insert 2");
+
+        let all = get_displayed_transactions_by_payref(&conn, account_id, "%").expect("query");
+        assert!(all.is_empty(), "a bare wildcard must match nothing, got {}", all.len());
+
+        let underscores = get_displayed_transactions_by_payref(&conn, account_id, &"_".repeat(64)).expect("query");
+        assert!(
+            underscores.is_empty(),
+            "`_` must not act as a single-character wildcard"
+        );
+
+        // A real payref still resolves.
+        let target = "aa".repeat(32);
+        let found = get_displayed_transactions_by_payref(&conn, account_id, &target).expect("query");
+        assert_eq!(found.len(), 1, "the literal payref must still match its transaction");
+        assert_eq!(found.first().expect("one match").id, TxId::from(1_u64));
+    }
 }

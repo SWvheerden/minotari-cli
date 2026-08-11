@@ -32,6 +32,75 @@ const HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_BACKOFF_EXPONENT: u32 = 5;
 pub const MAX_BACKOFF_SECONDS: u64 = 60;
 
+/// Largest response body the scanner will read, after decompression.
+///
+/// The client asks for `gzip`, so reqwest inflates the body transparently and the
+/// `Content-Length` the server advertises says nothing about how much memory the
+/// response will actually take. A few hundred KiB of gzip expands to gigabytes, and
+/// `response.json()` / `response.text()` will happily buffer all of it until the
+/// process is killed. Bodies are therefore read chunk by chunk — post-decompression
+/// — and abandoned once they cross this line.
+///
+/// 256 MiB is far above any legitimate reply: a `sync_utxos_by_block` page is capped
+/// at 50 blocks and the node chunks large blocks itself.
+const MAX_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
+
+/// Number of pages the scanner will accept for a single starting header before it
+/// gives up on the peer.
+///
+/// The download loop keeps requesting the next page for as long as the node answers
+/// `has_next_page: true`. Nothing else bounds it: a node that always sets the flag
+/// (whether broken or hostile) keeps the wallet paging and buffering blocks forever,
+/// never reaching the tip. There is a guard against the node returning the same
+/// *header* twice, but none against it returning pages without end. One header covers
+/// at most a few hundred blocks in practice, so this ceiling is only ever reached by
+/// a peer that is not making progress.
+const MAX_PAGES_PER_HEADER: u64 = 10_000;
+
+/// Reads a response body, refusing to buffer more than [`MAX_RESPONSE_BYTES`].
+///
+/// Bodies arrive already decompressed (the client negotiates `gzip`), so the cap is
+/// on the inflated size — which is the size that actually costs memory and the one an
+/// attacker controls independently of the bytes on the wire.
+async fn read_body_capped(response: reqwest::Response, what: &str) -> WalletResult<Vec<u8>> {
+    let mut response = response;
+    let mut body = Vec::new();
+
+    loop {
+        let chunk = response.chunk().await.map_err(|e| {
+            WalletError::ScanningError(crate::errors::ScanningError::blockchain_connection_failed(&format!(
+                "Failed to read {what} response body: {e}"
+            )))
+        })?;
+        let Some(chunk) = chunk else { break };
+
+        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+            return Err(WalletError::ScanningError(
+                crate::errors::ScanningError::blockchain_connection_failed(&format!(
+                    "{what} response body exceeds the {MAX_RESPONSE_BYTES} byte limit"
+                )),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(body)
+}
+
+/// Reads a response body under the size cap and decodes it as UTF-8, lossily.
+///
+/// Used for diagnostics (error bodies) and for the small JSON replies parsed with
+/// `serde_json::from_str`.
+async fn read_body_text_capped(response: reqwest::Response, what: &str) -> WalletResult<String> {
+    let bytes = read_body_capped(response, what).await?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Best-effort read of an error response body, for logging only.
+async fn read_error_body(response: reqwest::Response) -> String {
+    read_body_text_capped(response, "error").await.unwrap_or_default()
+}
+
 /// HTTP client for connecting to Tari base node
 #[derive(Clone)]
 pub struct HttpBlockchainScanner<KM> {
@@ -108,7 +177,7 @@ where
         let response = client.get(&test_url).send().await;
         if response.is_err() {
             let body = match response {
-                Ok(resp) => resp.text().await.unwrap_or_default(),
+                Ok(resp) => read_error_body(resp).await,
                 Err(e) => e.to_string(),
             };
             warn!("Connection test failed, response body: {body}");
@@ -216,14 +285,15 @@ where
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = read_error_body(response).await;
             warn!("HTTP error response body: {}", body);
             return Err(WalletError::ScanningError(
                 crate::errors::ScanningError::blockchain_connection_failed(&format!("HTTP error: {status}")),
             ));
         }
 
-        let sync_response_v1: SyncUtxosByBlockResponseV1 = response.json().await.map_err(|e| {
+        let body = read_body_capped(response, "sync_utxos_by_block").await?;
+        let sync_response_v1: SyncUtxosByBlockResponseV1 = serde_json::from_slice(&body).map_err(|e| {
             WalletError::ScanningError(crate::errors::ScanningError::blockchain_connection_failed(&format!(
                 "Failed to parse response: {e}"
             )))
@@ -251,18 +321,14 @@ where
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = read_error_body(response).await;
             warn!("HTTP error response body: {}", body);
             return Err(WalletError::ScanningError(
                 crate::errors::ScanningError::blockchain_connection_failed(&format!("HTTP error: {status}")),
             ));
         }
 
-        let body_text = response.text().await.map_err(|e| {
-            WalletError::ScanningError(crate::errors::ScanningError::blockchain_connection_failed(&format!(
-                "Failed to read response body: {e}"
-            )))
-        })?;
+        let body_text = read_body_text_capped(response, "get_utxos_by_block").await?;
         let sync_response: GetUtxosByBlockResponse = serde_json::from_str(&body_text).map_err(|e| {
             warn!("Failed to parse response body: {}", body_text);
             WalletError::ScanningError(crate::errors::ScanningError::blockchain_connection_failed(&format!(
@@ -383,6 +449,19 @@ where
             .and_then(|c| c.batch_size)
             .unwrap_or(SYNC_UTXOS_BY_BLOCK_PAGE_LIMIT);
         let page = self.current_in_progress.page();
+        // Paging is driven entirely by the node's `has_next_page` flag, so a node that
+        // never clears it keeps this loop running forever. Stop asking after
+        // MAX_PAGES_PER_HEADER pages against the same starting header rather than
+        // paging (and buffering) without end.
+        if page >= MAX_PAGES_PER_HEADER {
+            self.current_in_progress.clear();
+            return Err(WalletError::ScanningError(
+                crate::errors::ScanningError::blockchain_connection_failed(&format!(
+                    "Base node returned more than {MAX_PAGES_PER_HEADER} pages for header \
+                     {current_header_hash} without advancing; aborting scan"
+                )),
+            ));
+        }
         let sync_response = self
             .sync_utxos_by_block(&current_header_hash, limit, page, exclude_spent, exclude_inputs)
             .await?;
@@ -459,18 +538,14 @@ where
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = read_error_body(response).await;
             warn!("HTTP error response body: {}", body);
             return Err(WalletError::ScanningError(
                 crate::errors::ScanningError::blockchain_connection_failed(&format!("HTTP error: {status}")),
             ));
         }
 
-        let body_text = response.text().await.map_err(|e| {
-            WalletError::ScanningError(crate::errors::ScanningError::blockchain_connection_failed(&format!(
-                "Failed to read response body: {e}"
-            )))
-        })?;
+        let body_text = read_body_text_capped(response, "get_tip_info").await?;
 
         let tip_response: HttpTipInfoResponse = serde_json::from_str(&body_text).map_err(|e| {
             warn!("Failed to parse response body: {}", body_text);
@@ -505,18 +580,14 @@ where
                 return Ok(None);
             }
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = read_error_body(response).await;
             warn!("HTTP error response body: {}", body);
             return Err(WalletError::ScanningError(
                 crate::errors::ScanningError::blockchain_connection_failed(&format!("HTTP error: {status}")),
             ));
         }
 
-        let body = response.text().await.map_err(|e| {
-            WalletError::ScanningError(crate::errors::ScanningError::blockchain_connection_failed(&format!(
-                "Failed to read response body: {e}"
-            )))
-        })?;
+        let body = read_body_text_capped(response, "get_header_by_height").await?;
 
         let header_response: HttpBlockHeader = serde_json::from_str(&body).map_err(|e| {
             warn!("Failed to parse response body: {}", body);

@@ -47,7 +47,7 @@
 //! # async fn example() -> anyhow::Result<()> {
 //! let db_pool = init_db(PathBuf::from("wallet.db"))?;
 //! let network = Network::Esmeralda;
-//! let password = "secure_password".to_string();
+//! let password = zeroize::Zeroizing::new("secure_password".to_string());
 //! // `generated` is `Some` when no token was configured - show it to the operator.
 //! let (api_token, generated) = resolve_api_token(None, None)?;
 //!
@@ -81,6 +81,7 @@ use utoipa::{
     openapi::security::{ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme},
 };
 use utoipa_swagger_ui::SwaggerUi;
+use zeroize::Zeroizing;
 
 use crate::db::SqlitePool;
 
@@ -100,12 +101,13 @@ pub use auth::{ApiAuth, ApiToken, ApiTokenError, resolve_api_token};
 ///
 /// * `db_pool` - SQLite connection pool for database operations
 /// * `network` - Tari network configuration (Esmeralda, Nextnet, Mainnet, etc.)
-/// * `password` - Password for decrypting wallet keys (stored in memory)
+/// * `password` - Password for decrypting wallet keys (held in memory for the daemon's
+///   lifetime, so it is kept in a buffer that wipes itself when the state is dropped)
 #[derive(Clone)]
 pub struct AppState {
     pub db_pool: SqlitePool,
     pub network: Network,
-    pub password: String,
+    pub password: Zeroizing<String>,
     pub required_confirmations: u64,
     pub base_node_url: String,
 }
@@ -286,7 +288,7 @@ impl Modify for SecurityAddon {
 /// let router = create_router(
 ///     db_pool,
 ///     Network::Esmeralda,
-///     "password".to_string(),
+///     Zeroizing::new("password".to_string()),
 ///     3,
 ///     "https://rpc.tari.com".to_string(),
 ///     ApiAuth::Required(api_token),
@@ -300,7 +302,7 @@ impl Modify for SecurityAddon {
 pub fn create_router(
     db_pool: SqlitePool,
     network: Network,
-    password: String,
+    password: Zeroizing<String>,
     required_confirmations: u64,
     base_node_url: String,
     api_auth: ApiAuth,
@@ -384,7 +386,7 @@ mod tests {
         let router = create_router(
             db_pool,
             Network::LocalNet,
-            "password".to_string(),
+            Zeroizing::new("password".to_string()),
             3,
             "http://127.0.0.1:9999".to_string(),
             api_auth,

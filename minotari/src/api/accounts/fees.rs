@@ -18,7 +18,7 @@ use crate::{
     transactions::fee_estimator::{FeeEstimator, FeePriority},
 };
 
-use super::params::{WalletParams, confirmation_window_schema};
+use super::params::{WalletParams, confirmation_window_schema, resolve_confirmation_window};
 
 fn default_one_usize() -> usize {
     1
@@ -119,7 +119,7 @@ pub async fn api_estimate_fees(
     let name = name.clone();
 
     let estimator = FeeEstimator::new(pool, base_url);
-    let confirmation_window = body.confirmation_window.unwrap_or(default_confirmations);
+    let confirmation_window = resolve_confirmation_window(body.confirmation_window, default_confirmations)?;
 
     let estimates = estimator
         .estimate_fees(

@@ -25,6 +25,7 @@ use crate::utils::{
 use crate::{db::balance_changes::get_balance_aggregates_for_account, utils::crypto::FullEncryptedData};
 use tari_utilities::hex::Hex;
 use utoipa::openapi::{Object, Schema, Type};
+use zeroize::Zeroizing;
 
 pub fn micro_minotari_schema() -> Schema {
     Schema::Object(
@@ -48,8 +49,11 @@ pub fn create_account(
 
     let fingerprint = calculate_fingerprint(wallet);
     let birthday = i64::from(wallet.get_birthday().unwrap_or(0));
-    let wallet_json =
-        serde_json::to_string(wallet).map_err(|e| WalletDbError::Unexpected(format!("Serialization failed: {}", e)))?;
+    // The serialized wallet holds the cipher seed / view key in the clear. Keep it in a
+    // buffer that wipes itself so the only long-lived copy is the encrypted one.
+    let wallet_json = Zeroizing::new(
+        serde_json::to_string(wallet).map_err(|e| WalletDbError::Unexpected(format!("Serialization failed: {}", e)))?,
+    );
 
     let encrypted_data = encrypt_data(wallet_json.as_bytes(), password)
         .map_err(|e| WalletDbError::Unexpected(format!("Encryption failed: {}", e)))?;
@@ -182,7 +186,42 @@ impl AccountRow {
         let wallet: WalletType = serde_json::from_slice(&plaintext_bytes)
             .map_err(|e| WalletDbError::Decoding(format!("Failed to deserialize wallet JSON: {}", e)))?;
 
+        // The fingerprint column is the only record of *which* wallet this row is
+        // supposed to hold. AEAD tells us the ciphertext was not tampered with under
+        // this password, but nothing stops an encrypted_wallet/cipher_nonce/salt triple
+        // belonging to a different account from being swapped into this row — the
+        // decryption still succeeds and the wallet silently starts scanning, addressing
+        // and spending under someone else's keys. Writing the fingerprint and never
+        // checking it makes that swap invisible, so check it on every load.
+        self.verify_fingerprint(&wallet)?;
+
         Ok(wallet)
+    }
+
+    /// Checks that the decrypted wallet is the one this row claims to hold.
+    ///
+    /// Rows written before the `fingerprint` column existed may carry an empty value;
+    /// those are accepted (there is nothing to compare against) rather than locking the
+    /// operator out of a legitimate wallet.
+    fn verify_fingerprint(&self, wallet: &WalletType) -> WalletDbResult<()> {
+        if self.fingerprint.is_empty() {
+            return Ok(());
+        }
+
+        let expected = calculate_fingerprint(wallet);
+        if expected != self.fingerprint {
+            warn!(
+                target: "audit",
+                account = &*self.friendly_name;
+                "DB: Wallet fingerprint mismatch — stored key material does not belong to this account"
+            );
+            return Err(WalletDbError::DecryptionFailed(format!(
+                "Wallet fingerprint mismatch for account '{}': the stored key material does not belong to this account",
+                self.friendly_name
+            )));
+        }
+
+        Ok(())
     }
 
     pub fn get_address(&self, network: Network, password: &str) -> WalletDbResult<TariAddress> {
@@ -250,13 +289,18 @@ impl AccountRow {
         }
     }
 
-    pub fn get_keys_hex(&self, password: &str) -> WalletDbResult<(String, String)> {
+    /// Returns `(private view key hex, public spend key hex)`.
+    ///
+    /// The view key is a secret — it reveals the whole transaction history — so it is
+    /// handed back in a buffer that wipes itself rather than as a plain `String` left
+    /// in the heap after printing.
+    pub fn get_keys_hex(&self, password: &str) -> WalletDbResult<(Zeroizing<String>, String)> {
         let wallet = self.decrypt_wallet_type(password)?;
 
         let view_key = wallet.get_view_key();
         let spend_key = wallet.get_public_spend_key();
 
-        Ok((view_key.to_hex(), spend_key.to_hex()))
+        Ok((Zeroizing::new(view_key.to_hex()), spend_key.to_hex()))
     }
 }
 
@@ -295,7 +339,36 @@ pub struct AccountBalance {
     pub max_date: Option<String>,
 }
 
+/// Reads the three sources a balance is derived from under one consistent snapshot.
+///
+/// `total` comes from the `balance_changes` ledger while `locked`/`unconfirmed`/
+/// `immature` come from the `outputs` table and `tip_height` from
+/// `scanned_tip_blocks`. Read on three separate WAL snapshots, a scan committing
+/// between them can be observed half-applied: the credit for a new output is
+/// visible in the ledger while the output row that makes it `unconfirmed` is not,
+/// and `available = total - unavailable` reports funds that cannot be spent. That
+/// same number is copied into every webhook payload, so a consumer acting on it
+/// would act on a balance the wallet never actually had.
+///
+/// A deferred read transaction pins one snapshot for all three reads. When the
+/// caller is already inside a transaction (webhook enrichment runs inside the scan's
+/// write transaction) the snapshot is pinned already and this is a plain read.
 pub fn get_balance(conn: &Connection, account_id: i64) -> WalletDbResult<AccountBalance> {
+    if !conn.is_autocommit() {
+        return get_balance_in_snapshot(conn, account_id);
+    }
+
+    conn.execute_batch("BEGIN DEFERRED")?;
+    let result = get_balance_in_snapshot(conn, account_id);
+    // Release the snapshot on both paths; the read transaction wrote nothing, so
+    // rolling back and committing are equivalent.
+    if let Err(e) = conn.execute_batch("COMMIT") {
+        warn!(error:% = e; "DB: Failed to close balance read transaction");
+    }
+    result
+}
+
+fn get_balance_in_snapshot(conn: &Connection, account_id: i64) -> WalletDbResult<AccountBalance> {
     debug!(
         account_id = account_id;
         "DB: Calculating account balance"
@@ -342,8 +415,21 @@ pub fn delete_account(conn: &Connection, friendly_name: &str) -> WalletDbResult<
         .ok_or_else(|| WalletDbError::InvalidInput(format!("Account '{}' not found", friendly_name)))?;
     let account_id = account.id;
 
+    // `webhook_queue` does not carry an account_id; it references `events(id)`, so its
+    // rows have to go before the events they point at. (The FK is ON DELETE SET NULL,
+    // which would otherwise leave this account's undelivered payloads queued forever
+    // with no way to tell whose they were.)
+    debug!(account_id = account_id; "Deleting from webhook_queue");
+    conn.execute(
+        "DELETE FROM webhook_queue WHERE event_id IN (SELECT id FROM events WHERE account_id = :id)",
+        named_params! { ":id": account_id },
+    )?;
+
     // The order of table deletion is important to respect foreign key constraints.
-    // The tables are ordered from child to parent.
+    // The tables are ordered from child to parent. Every table holding an
+    // `account_id` REFERENCES accounts(id) must appear here: `PRAGMA foreign_keys`
+    // is ON, so a single omitted table makes the final `DELETE FROM accounts` fail
+    // with a constraint violation and the account can never be deleted.
     let tables_to_clear = [
         "balance_changes",
         "inputs",
@@ -353,6 +439,8 @@ pub fn delete_account(conn: &Connection, friendly_name: &str) -> WalletDbResult<
         "scanned_tip_blocks",
         "events",
         "displayed_transactions",
+        "burn_proofs",
+        "payref_history",
     ];
 
     for table_name in tables_to_clear {
@@ -362,10 +450,16 @@ pub fn delete_account(conn: &Connection, friendly_name: &str) -> WalletDbResult<
     }
 
     debug!(account_id = account_id; "Deleting account record");
-    conn.execute(
+    let deleted = conn.execute(
         "DELETE FROM accounts WHERE id = :id",
         named_params! { ":id": account_id },
     )?;
+    if deleted == 0 {
+        return Err(WalletDbError::Unexpected(format!(
+            "Account '{}' was not deleted",
+            friendly_name
+        )));
+    }
 
     info!(target: "audit", account = friendly_name; "Account successfully deleted");
 
@@ -413,4 +507,129 @@ pub fn update_account_name(conn: &Connection, current_name: &str, new_name: &str
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{NewBurnProof, init_db, insert_burn_proof, save_payref_history};
+    use tari_common_types::seeds::cipher_seed::CipherSeed;
+    use tari_common_types::types::FixedHash;
+    use tempfile::tempdir;
+
+    fn make_wallet() -> WalletType {
+        let seeds = CipherSeed::random();
+        WalletType::SeedWords(
+            tari_transaction_components::key_manager::wallet_types::SeedWordsWallet::construct_new(seeds).unwrap(),
+        )
+    }
+
+    fn new_account(conn: &Connection, name: &str) -> AccountRow {
+        create_account(conn, name, &make_wallet(), "password").unwrap();
+        get_account_by_name(conn, name).unwrap().unwrap()
+    }
+
+    #[test]
+    fn an_account_is_deletable_even_once_it_owns_burn_proofs_and_payref_history() {
+        // `PRAGMA foreign_keys` is ON, so any table referencing accounts(id) that the
+        // deletion forgets makes `DELETE FROM accounts` fail on a constraint. Deleting
+        // a wallet then becomes impossible for exactly the accounts that have been used.
+        let temp = tempdir().expect("temp dir");
+        let pool = init_db(temp.path().join("delete.db")).expect("init db");
+        let conn = pool.get().expect("conn");
+        let account = new_account(&conn, "doomed");
+
+        insert_burn_proof(
+            &conn,
+            &NewBurnProof {
+                account_id: account.id,
+                output_hash: FixedHash::zero(),
+                commitment: vec![0u8; 32],
+                claim_public_key: "00".repeat(32),
+                ownership_proof_nonce: vec![0u8; 32],
+                ownership_proof_sig: vec![0u8; 32],
+                kernel_excess: vec![0u8; 32],
+                kernel_excess_nonce: vec![0u8; 32],
+                kernel_excess_sig: vec![0u8; 32],
+                sender_offset_public_key: vec![0u8; 32],
+                encrypted_data: vec![1, 2, 3],
+                value: 1_000,
+                kernel_fee: 10,
+                kernel_lock_height: 0,
+            },
+        )
+        .expect("insert burn proof");
+
+        save_payref_history(&conn, account.id, 42_u64.into(), "deadbeef", None).expect("save payref history");
+
+        delete_account(&conn, "doomed").expect("account is deletable");
+        assert!(get_account_by_name(&conn, "doomed").unwrap().is_none());
+
+        let burn_proofs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM burn_proofs", [], |r| r.get(0))
+            .unwrap();
+        let payrefs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM payref_history", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((burn_proofs, payrefs), (0, 0), "child rows must go with the account");
+    }
+
+    #[test]
+    fn a_wallet_swapped_into_another_accounts_row_is_refused() {
+        // The ciphertext is authenticated, but nothing binds it to *this* row. Copying
+        // another account's (encrypted_wallet, nonce, salt) triple over this one still
+        // decrypts cleanly under the same password — and the wallet would go on to
+        // scan, address and spend under someone else's keys. The fingerprint column
+        // exists to catch exactly that, so it has to be checked on load.
+        let temp = tempdir().expect("temp dir");
+        let pool = init_db(temp.path().join("fingerprint.db")).expect("init db");
+        let conn = pool.get().expect("conn");
+
+        let victim = new_account(&conn, "victim");
+        let attacker = new_account(&conn, "attacker");
+
+        victim.decrypt_wallet_type("password").expect("own wallet loads");
+
+        conn.execute(
+            "UPDATE accounts SET encrypted_wallet = :w, cipher_nonce = :n, salt = :s WHERE id = :id",
+            named_params! {
+                ":w": attacker.encrypted_wallet,
+                ":n": attacker.cipher_nonce,
+                ":s": attacker.salt,
+                ":id": victim.id,
+            },
+        )
+        .expect("swap key material");
+
+        let swapped = get_account_by_name(&conn, "victim").unwrap().unwrap();
+        let err = swapped
+            .decrypt_wallet_type("password")
+            .expect_err("foreign key material must be rejected");
+        assert!(
+            matches!(&err, WalletDbError::DecryptionFailed(m) if m.contains("fingerprint")),
+            "expected a fingerprint mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_legacy_row_without_a_fingerprint_still_loads() {
+        // Rows written before the column was populated have nothing to compare
+        // against; they must not be treated as tampered with.
+        let temp = tempdir().expect("temp dir");
+        let pool = init_db(temp.path().join("legacy.db")).expect("init db");
+        let conn = pool.get().expect("conn");
+        let account = new_account(&conn, "legacy");
+
+        conn.execute(
+            "UPDATE accounts SET fingerprint = :f WHERE id = :id",
+            named_params! { ":f": Vec::<u8>::new(), ":id": account.id },
+        )
+        .expect("clear fingerprint");
+
+        get_account_by_name(&conn, "legacy")
+            .unwrap()
+            .unwrap()
+            .decrypt_wallet_type("password")
+            .expect("legacy row still loads");
+    }
 }

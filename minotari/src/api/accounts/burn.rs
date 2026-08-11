@@ -16,7 +16,7 @@ use crate::{
         burn::{BurnTxParams, create_burn_tx, persist_burn_records},
         fund_locker::validate_seconds_to_lock,
     },
-    utils::crypto::{parse_private_key_hex, parse_public_key_hex},
+    utils::crypto::{parse_claimable_public_key_hex, parse_private_key_hex},
 };
 
 use super::params::{
@@ -160,7 +160,7 @@ pub async fn api_burn_funds(
         let claim_public_key = body
             .claim_public_key
             .as_deref()
-            .map(parse_public_key_hex)
+            .map(parse_claimable_public_key_hex)
             .transpose()
             .map_err(|e| ApiError::BadRequest(format!("Invalid claim_public_key: {}", e)))?;
 
@@ -173,7 +173,7 @@ pub async fn api_burn_funds(
 
         let idempotency_key = idempotency_key.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-        let conn = pool.get().map_err(|e| ApiError::DbError(e.to_string()))?;
+        let mut conn = pool.get().map_err(|e| ApiError::DbError(e.to_string()))?;
         let account = get_account_by_name(&conn, &name)
             .map_err(|e| ApiError::DbError(e.to_string()))?
             .ok_or_else(|| ApiError::AccountNotFound(name.clone()))?;
@@ -193,7 +193,7 @@ pub async fn api_burn_funds(
         let result = create_burn_tx(&account, pool.clone(), network, &password, params)
             .map_err(|e| ApiError::FailedToBurnFunds(e.to_string()))?;
 
-        persist_burn_records(&conn, &result, account.id, &idempotency_key)
+        persist_burn_records(&mut conn, &result, account.id, &idempotency_key)
             .map_err(|e| ApiError::DbError(e.to_string()))?;
 
         let tx_id = result.tx_id;

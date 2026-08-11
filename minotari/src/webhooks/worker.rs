@@ -8,6 +8,7 @@ use tokio::sync::broadcast;
 use crate::db::{self, SqlitePool};
 use crate::webhooks::models::{WebhookQueueItem, WebhookStatus};
 use crate::webhooks::sender::{DeliveryResult, WebhookSender};
+use zeroize::Zeroizing;
 
 const POLL_INTERVAL: u64 = 30; // 30 seconds
 const BATCH_SIZE: i64 = 10;
@@ -17,7 +18,9 @@ const MAX_AGE: u64 = 24 * 60 * 60; // 24 hrs
 #[derive(Clone)]
 pub struct WebhookWorkerConfig {
     pub enabled: bool,
-    pub secret: Option<String>,
+    /// HMAC signing key. Kept in a buffer that wipes itself: anyone holding it can
+    /// forge webhooks the receiver will accept as coming from this wallet.
+    pub secret: Option<Zeroizing<String>>,
     pub send_only_event_types: Option<Vec<String>>,
 }
 
@@ -192,7 +195,7 @@ mod tests {
 
         let config = WebhookWorkerConfig {
             enabled: true,
-            secret: Some(secret.to_string()),
+            secret: Some(Zeroizing::new(secret.to_string())),
             send_only_event_types: None,
         };
         let worker = WebhookWorker::new(pool.clone(), config);
@@ -230,7 +233,7 @@ mod tests {
             pool.clone(),
             WebhookWorkerConfig {
                 enabled: true,
-                secret: Some("secret".into()),
+                secret: Some(Zeroizing::new("secret".to_string())),
                 send_only_event_types: None,
             },
         );
