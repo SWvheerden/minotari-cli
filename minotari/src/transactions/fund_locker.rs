@@ -309,9 +309,17 @@ impl FundLocker {
         // the global mutex, so untrusted input can never reach the critical
         // section (see `MAX_SECONDS_TO_LOCK_UTXOS`).
         validate_seconds_to_lock(seconds_to_lock_utxos)?;
-        // Acquire a database connection first so we don't hold the global
-        // mutex while waiting for a pooled connection (which could deadlock
-        // under pool exhaustion).
+        // Scope this connection so it is back in the pool before the mutex is
+        // taken. Holding one across that wait makes the pool requirement scale
+        // with the number of callers rather than with the work in flight: every
+        // caller queued on the mutex would pin a connection while doing nothing.
+        //
+        // The connection is therefore acquired *after* the mutex below, which
+        // does mean holding the mutex while waiting for one. That is safe
+        // precisely because of this scoping: no waiter holds a connection, so
+        // the only holders are paths that never want this mutex, and they
+        // always finish and release. The cost is latency under pool pressure,
+        // not a cycle.
         {
             let conn = self.db_pool.get()?;
             // Fast idempotency check (without the global mutex).  If the pending

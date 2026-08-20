@@ -297,12 +297,12 @@ impl TransactionSender {
     }
 
     fn validate_transaction_creation_request(
-        &mut self,
+        &self,
+        conn: &Connection,
         processed_transaction: &ProcessedTransaction,
     ) -> Result<(), anyhow::Error> {
-        let conn = self.get_connection()?;
         if db::check_if_transaction_was_already_completed_by_idempotency_key(
-            &conn,
+            conn,
             &processed_transaction.idempotency_key,
             self.account.id,
         )? {
@@ -322,17 +322,20 @@ impl TransactionSender {
         Ok(())
     }
 
-    fn check_if_transaction_expired(&self, processed_transaction: &ProcessedTransaction) -> Result<(), anyhow::Error> {
-        let conn = self.get_connection()?;
+    fn check_if_transaction_expired(
+        &self,
+        conn: &Connection,
+        processed_transaction: &ProcessedTransaction,
+    ) -> Result<(), anyhow::Error> {
         let is_expired = db::check_if_transaction_is_expired_by_idempotency_key(
-            &conn,
+            conn,
             &processed_transaction.idempotency_key,
             self.account.id,
         )?;
 
         if is_expired {
             db::update_pending_transaction_status(
-                &conn,
+                conn,
                 processed_transaction.id(),
                 PendingTransactionStatus::Expired,
             )?;
@@ -369,9 +372,9 @@ impl TransactionSender {
 
     fn create_pending_transaction(
         &self,
+        connection: &mut Connection,
         processed_transaction: &mut ProcessedTransaction,
     ) -> Result<String, anyhow::Error> {
-        let mut connection = self.get_connection()?;
         // `seconds_to_lock_utxos` is untrusted (JSON body / CLI argument), so use
         // the checked helper: `Utc::now() + Duration::seconds(..)` panics on
         // overflow. See `MAX_SECONDS_TO_LOCK_UTXOS`.
@@ -416,12 +419,11 @@ impl TransactionSender {
 
     fn create_or_find_pending_transaction(
         &self,
+        connection: &mut Connection,
         processed_transaction: &mut ProcessedTransaction,
     ) -> Result<String, anyhow::Error> {
-        let connection = self.get_connection()?;
-
         let response = db::find_pending_transaction_record_by_idempotency_key(
-            &connection,
+            connection,
             &processed_transaction.idempotency_key,
             self.account.id,
         )?;
@@ -433,7 +435,7 @@ impl TransactionSender {
                 .check_matches(&record.operation, &record.request_hash)?;
             Ok(record.id)
         } else {
-            let pending_tx_id = self.create_pending_transaction(processed_transaction)?;
+            let pending_tx_id = self.create_pending_transaction(connection, processed_transaction)?;
             Ok(pending_tx_id)
         }
     }
@@ -507,14 +509,20 @@ impl TransactionSender {
             amount = &*mask_amount(recipient.amount);
             "Starting new transaction"
         );
-        let connection = self.get_connection()?;
+        // One connection for the whole flow. Taking a fresh one at each step instead meant a
+        // single send held three at once — this one, another in
+        // `create_or_find_pending_transaction`, a third in `create_pending_transaction` — so
+        // concurrent senders deadlocked on a pool smaller than three times their number, each
+        // holding connections it could not finish without one more.
+        let mut connection = self.get_connection()?;
 
         let mut processed_transaction =
             ProcessedTransaction::new(None, idempotency_key, recipient.clone(), seconds_to_lock_utxo);
 
-        self.validate_transaction_creation_request(&processed_transaction)?;
+        self.validate_transaction_creation_request(&connection, &processed_transaction)?;
 
-        let pending_transaction_id = self.create_or_find_pending_transaction(&mut processed_transaction)?;
+        let pending_transaction_id =
+            self.create_or_find_pending_transaction(&mut connection, &mut processed_transaction)?;
         processed_transaction.update_id(pending_transaction_id.clone());
 
         let result: Result<PrepareOneSidedTransactionForSigningResult, anyhow::Error> = (|| {
@@ -625,7 +633,7 @@ impl TransactionSender {
             "Finalizing and broadcasting transaction"
         );
 
-        self.check_if_transaction_expired(processed_transaction)
+        self.check_if_transaction_expired(&connection, processed_transaction)
             .inspect_err(|e| {
                 warn!(target: "audit", error:% = e; "Transaction finalization preparation failed");
                 self.fail_and_unlock_pending_transaction(&connection, processed_transaction.id());
@@ -822,11 +830,7 @@ impl TransactionSender {
         Ok(tx)
     }
 
-    fn fail_and_unlock_pending_transaction(
-        &self,
-        connection: &PooledConnection<SqliteConnectionManager>,
-        pending_tx_id: &str,
-    ) {
+    fn fail_and_unlock_pending_transaction(&self, connection: &Connection, pending_tx_id: &str) {
         if let Err(e) =
             db::update_pending_transaction_status(connection, pending_tx_id, PendingTransactionStatus::Expired)
         {
@@ -835,6 +839,75 @@ impl TransactionSender {
 
         if let Err(e) = db::unlock_outputs_for_request(connection, pending_tx_id) {
             error!(target: "audit", error:% = e; "Failed to unlock outputs during cleanup");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use r2d2_sqlite::SqliteConnectionManager;
+    use tari_common_types::seeds::cipher_seed::CipherSeed;
+    use tari_transaction_components::key_manager::wallet_types::{SeedWordsWallet, WalletType};
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::db::{create_account, get_account_by_name, init_db, insert_scanned_tip_block};
+
+    /// A send must make do with one database connection.
+    ///
+    /// The pool here holds exactly one, so a sender that reaches for a second cannot get it and
+    /// fails on the checkout timeout. That is what used to happen in production too, just at a
+    /// larger scale: each send held three connections at once, so concurrent senders exhausted
+    /// any pool smaller than three times their number and then deadlocked, every one of them
+    /// holding connections it could not finish without one more.
+    #[test]
+    fn a_send_needs_only_one_database_connection() {
+        let temp = tempdir().expect("temp dir");
+        let path = temp.path().join("test.db");
+
+        // Create and migrate the database, then reopen it with a single-connection pool.
+        {
+            let pool = init_db(path.clone()).expect("init db");
+            let conn = pool.get().expect("get conn");
+            let wallet = WalletType::SeedWords(
+                SeedWordsWallet::construct_new(CipherSeed::random()).expect("construct wallet"),
+            );
+            create_account(&conn, "test", &wallet, "pass").expect("create account");
+            let account = get_account_by_name(&conn, "test")
+                .expect("get account")
+                .expect("account exists");
+            insert_scanned_tip_block(&conn, account.id, 200, &[0u8; 32]).expect("insert tip block");
+        }
+
+        let pool = r2d2::Pool::builder()
+            .max_size(1)
+            .connection_timeout(Duration::from_secs(2))
+            .build(SqliteConnectionManager::file(&path))
+            .expect("build single-connection pool");
+
+        let password = Zeroizing::new("pass".to_string());
+        let mut sender =
+            TransactionSender::new(pool, "test".to_string(), password.clone(), Network::LocalNet, 3)
+                .expect("build sender");
+        let recipient = Recipient {
+            address: sender
+                .account
+                .get_address(Network::LocalNet, &password)
+                .expect("account address"),
+            amount: MicroMinotari(1_000),
+            payment_id: None,
+        };
+
+        // The send has no funds to spend, so it is expected to fail — but on the wallet's own
+        // terms. Failing for want of a connection is the regression.
+        if let Err(e) = sender.start_new_transaction("idempotency-key".to_string(), recipient, 300) {
+            let message = e.to_string();
+            assert!(
+                !message.contains("Failed to acquire database connection"),
+                "the send wanted a second connection: {message}"
+            );
         }
     }
 }
