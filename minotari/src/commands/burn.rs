@@ -66,7 +66,7 @@ pub async fn handle_burn_funds(
         confirmation_window,
     };
 
-    let result = create_burn_tx(&account, pool.clone(), network, &password, params)
+    let result = create_burn_tx(&account, &mut conn, network, &password, params)
         .map_err(|e| anyhow!("Failed to build burn transaction: {}", e))?;
 
     // Persist partial burn proof before broadcasting (so it's never lost).

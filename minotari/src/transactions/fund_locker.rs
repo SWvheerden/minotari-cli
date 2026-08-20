@@ -36,7 +36,7 @@ use uuid::Uuid;
 
 use crate::{
     api::types::LockFundsResult,
-    db::{self, SqlitePool},
+    db::{self},
     log::mask_amount,
     models::PendingTransactionStatus,
     transactions::{
@@ -210,27 +210,43 @@ fn resolve_replay(conn: &Connection, binding: &IdempotencyBinding, account_id: i
 ///
 /// // Use result.utxos to build the transaction
 /// ```
-pub struct FundLocker {
-    db_pool: SqlitePool,
-}
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FundLocker;
 
 impl FundLocker {
-    /// Creates a new `FundLocker` with the given database connection pool.
+    /// Creates a new `FundLocker`.
     ///
-    /// # Arguments
-    ///
-    /// * `db_pool` - SQLite connection pool for database operations
+    /// It holds no state: [`FundLocker::lock`] works on the connection its caller
+    /// passes in. See that method for why it does not take one from the pool itself.
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// let locker = FundLocker::new(db_pool);
+    /// let locker = FundLocker::new();
     /// ```
-    pub fn new(db_pool: SqlitePool) -> Self {
-        Self { db_pool }
+    pub fn new() -> Self {
+        Self
     }
 
     /// Locks UTXOs for a pending transaction.
+    ///
+    /// # Why the connection is a parameter
+    ///
+    /// This call serialises on a process-wide mutex, so a caller can be queued here for as
+    /// long as the busiest request ahead of it takes. Taking a connection from the pool as
+    /// well — at either end of that wait — is what starves the pool:
+    ///
+    /// * acquiring it *before* the mutex means every queued caller pins a connection while
+    ///   doing nothing, so the pool has to be as large as the number of concurrent callers;
+    /// * acquiring it *after* the mutex means blocking on checkout while holding the mutex,
+    ///   which is safe only for as long as no caller anywhere holds a connection across this
+    ///   call — an unwritten rule that three API handlers already broke.
+    ///
+    /// Taking the caller's connection avoids both. The caller already has one (it looked up
+    /// the account with it), the mutex holder arrives holding everything it needs and so
+    /// never blocks on another resource, and no caller can accidentally hold a second
+    /// connection because there is nowhere to put it. One connection per in-flight request,
+    /// enforced by the signature rather than by convention.
     ///
     /// Selects unspent outputs sufficient to cover the requested amount plus estimated
     /// transaction fees, then locks them in the database with an expiration time.
@@ -289,6 +305,7 @@ impl FundLocker {
     #[allow(clippy::too_many_arguments)]
     pub fn lock(
         &self,
+        conn: &mut Connection,
         account_id: i64,
         amount: MicroMinotari,
         num_outputs: usize,
@@ -309,26 +326,12 @@ impl FundLocker {
         // the global mutex, so untrusted input can never reach the critical
         // section (see `MAX_SECONDS_TO_LOCK_UTXOS`).
         validate_seconds_to_lock(seconds_to_lock_utxos)?;
-        // Scope this connection so it is back in the pool before the mutex is
-        // taken. Holding one across that wait makes the pool requirement scale
-        // with the number of callers rather than with the work in flight: every
-        // caller queued on the mutex would pin a connection while doing nothing.
-        //
-        // The connection is therefore acquired *after* the mutex below, which
-        // does mean holding the mutex while waiting for one. That is safe
-        // precisely because of this scoping: no waiter holds a connection, so
-        // the only holders are paths that never want this mutex, and they
-        // always finish and release. The cost is latency under pool pressure,
-        // not a cycle.
-        {
-            let conn = self.db_pool.get()?;
-            // Fast idempotency check (without the global mutex).  If the pending
-            // transaction already exists we can return immediately without waiting
-            // for any concurrent `lock()` call to finish.  A key that does not match
-            // the stored scope fails here, before any UTXO is looked at.
-            if let Replay::Existing(response) = resolve_replay(&conn, &idempotency, account_id)? {
-                return Ok(*response);
-            }
+        // Fast idempotency check (without the global mutex).  If the pending
+        // transaction already exists we can return immediately without waiting
+        // for any concurrent `lock()` call to finish.  A key that does not match
+        // the stored scope fails here, before any UTXO is looked at.
+        if let Replay::Existing(response) = resolve_replay(conn, &idempotency, account_id)? {
+            return Ok(*response);
         }
 
         // Acquire the global mutex so that the idempotency re-check, UTXO
@@ -350,12 +353,11 @@ impl FundLocker {
             );
             poisoned.into_inner()
         });
-        let mut conn = self.db_pool.get()?;
         // Re-check idempotency now that we hold the mutex.  The first thread
         // that passed the fast-path check above may have created the pending
         // transaction while we were waiting for the lock; if so we return its
         // result rather than selecting UTXOs a second time.
-        if let Replay::Existing(response) = resolve_replay(&conn, &idempotency, account_id)? {
+        if let Replay::Existing(response) = resolve_replay(conn, &idempotency, account_id)? {
             return Ok(*response);
         }
 
@@ -446,7 +448,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        db::{create_account, get_account_by_name, init_db, insert_scanned_tip_block},
+        db::{SqlitePool, create_account, get_account_by_name, init_db, insert_scanned_tip_block},
         transactions::idempotency::{IdempotencyOperation, RequestFingerprint},
     };
     use anyhow::Error;
@@ -582,7 +584,8 @@ mod tests {
 
     /// Locks 100_000 µT under `binding`, with everything else held constant.
     fn lock_with(pool: &SqlitePool, account_id: i64, binding: IdempotencyBinding) -> Result<LockFundsResult, Error> {
-        FundLocker::new(pool.clone()).lock(
+        FundLocker::new().lock(
+            &mut pool.get().expect("conn"),
             account_id,
             MicroMinotari(100_000),
             1,
@@ -592,6 +595,66 @@ mod tests {
             3600,
             100,
         )
+    }
+
+    /// Callers in the shape of every real one: hold a connection, then lock.
+    ///
+    /// This is what the API handlers and CLI commands do — they look an account up before
+    /// they can lock anything, so they are already holding a connection when they call. With
+    /// `lock` taking a connection of its own, that shape starved the pool: every caller
+    /// pinned one connection and needed a second, so a pool of five deadlocked on five
+    /// callers and every one of them failed on the checkout timeout.
+    ///
+    /// Twenty callers against a pool of five must all get an answer. Some will legitimately
+    /// run out of funds; none may fail for want of a connection.
+    #[test]
+    fn concurrent_callers_holding_a_connection_do_not_exhaust_the_pool() {
+        let (_pool, account_id, temp) = setup_test_env(5, 500_000);
+
+        // A pool far smaller than the number of callers: with one connection per caller this
+        // is merely a queue, and the test finishes; with two it is a deadlock.
+        let pool = r2d2::Pool::builder()
+            .max_size(5)
+            .connection_timeout(std::time::Duration::from_secs(10))
+            .build(r2d2_sqlite::SqliteConnectionManager::file(temp.path().join("test.db")))
+            .expect("build pool");
+
+        let failures: Vec<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..20)
+                .map(|i| {
+                    let pool = pool.clone();
+                    scope.spawn(move || {
+                        // The handler shape: take a connection, look something up with it,
+                        // then lock with that same connection still in hand.
+                        let mut conn = pool.get().map_err(|e| e.to_string())?;
+                        let _ = get_account_by_name(&conn, "test").map_err(|e| e.to_string())?;
+                        FundLocker::new()
+                            .lock(
+                                &mut conn,
+                                account_id,
+                                MicroMinotari(100_000),
+                                1,
+                                MicroMinotari(0),
+                                Some(1000),
+                                test_binding(None, i),
+                                3600,
+                                100,
+                            )
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|h| h.join().expect("thread").err())
+                .collect()
+        });
+
+        assert!(
+            !failures.iter().any(|e| e.contains("timed out waiting for connection")),
+            "callers starved the pool: {failures:?}"
+        );
     }
 
     /// The set of outputs currently reserved in the database, by value.
@@ -618,8 +681,9 @@ mod tests {
 
         let pool2 = pool.clone();
         let handle_a = std::thread::spawn(move || {
-            let locker = FundLocker::new(pool);
+            let locker = FundLocker::new();
             locker.lock(
+                &mut pool.get().expect("conn"),
                 account_id,
                 MicroMinotari(100_000),
                 1,
@@ -631,8 +695,9 @@ mod tests {
             )
         });
         let handle_b = std::thread::spawn(move || {
-            let locker = FundLocker::new(pool2);
+            let locker = FundLocker::new();
             locker.lock(
+                &mut pool2.get().expect("conn"),
                 account_id,
                 MicroMinotari(100_000),
                 1,
@@ -674,8 +739,9 @@ mod tests {
         let key2 = key.clone();
 
         let handle_a = std::thread::spawn(move || {
-            let locker = FundLocker::new(pool);
+            let locker = FundLocker::new();
             locker.lock(
+                &mut pool.get().expect("conn"),
                 account_id,
                 MicroMinotari(200_000),
                 1,
@@ -687,8 +753,9 @@ mod tests {
             )
         });
         let handle_b = std::thread::spawn(move || {
-            let locker = FundLocker::new(pool2);
+            let locker = FundLocker::new();
             locker.lock(
+                &mut pool2.get().expect("conn"),
                 account_id,
                 MicroMinotari(200_000),
                 1,
@@ -736,7 +803,8 @@ mod tests {
         let _pool_b2 = pool_b.clone();
 
         let h_a = std::thread::spawn(move || {
-            FundLocker::new(pool_a).lock(
+            FundLocker::new().lock(
+                &mut pool_a.get().expect("conn"),
                 account_a,
                 MicroMinotari(200_000),
                 1,
@@ -748,7 +816,8 @@ mod tests {
             )
         });
         let h_b = std::thread::spawn(move || {
-            FundLocker::new(pool_b).lock(
+            FundLocker::new().lock(
+                &mut pool_b.get().expect("conn"),
                 account_b,
                 MicroMinotari(200_000),
                 1,
@@ -774,10 +843,11 @@ mod tests {
         // the database: every returned UTXO is LOCKED under this request's id,
         // and no later call can select it again.
         let (pool, account_id, _temp) = setup_test_env(2, 1_000_000);
-        let locker = FundLocker::new(pool.clone());
+        let locker = FundLocker::new();
 
         let first = locker
             .lock(
+                &mut pool.get().expect("conn"),
                 account_id,
                 MicroMinotari(100_000),
                 1,
@@ -814,6 +884,7 @@ mod tests {
         // A second lock must pick from what is left, never from the reserved set.
         let second = locker
             .lock(
+                &mut pool.get().expect("conn"),
                 account_id,
                 MicroMinotari(100_000),
                 1,
@@ -838,10 +909,11 @@ mod tests {
         // Selection happens inside the write transaction, so when it fails
         // (here: nothing left to select) nothing at all is committed.
         let (pool, account_id, _temp) = setup_test_env(1, 1_000_000);
-        let locker = FundLocker::new(pool.clone());
+        let locker = FundLocker::new();
 
         locker
             .lock(
+                &mut pool.get().expect("conn"),
                 account_id,
                 MicroMinotari(500_000),
                 1,
@@ -855,6 +927,7 @@ mod tests {
 
         locker
             .lock(
+                &mut pool.get().expect("conn"),
                 account_id,
                 MicroMinotari(500_000),
                 1,
@@ -923,10 +996,11 @@ mod tests {
     #[test]
     fn lock_rejects_out_of_range_duration_without_poisoning_the_mutex() {
         let (pool, account_id, _temp) = setup_test_env(3, 1_000_000);
-        let locker = FundLocker::new(pool);
+        let locker = FundLocker::new();
 
         let err = locker
             .lock(
+                &mut pool.get().expect("conn"),
                 account_id,
                 MicroMinotari(100_000),
                 1,
@@ -947,6 +1021,7 @@ mod tests {
         // poisoned `FUND_LOCK_MUTEX` and every later call died at the `.expect`.
         let result = locker
             .lock(
+                &mut pool.get().expect("conn"),
                 account_id,
                 MicroMinotari(100_000),
                 1,
@@ -973,8 +1048,9 @@ mod tests {
         assert!(FUND_LOCK_MUTEX.is_poisoned(), "mutex is poisoned");
 
         let (pool, account_id, _temp) = setup_test_env(3, 1_000_000);
-        let result = FundLocker::new(pool)
+        let result = FundLocker::new()
             .lock(
+                &mut pool.get().expect("conn"),
                 account_id,
                 MicroMinotari(100_000),
                 1,

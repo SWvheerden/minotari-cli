@@ -768,7 +768,9 @@ fn handle_create_unsigned_transaction(
         .collect();
     let recipients = recipients?;
     let pool = init_db(database_file)?;
-    let conn = pool.get()?;
+    // One connection for the whole command; `lock` uses this one rather than taking a
+    // second from the pool.
+    let mut conn = pool.get()?;
     let account =
         db::get_account_by_name(&conn, &account_name)?.ok_or_else(|| anyhow!("Account not found: {}", account_name))?;
 
@@ -787,9 +789,10 @@ fn handle_create_unsigned_transaction(
         seconds_to_lock,
         confirmation_window,
     );
-    let lock_amount = FundLocker::new(pool.clone());
+    let lock_amount = FundLocker::new();
     let locked_funds = lock_amount
         .lock(
+            &mut conn,
             account.id,
             amount,
             num_outputs,
@@ -821,7 +824,9 @@ fn handle_lock_funds(
     request: LockFundsRequest,
 ) -> Result<(), anyhow::Error> {
     let pool = init_db(database_file)?;
-    let conn = pool.get()?;
+    // One connection for the whole command; `lock` uses this one rather than taking a
+    // second from the pool.
+    let mut conn = pool.get()?;
     let account =
         db::get_account_by_name(&conn, &account_name)?.ok_or_else(|| anyhow!("Account not found: {}", account_name))?;
     let num_outputs = request.num_outputs.expect("must be present");
@@ -845,9 +850,10 @@ fn handle_lock_funds(
             .field("seconds_to_lock_utxos", seconds_to_lock_utxos.to_le_bytes())
             .field("confirmation_window", confirmation_window.to_le_bytes()),
     );
-    let lock_amount = FundLocker::new(pool.clone());
+    let lock_amount = FundLocker::new();
     let result = lock_amount
         .lock(
+            &mut conn,
             account.id,
             request.amount,
             num_outputs,

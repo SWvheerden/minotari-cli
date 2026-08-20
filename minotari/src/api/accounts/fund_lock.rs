@@ -299,13 +299,15 @@ pub async fn api_lock_funds(
     validate_seconds_to_lock(seconds_to_lock_utxos)?;
 
     let response = tokio::task::spawn_blocking(move || {
-        let conn = pool.get().map_err(|e| ApiError::DbError(e.to_string()))?;
+        // One connection for the whole request: the account lookup and the lock share it,
+        // so nothing is held idle while `lock` waits on its mutex.
+        let mut conn = pool.get().map_err(|e| ApiError::DbError(e.to_string()))?;
 
         let account = get_account_by_name(&conn, &name)
             .map_err(|e| ApiError::DbError(e.to_string()))?
             .ok_or_else(|| ApiError::AccountNotFound(name.clone()))?;
 
-        let lock_amount = FundLocker::new(pool);
+        let lock_amount = FundLocker::new();
         let confirmation_window = resolve_confirmation_window(body.confirmation_window, default_confirmations)?;
         // Every field below changes which UTXOs get reserved or for how long, so
         // all of them are bound to the key: a replay that alters any of them is
@@ -327,6 +329,7 @@ pub async fn api_lock_funds(
         );
         lock_amount
             .lock(
+                &mut conn,
                 account.id,
                 body.amount,
                 num_outputs,
@@ -449,7 +452,8 @@ pub async fn api_create_unsigned_transaction(
     validate_seconds_to_lock(seconds_to_lock_utxos)?;
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = pool.get().map_err(|e| ApiError::DbError(e.to_string()))?;
+        // One connection for the whole request; see `api_lock_funds`.
+        let mut conn = pool.get().map_err(|e| ApiError::DbError(e.to_string()))?;
 
         let account = get_account_by_name(&conn, &name)
             .map_err(|e| ApiError::DbError(e.to_string()))?
@@ -472,9 +476,10 @@ pub async fn api_create_unsigned_transaction(
             seconds_to_lock_utxos,
             confirmation_window,
         );
-        let lock_amount = FundLocker::new(pool.clone());
+        let lock_amount = FundLocker::new();
         let locked_funds = lock_amount
             .lock(
+                &mut conn,
                 account.id,
                 amount,
                 num_outputs,

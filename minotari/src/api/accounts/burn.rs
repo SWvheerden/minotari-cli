@@ -190,7 +190,7 @@ pub async fn api_burn_funds(
             confirmation_window,
         };
 
-        let result = create_burn_tx(&account, pool.clone(), network, &password, params)
+        let result = create_burn_tx(&account, &mut conn, network, &password, params)
             .map_err(|e| ApiError::FailedToBurnFunds(e.to_string()))?;
 
         persist_burn_records(&mut conn, &result, account.id, &idempotency_key)

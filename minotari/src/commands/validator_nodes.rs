@@ -153,7 +153,7 @@ async fn run_vn_command<F>(
 where
     F: FnOnce(
         &AccountRow,
-        db::SqlitePool,
+        &mut Connection,
         Network,
         &str,
         Option<String>,
@@ -163,13 +163,15 @@ where
 {
     let idempotency_key = idempotency_key.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let pool = init_db(database_file)?;
-    let conn = pool.get()?;
+    // One connection for the command: the VN transaction is built on it and the result is
+    // then saved and broadcast with it, so nothing is held idle while `lock` waits.
+    let mut conn = pool.get()?;
     let account =
         db::get_account_by_name(&conn, account_name)?.ok_or_else(|| anyhow!("Account not found: {}", account_name))?;
 
     let unsigned_result = create_tx(
         &account,
-        pool.clone(),
+        &mut conn,
         network,
         password,
         Some(idempotency_key.clone()),
@@ -235,11 +237,11 @@ pub async fn handle_register_validator_node(
         confirmation_window,
         &base_url,
         "VN registration",
-        |account, pool, network, password, idempotency_key, seconds_to_lock, confirmation_window| {
+        |account, conn, network, password, idempotency_key, seconds_to_lock, confirmation_window| {
             create_validator_node_registration_tx(
                 account,
                 params,
-                pool,
+                conn,
                 network,
                 password,
                 idempotency_key,
@@ -291,11 +293,11 @@ pub async fn handle_submit_validator_node_exit(
         confirmation_window,
         &base_url,
         "VN exit",
-        |account, pool, network, password, idempotency_key, seconds_to_lock, confirmation_window| {
+        |account, conn, network, password, idempotency_key, seconds_to_lock, confirmation_window| {
             create_validator_node_exit_tx(
                 account,
                 params,
-                pool,
+                conn,
                 network,
                 password,
                 idempotency_key,
@@ -346,11 +348,11 @@ pub async fn handle_submit_validator_eviction_proof(
         confirmation_window,
         &base_url,
         "VN eviction proof",
-        |account, pool, network, password, idempotency_key, seconds_to_lock, confirmation_window| {
+        |account, conn, network, password, idempotency_key, seconds_to_lock, confirmation_window| {
             create_validator_node_eviction_tx(
                 account,
                 params,
-                pool,
+                conn,
                 network,
                 password,
                 idempotency_key,

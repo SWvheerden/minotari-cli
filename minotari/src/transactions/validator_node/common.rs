@@ -6,6 +6,7 @@
 
 use anyhow::anyhow;
 use log::info;
+use rusqlite::Connection;
 use tari_common::configuration::Network;
 use tari_common_types::transaction::TxId;
 use tari_transaction_components::{
@@ -20,7 +21,7 @@ use tari_transaction_components::{
 };
 
 use crate::{
-    db::{AccountRow, SqlitePool},
+    db::AccountRow,
     transactions::{
         fund_locker::FundLocker,
         idempotency::{IdempotencyBinding, IdempotencyOperation, RequestFingerprint},
@@ -38,7 +39,7 @@ use crate::{
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_vn_pay_to_self_tx(
     account: &AccountRow,
-    db_pool: SqlitePool,
+    conn: &mut Connection,
     network: Network,
     password: &str,
     output_features: OutputFeatures,
@@ -78,8 +79,9 @@ pub(crate) fn build_vn_pay_to_self_tx(
     );
 
     let sender_address = account.get_address(network, password)?;
-    let fund_locker = FundLocker::new(db_pool);
+    let fund_locker = FundLocker::new();
     let locked_funds = fund_locker.lock(
+        conn,
         account.id,
         deposit_amount,
         1,

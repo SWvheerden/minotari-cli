@@ -334,11 +334,7 @@ impl TransactionSender {
         )?;
 
         if is_expired {
-            db::update_pending_transaction_status(
-                conn,
-                processed_transaction.id(),
-                PendingTransactionStatus::Expired,
-            )?;
+            db::update_pending_transaction_status(conn, processed_transaction.id(), PendingTransactionStatus::Expired)?;
             return Err(anyhow!("The transaction has expired."));
         }
 
@@ -871,9 +867,8 @@ mod tests {
         {
             let pool = init_db(path.clone()).expect("init db");
             let conn = pool.get().expect("get conn");
-            let wallet = WalletType::SeedWords(
-                SeedWordsWallet::construct_new(CipherSeed::random()).expect("construct wallet"),
-            );
+            let wallet =
+                WalletType::SeedWords(SeedWordsWallet::construct_new(CipherSeed::random()).expect("construct wallet"));
             create_account(&conn, "test", &wallet, "pass").expect("create account");
             let account = get_account_by_name(&conn, "test")
                 .expect("get account")
@@ -888,9 +883,8 @@ mod tests {
             .expect("build single-connection pool");
 
         let password = Zeroizing::new("pass".to_string());
-        let mut sender =
-            TransactionSender::new(pool, "test".to_string(), password.clone(), Network::LocalNet, 3)
-                .expect("build sender");
+        let mut sender = TransactionSender::new(pool, "test".to_string(), password.clone(), Network::LocalNet, 3)
+            .expect("build sender");
         let recipient = Recipient {
             address: sender
                 .account

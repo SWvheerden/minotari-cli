@@ -35,7 +35,7 @@ use tari_transaction_components::{
 use tari_utilities::{ByteArray, hex::Hex};
 
 use crate::{
-    db::{AccountRow, NewBurnProof, SqlitePool},
+    db::{AccountRow, NewBurnProof},
     models::PendingTransactionStatus,
     transactions::{
         fund_locker::FundLocker,
@@ -108,7 +108,7 @@ impl BurnTxParams {
 /// always produce a burn proof.
 pub fn create_burn_tx(
     account: &AccountRow,
-    db_pool: SqlitePool,
+    conn: &mut Connection,
     network: Network,
     password: &str,
     params: BurnTxParams,
@@ -137,8 +137,9 @@ pub fn create_burn_tx(
     );
 
     let sender_address = account.get_address(network, password)?;
-    let fund_locker = FundLocker::new(db_pool);
+    let fund_locker = FundLocker::new();
     let locked_funds = fund_locker.lock(
+        conn,
         account.id,
         params.amount,
         1,

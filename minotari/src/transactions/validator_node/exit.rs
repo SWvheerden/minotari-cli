@@ -18,6 +18,7 @@
 //! 3. Lock the deposit UTXOs via [`FundLocker`] and prepare the transaction for signing
 
 use anyhow::anyhow;
+use rusqlite::Connection;
 use tari_common::configuration::Network;
 use tari_common_types::{
     epoch::VnEpoch,
@@ -31,7 +32,7 @@ use tari_transaction_components::{
 };
 
 use super::common::build_vn_pay_to_self_tx;
-use crate::db::{AccountRow, SqlitePool};
+use crate::db::AccountRow;
 use crate::transactions::idempotency::IdempotencyOperation;
 
 /// Parameters for validator node exit
@@ -70,7 +71,7 @@ pub struct ValidatorNodeExitParams {
 pub fn create_validator_node_exit_tx(
     account: &AccountRow,
     params: ValidatorNodeExitParams,
-    db_pool: SqlitePool,
+    conn: &mut Connection,
     network: Network,
     password: &str,
     idempotency_key: Option<String>,
@@ -98,7 +99,7 @@ pub fn create_validator_node_exit_tx(
 
     build_vn_pay_to_self_tx(
         account,
-        db_pool,
+        conn,
         network,
         password,
         output_features,
