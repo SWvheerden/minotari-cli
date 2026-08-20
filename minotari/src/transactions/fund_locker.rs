@@ -627,7 +627,7 @@ mod tests {
                         // The handler shape: take a connection, look something up with it,
                         // then lock with that same connection still in hand.
                         let mut conn = pool.get().map_err(|e| e.to_string())?;
-                        let _ = get_account_by_name(&conn, "test").map_err(|e| e.to_string())?;
+                        let _unused = get_account_by_name(&conn, "test").map_err(|e| e.to_string())?;
                         FundLocker::new()
                             .lock(
                                 &mut conn,
