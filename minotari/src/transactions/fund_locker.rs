@@ -312,13 +312,15 @@ impl FundLocker {
         // Acquire a database connection first so we don't hold the global
         // mutex while waiting for a pooled connection (which could deadlock
         // under pool exhaustion).
-        let mut conn = self.db_pool.get()?;
-        // Fast idempotency check (without the global mutex).  If the pending
-        // transaction already exists we can return immediately without waiting
-        // for any concurrent `lock()` call to finish.  A key that does not match
-        // the stored scope fails here, before any UTXO is looked at.
-        if let Replay::Existing(response) = resolve_replay(&conn, &idempotency, account_id)? {
-            return Ok(*response);
+        {
+            let conn = self.db_pool.get()?;
+            // Fast idempotency check (without the global mutex).  If the pending
+            // transaction already exists we can return immediately without waiting
+            // for any concurrent `lock()` call to finish.  A key that does not match
+            // the stored scope fails here, before any UTXO is looked at.
+            if let Replay::Existing(response) = resolve_replay(&conn, &idempotency, account_id)? {
+                return Ok(*response);
+            }
         }
 
         // Acquire the global mutex so that the idempotency re-check, UTXO
@@ -340,6 +342,7 @@ impl FundLocker {
             );
             poisoned.into_inner()
         });
+        let mut conn = self.db_pool.get()?;
         // Re-check idempotency now that we hold the mutex.  The first thread
         // that passed the fast-path check above may have created the pending
         // transaction while we were waiting for the lock; if so we return its
