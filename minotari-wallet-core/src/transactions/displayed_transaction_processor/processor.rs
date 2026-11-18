@@ -91,29 +91,37 @@ impl DisplayedTransactionProcessor {
             new_credit.push((balance_change.clone(), output.clone()));
         }
         'input_loop: for (balance_change, output) in accumulator.debit_balance_changes() {
-            for tx in current_display_transactions {
-                // Not an entry naming another active copy of a re-created hash, so its
-                // spend gets its own entry. An entry naming this row, a row a reorg
-                // replaced with this one, or none (0) is this spend's.
-                if tx.details.inputs.iter().any(|o| {
+            // This spend's entry names this row (or none, 0). Failing that, an entry
+            // naming a row a reorg replaced with this one; never one naming another
+            // active copy of a re-created hash, whose spend has its own entry.
+            let names = |tx: &DisplayedTransaction, exact: bool| {
+                tx.details.inputs.iter().any(|o| {
                     o.output_hash == output.output.output_hash()
-                        && !output.other_copy_ids.contains(&o.matched_output_id)
-                }) {
-                    let mut updated = tx.clone();
-                    updated.blockchain.block_height = output.mined_in_block_height;
-                    updated.blockchain.timestamp = balance_change.effective_date;
-                    updated.blockchain.confirmations =
-                        self.current_tip_height.saturating_sub(output.mined_in_block_height);
+                        && if exact {
+                            o.matched_output_id == output.output_id || o.matched_output_id == 0
+                        } else {
+                            !output.other_copy_ids.contains(&o.matched_output_id)
+                        }
+                })
+            };
+            let entry = current_display_transactions
+                .iter()
+                .find(|tx| names(tx, true))
+                .or_else(|| current_display_transactions.iter().find(|tx| names(tx, false)));
+            if let Some(tx) = entry {
+                let mut updated = tx.clone();
+                updated.blockchain.block_height = output.mined_in_block_height;
+                updated.blockchain.timestamp = balance_change.effective_date;
+                updated.blockchain.confirmations = self.current_tip_height.saturating_sub(output.mined_in_block_height);
 
-                    // Update status based on confirmations
-                    if updated.blockchain.confirmations >= self.req_confirmations {
-                        updated.status = TransactionDisplayStatus::Confirmed;
-                    } else {
-                        updated.status = TransactionDisplayStatus::Unconfirmed;
-                    }
-                    let _unused = updated_transactions.insert(tx.id, updated);
-                    continue 'input_loop;
+                // Update status based on confirmations
+                if updated.blockchain.confirmations >= self.req_confirmations {
+                    updated.status = TransactionDisplayStatus::Confirmed;
+                } else {
+                    updated.status = TransactionDisplayStatus::Unconfirmed;
                 }
+                let _unused = updated_transactions.insert(tx.id, updated);
+                continue 'input_loop;
             }
             // we need to create a new display tx for this input
             new_debit.push((balance_change.clone(), output.clone()));

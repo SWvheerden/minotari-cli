@@ -131,6 +131,30 @@ pub fn get_scanned_tip_block_hash_at_height(
     Ok(hash)
 }
 
+/// Whether the account has scanned a block at `height`, but none with `hash`.
+/// A database from before per-copy output rows can hold two blocks at one
+/// height, so any of them matching counts.
+pub fn is_other_block_scanned_at_height(
+    conn: &Connection,
+    account_id: i64,
+    height: u64,
+    hash: &[u8],
+) -> WalletDbResult<bool> {
+    #[allow(clippy::cast_possible_wrap)]
+    let height = height as i64;
+    let other: bool = conn.query_row(
+        r#"
+        SELECT EXISTS (SELECT 1 FROM scanned_tip_blocks WHERE account_id = :account_id AND height = :height)
+           AND NOT EXISTS (
+               SELECT 1 FROM scanned_tip_blocks WHERE account_id = :account_id AND height = :height AND hash = :hash
+           )
+        "#,
+        named_params! { ":account_id": account_id, ":height": height, ":hash": hash },
+        |row| row.get(0),
+    )?;
+    Ok(other)
+}
+
 pub fn insert_scanned_tip_block(conn: &Connection, account_id: i64, height: i64, hash: &[u8]) -> WalletDbResult<()> {
     debug!(
         account_id = account_id,

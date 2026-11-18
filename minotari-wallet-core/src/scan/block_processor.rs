@@ -3824,4 +3824,72 @@ mod tests {
             .expect("count");
         assert_eq!(rows, 1);
     }
+
+    /// Points the send's history entry at the row of its input, as
+    /// `TransactionManager` records it (the fixture writes 0).
+    fn name_input_row(conn: &Connection, send: &TestSend, row: i64) {
+        let mut entry = db::get_displayed_transaction_by_id(conn, &send.tx_id.to_string())
+            .expect("query")
+            .expect("entry");
+        entry.details.inputs[0].matched_output_id = row;
+        db::insert_displayed_transaction(conn, &entry).expect("entry");
+    }
+
+    #[test]
+    fn spends_of_two_copies_re_mined_after_a_reorg_go_back_to_their_own_entries() {
+        let wallet = test_wallet();
+        let mut conn = wallet.pool.get().expect("conn");
+        let x = test_wallet_output(10_000, 1);
+        let mut processor = processor(&wallet, true);
+
+        // X received at 10 and spent by S1 at 20; re-created at 30 and spent by S2 at 50.
+        process(
+            &mut processor,
+            &conn,
+            wallet.account_id,
+            &[block(10, vec![x.clone()], Vec::new())],
+        );
+        let s1 = record_send(&wallet, &conn, 1, &[1], Some(3));
+        name_input_row(&conn, &s1, instances(&conn, wallet.account_id, &x)[0].0);
+        let s1_block = block(20, vec![s1.change.clone().unwrap()], vec![x.output_hash()]);
+        process(
+            &mut processor,
+            &conn,
+            wallet.account_id,
+            &[s1_block.clone(), block(30, vec![x.clone()], Vec::new())],
+        );
+        let s2 = record_send(&wallet, &conn, 2, &[1], Some(4));
+        name_input_row(&conn, &s2, instances(&conn, wallet.account_id, &x)[1].0);
+        let s2_block = block(50, vec![s2.change.clone().unwrap()], vec![x.output_hash()]);
+        process(
+            &mut processor,
+            &conn,
+            wallet.account_id,
+            &[s2_block.clone(), block(51, Vec::new(), Vec::new())],
+        );
+
+        // A reorg removes both spends and the second copy; all of it is mined again.
+        rollback_to(&mut conn, wallet.account_id, 15);
+        db::mark_completed_transaction_as_broadcasted(&conn, s1.tx_id, 1).expect("rebroadcast");
+        db::mark_completed_transaction_as_broadcasted(&conn, s2.tx_id, 1).expect("rebroadcast");
+        process(
+            &mut processor,
+            &conn,
+            wallet.account_id,
+            &[
+                s1_block,
+                block(30, vec![x.clone()], Vec::new()),
+                s2_block,
+                block(51, Vec::new(), Vec::new()),
+            ],
+        );
+
+        for (send, height) in [(&s1, 20), (&s2, 50)] {
+            let entry = db::get_displayed_transaction_by_id(&conn, &send.tx_id.to_string())
+                .expect("query")
+                .expect("entry");
+            assert_eq!(entry.blockchain.block_height, height);
+        }
+        assert_eq!(history_heights(&conn, wallet.account_id), vec![10, 20, 30, 50]);
+    }
 }

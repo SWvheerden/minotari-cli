@@ -1,6 +1,6 @@
 use crate::{
     ScanError, WalletEvent,
-    db::{SqlitePool, WalletDbError, get_scanned_tip_block_hash_at_height, prune_scanned_tip_blocks},
+    db::{SqlitePool, WalletDbError, is_other_block_scanned_at_height, prune_scanned_tip_blocks},
     scan::{EventSender, block_processor::BlockProcessor},
     webhooks::WebhookTriggerConfig,
 };
@@ -9,7 +9,6 @@ use r2d2::PooledConnection;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::TransactionBehavior;
 use std::sync::Arc;
-use tari_common_types::types::FixedHash;
 
 pub struct ScanDbHandler<E: EventSender + Clone + Send + 'static> {
     pool: SqlitePool,
@@ -116,16 +115,17 @@ impl<E: EventSender + Clone + Send + 'static> ScanDbHandler<E> {
                 // Every result at a height is the block the wallet already has there,
                 // or, for a repeat within the batch, the block of the previous result.
                 // Another block at that height means the chain changed under the scan:
-                // stop before recording anything, so the reorg check can roll back
-                // from that height. A second block would leave the first block's
-                // outputs credited, and the reorg check would only roll back above it.
-                let known_hash = if last_height == Some(block.height) {
-                    last_hash
+                // stop before recording anything, so a reorg check rolls back from
+                // that height (the main scan loop runs one at once; other callers
+                // return the error and the next scan's start-up check does). A second
+                // block would leave the first block's outputs credited, and the reorg
+                // check would only roll back above it.
+                let other_block = if last_height == Some(block.height) {
+                    last_hash != Some(block.block_hash)
                 } else {
-                    get_scanned_tip_block_hash_at_height(&tx, target_account_id, block.height)?
-                        .and_then(|hash| FixedHash::try_from(hash).ok())
+                    is_other_block_scanned_at_height(&tx, target_account_id, block.height, block.block_hash.as_slice())?
                 };
-                if known_hash.is_some_and(|known| known != block.block_hash) {
+                if other_block {
                     return Err(ScanError::Intermittent(format!(
                         "Base node returned a different block at height {} than the one already scanned there",
                         block.height
@@ -313,6 +313,23 @@ mod tests {
             .process_blocks(Arc::new(vec![block(100)]), account_id, false, None, 100)
             .await
             .expect("re-read");
+    }
+
+    #[tokio::test]
+    async fn a_block_matching_any_of_two_stored_blocks_at_its_height_is_accepted() {
+        // Databases from before this check can hold two blocks at one height.
+        let (mut handler, account_id, _dir) = handler("two_stored.db");
+        {
+            let conn = handler.pool.get().expect("conn");
+            crate::db::insert_scanned_tip_block(&conn, account_id, 100, &[0x01; 32]).expect("stale");
+            crate::db::insert_scanned_tip_block(&conn, account_id, 100, block(100).block_hash.as_slice())
+                .expect("current");
+        }
+
+        handler
+            .process_blocks(Arc::new(vec![block(100)]), account_id, false, None, 100)
+            .await
+            .expect("the block matches one of them");
     }
 
     #[tokio::test]

@@ -70,7 +70,7 @@ mod scanned_tip_blocks;
 pub use scanned_tip_blocks::{
     LatestScannedBlock, delete_scanned_tip_blocks_from_height, get_latest_scanned_block_with_timestamp,
     get_latest_scanned_tip_block_by_account, get_scanned_tip_block_hash_at_height, get_scanned_tip_blocks_by_account,
-    insert_scanned_tip_block, prune_scanned_tip_blocks,
+    insert_scanned_tip_block, is_other_block_scanned_at_height, prune_scanned_tip_blocks,
 };
 
 mod outputs;
