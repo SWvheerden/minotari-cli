@@ -56,7 +56,8 @@ use zeroize::Zeroizing;
 /// # Network
 ///
 /// Output hashes take their domain from the process-global network, so set it with
-/// `Network::set_current` before scanning; the scanner has no network of its own to check.
+/// `Network::set_current` at startup, before any wallet-core call; the scanner has no
+/// network of its own to check.
 ///
 /// # Thread Safety
 ///
