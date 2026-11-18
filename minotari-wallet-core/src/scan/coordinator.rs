@@ -1586,6 +1586,8 @@ impl ScanCoordinator {
     ) -> Result<(), ScanError> {
         use std::collections::HashMap;
 
+        // `unresolved` is ordered by mined height, so a hash re-created after a
+        // spend maps to its newest row: the instance the base node reports on.
         let hash_to_output: HashMap<Vec<u8>, &crate::db::UnresolvedSpentOutput> =
             unresolved.iter().map(|o| (o.output_hash.clone(), o)).collect();
 
@@ -1689,7 +1691,7 @@ impl ScanCoordinator {
                         reversal_of_balance_change_id: None,
                         is_reversed: false,
                     };
-                    crate::db::insert_balance_change(&tx, &change).map_err(ScanError::DbError)?;
+                    crate::db::insert_balance_change_if_not_exists(&tx, &change).map_err(ScanError::DbError)?;
 
                     crate::db::update_output_status(&tx, *output_id, OutputStatus::Spent)
                         .map_err(ScanError::DbError)?;
