@@ -39,8 +39,10 @@ fn execute_burn_funds(world: &mut MinotariWorld, amount: &str, claim_public_key:
         args.extend_from_slice(&["--claim-public-key".to_string(), cpk.to_string()]);
     }
 
+    // Without TARI_NETWORK the burn only signs for LocalNet if `--network` sets the global network.
     let output = Command::new(&program)
         .args(&args)
+        .env_remove("TARI_NETWORK")
         .output()
         .expect("Failed to execute burn-funds command");
 

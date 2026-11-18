@@ -61,6 +61,7 @@ use crate::{
     http::WalletHttpClient,
     scan::{self, ScanError, ScanMode},
     tasks::{burn_proof_worker::BurnProofWorker, unlocker::TransactionUnlocker},
+    utils::network::ensure_global_network,
     webhooks::{
         WebhookTriggerConfig,
         worker::{WebhookWorker, WebhookWorkerConfig},
@@ -219,6 +220,8 @@ impl Daemon {
     /// - `ScanError::Fatal` - Database connection failures, API binding errors, or task panics
     /// - Scanner errors are handled internally with retry logic for intermittent failures
     pub async fn run(&self) -> Result<(), ScanError> {
+        // The burn route and the burn-proof worker hash with the process-global network.
+        ensure_global_network(self.network)?;
         info!("Daemon started. Press Ctrl+C to stop.");
 
         let (shutdown_tx, _) = broadcast::channel(1);

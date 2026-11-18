@@ -288,7 +288,7 @@ mod tests {
             seconds_to_lock: 3600,
             confirmation_window: 100,
         };
-        let result = create_burn_tx(&restored, &mut conn, Network::LocalNet, "pass", params).expect("builds");
+        let result = create_burn_tx(&restored, &mut conn, Network::get_current(), "pass", params).expect("builds");
         assert_eq!(result.transaction.body.inputs().len(), 1);
     }
 

@@ -113,6 +113,11 @@ fn ensure_minotari_binary_built() {
 
 #[tokio::main]
 async fn main() {
+    // CLI children without `--network` take it from here; the default config's mainnet is invalid for a
+    // testnet-target build. Base nodes set this too, but only once the first one starts.
+    unsafe {
+        std::env::set_var("TARI_NETWORK", "localnet");
+    }
     ensure_minotari_binary_built();
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

@@ -27,6 +27,7 @@ use crate::{
         idempotency::{IdempotencyBinding, IdempotencyOperation, RequestFingerprint},
         input_selector::map_change_required_error,
     },
+    utils::network::ensure_global_network,
 };
 
 /// Locks the VN registration deposit and prepares a pay-to-self transaction for signing.
@@ -51,6 +52,7 @@ pub(crate) fn build_vn_pay_to_self_tx(
     confirmation_window: u64,
     operation: IdempotencyOperation,
 ) -> Result<PrepareOneSidedTransactionForSigningResult, anyhow::Error> {
+    ensure_global_network(network)?;
     let consensus_constants = ConsensusConstantsBuilder::new(network).build();
     let deposit_amount = consensus_constants.validator_node_registration_min_deposit_amount();
 
