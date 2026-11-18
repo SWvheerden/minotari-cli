@@ -1781,12 +1781,19 @@ mod tests {
     use tari_common_types::seeds::cipher_seed::CipherSeed;
     use tari_common_types::transaction::TxId;
     use tari_common_types::types::FixedHash;
+    use tari_script::script;
     use tari_transaction_components::MicroMinotari;
+    use tari_transaction_components::key_manager::TransactionKeyManagerInterface;
     use tari_transaction_components::key_manager::wallet_types::{SeedWordsWallet, WalletType};
     use tari_transaction_components::rpc::models::{
-        BlockUtxoInfo, SyncUtxosByBlockResponseV0, SyncUtxosByBlockResponseV1,
+        BlockUtxoInfo, GetUtxosByBlockResponse, MinimalUtxoSyncInfo, SyncUtxosByBlockResponseV0,
+        SyncUtxosByBlockResponseV1,
     };
-    use tari_transaction_components::transaction_components::{Transaction, TransactionKernel};
+    use tari_transaction_components::test_helpers::{TestParams, create_wallet_output_with_data};
+    use tari_transaction_components::transaction_components::{
+        OutputFeatures, Transaction, TransactionKernel, TransactionOutput,
+    };
+    use tari_utilities::ByteArray;
     use tempfile::TempDir;
     use tokio::sync::mpsc::UnboundedReceiver;
     use wiremock::{MockServer, Request, Respond, ResponseTemplate};
@@ -1865,7 +1872,8 @@ mod tests {
     /// header requests while `slow_headers`. The birthday is at `BIRTHDAY_HEIGHT`;
     /// its lookup fails if `fail_birthday` and hangs while `slow_birthday`.
     /// `refork_from: Some(from)` forks the chain anew from `from` whenever a
-    /// header at or above it is asked for.
+    /// header at or above it is asked for. The tip block holds `tip_output` and
+    /// spends `tip_inputs`.
     struct MockChain {
         tip: u64,
         fork_from: Arc<AtomicU64>,
@@ -1877,6 +1885,8 @@ mod tests {
         slow_birthday: Arc<AtomicBool>,
         refork_from: Option<u64>,
         forks: AtomicU64,
+        tip_output: Option<TransactionOutput>,
+        tip_inputs: Vec<Vec<u8>>,
     }
 
     const BIRTHDAY_HEIGHT: u64 = 1450;
@@ -1902,6 +1912,8 @@ mod tests {
                 slow_birthday: Arc::new(AtomicBool::new(false)),
                 refork_from: None,
                 forks: AtomicU64::new(0),
+                tip_output: None,
+                tip_inputs: Vec::new(),
             }
         }
 
@@ -1972,11 +1984,21 @@ mod tests {
                     let last = (start + limit - 1).min(self.tip);
                     let mut blocks = Vec::new();
                     for height in start..=last {
+                        let at_tip = height == self.tip;
+                        let outputs = match &self.tip_output {
+                            Some(output) if at_tip => vec![MinimalUtxoSyncInfo {
+                                output_hash: output.hash().to_vec(),
+                                commitment: output.commitment.as_bytes().to_vec(),
+                                encrypted_data: output.encrypted_data.as_bytes().to_vec(),
+                                sender_offset_public_key: output.sender_offset_public_key.as_bytes().to_vec(),
+                            }],
+                            _ => Vec::new(),
+                        };
                         blocks.push(BlockUtxoInfo {
                             header_hash: self.hash(height),
                             height,
-                            outputs: Vec::new(),
-                            inputs: Vec::new(),
+                            outputs,
+                            inputs: if at_tip { self.tip_inputs.clone() } else { Vec::new() },
                             mined_timestamp: 1_700_000_000,
                         });
                     }
@@ -1993,6 +2015,19 @@ mod tests {
                     ResponseTemplate::new(200)
                         .set_body_json(response)
                         .set_delay(self.download_delay)
+                },
+                "/get_utxos_by_block" => {
+                    let height = height_of(&query_param(request, "header_hash"));
+                    let outputs = match &self.tip_output {
+                        Some(output) if height == self.tip => vec![output.clone()],
+                        _ => Vec::new(),
+                    };
+                    ResponseTemplate::new(200).set_body_json(GetUtxosByBlockResponse {
+                        header_hash: self.hash(height),
+                        height,
+                        outputs,
+                        mined_timestamp: 1_700_000_000,
+                    })
                 },
                 _ => ResponseTemplate::new(404),
             }
@@ -2995,6 +3030,107 @@ mod tests {
         let tips = get_scanned_tip_blocks_by_account(&conn, setup.account_id).expect("tips");
         let tip = tips.iter().find(|t| t.height == 1505).expect("the tip is rescanned");
         assert_eq!(tip.hash, forked_block_hash(1505), "the rescanned tip is the new block");
+    }
+
+    #[tokio::test]
+    async fn a_continuous_scan_re_reads_a_tip_with_a_wallet_output_and_a_spend_without_counting_them_twice() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pool = init_db(dir.path().join("coordinator.db")).expect("init db");
+        let conn = pool.get().expect("conn");
+        let wallet = WalletType::SeedWords(SeedWordsWallet::construct_new(CipherSeed::random()).unwrap());
+        create_account(&conn, "default", &wallet, "password").unwrap();
+        let account = get_account_by_name(&conn, "default").unwrap().unwrap();
+        let key_manager = account.get_key_manager("password").unwrap();
+        insert_scanned_tip_block(&conn, account.id, 1500, &block_hash(1500)).expect("tip");
+
+        // A wallet output mined earlier and spent in the tip block, and one received there.
+        let new_output = |value: u64| {
+            create_wallet_output_with_data(
+                script!(Nop).unwrap(),
+                OutputFeatures::default(),
+                &TestParams::new(&key_manager),
+                MicroMinotari(value),
+                &key_manager,
+            )
+            .unwrap()
+        };
+        let spent = new_output(5_000);
+        let (spent_id, _) = crate::db::insert_output(
+            &conn,
+            account.id,
+            &key_manager.get_private_view_key(),
+            &spent.output_hash(),
+            &spent,
+            1400,
+            &FixedHash::from([0x14; 32]),
+            1_700_000_000,
+            None,
+            None,
+            FixedHash::zero(),
+            false,
+        )
+        .expect("spent output");
+        let received = new_output(1_000_000).to_transaction_output().unwrap();
+        drop(conn);
+
+        let mut chain = MockChain::new(1505);
+        chain.tip_output = Some(received.clone());
+        chain.tip_inputs = vec![spent.output_hash().to_vec()];
+        let server = MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(chain)
+            .mount(&server)
+            .await;
+        let (sender, events) = tokio::sync::mpsc::unbounded_channel();
+        let coordinator = new_coordinator(&pool, &server, EventChannel::Unbounded(sender), 1_000);
+        let mut setup = Setup {
+            coordinator,
+            events,
+            pool,
+            account_id: account.id,
+            server,
+            _dir: dir,
+        };
+
+        // The poll between the first and second wait re-reads the tip block.
+        let mut waits = 0;
+        run_continuous_until(&mut setup, |event| {
+            if is_waiting(event) {
+                waits += 1;
+            }
+            waits == 2
+        })
+        .await;
+        let tip_reads = setup
+            .server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| {
+                r.url.path() == "/sync_utxos_by_block" && height_of(&query_param(r, "start_header_hash")) == 1505
+            })
+            .count();
+        assert!(tip_reads >= 1, "the tip block is read again");
+
+        let conn = setup.pool.get().expect("conn");
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).expect("count") };
+        let received_rows = count(&format!(
+            "SELECT COUNT(*) FROM outputs WHERE output_hash = x'{}' AND deleted_at IS NULL",
+            hex::encode(received.hash().as_slice())
+        ));
+        assert_eq!(received_rows, 1);
+        let credits = count(&format!(
+            "SELECT COUNT(*) FROM balance_changes bc JOIN outputs o ON bc.caused_by_output_id = o.id
+             WHERE o.output_hash = x'{}' AND bc.balance_credit > 0",
+            hex::encode(received.hash().as_slice())
+        ));
+        assert_eq!(credits, 1, "one credit");
+        let debits = count(&format!(
+            "SELECT COUNT(*) FROM balance_changes bc JOIN inputs i ON bc.caused_by_input_id = i.id
+             WHERE i.output_id = {spent_id} AND bc.balance_debit > 0"
+        ));
+        assert_eq!(debits, 1, "one debit");
     }
 
     async fn count_requests(server: &MockServer, path: &str) -> usize {

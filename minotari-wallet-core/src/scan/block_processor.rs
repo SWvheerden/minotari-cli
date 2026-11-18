@@ -1307,6 +1307,7 @@ mod tests {
     use tari_transaction_components::transaction_components::{
         EncryptedData, MemoField, OutputFeatures, TransactionInput, TransactionOutputVersion, covenants::Covenant,
     };
+    use tari_utilities::ByteArray;
     use tempfile::TempDir;
 
     struct TestWallet {
@@ -2939,5 +2940,310 @@ mod tests {
             lock_of(&conn, send_input),
             ("LOCKED".to_string(), Some(send.request_id.clone()))
         );
+    }
+
+    /// `(credits, debits)` recorded for the account (reversals left out) and the
+    /// ledger total, which is what the balance is built from.
+    fn ledger(conn: &Connection, account_id: i64) -> (i64, i64, i64) {
+        conn.query_row(
+            "SELECT COUNT(*) FILTER (WHERE balance_credit > 0 AND NOT is_reversal),
+                    COUNT(*) FILTER (WHERE balance_debit > 0 AND NOT is_reversal),
+                    COALESCE(SUM(balance_credit), 0) - COALESCE(SUM(balance_debit), 0)
+             FROM balance_changes WHERE account_id = :account_id",
+            named_params! { ":account_id": account_id },
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("ledger")
+    }
+
+    /// `(row id, tx_id, block hash of its active input)` of each active row of
+    /// `output` in the account, oldest first.
+    fn instances(conn: &Connection, account_id: i64, output: &WalletOutput) -> Vec<(i64, i64, Option<Vec<u8>>)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT o.id, o.tx_id, i.mined_in_block_hash
+                 FROM outputs o LEFT JOIN inputs i ON i.output_id = o.id AND i.deleted_at IS NULL
+                 WHERE o.account_id = :account_id AND o.output_hash = :hash AND o.deleted_at IS NULL
+                 ORDER BY o.mined_in_block_height",
+            )
+            .expect("prepare");
+        stmt.query_map(
+            named_params! { ":account_id": account_id, ":hash": output.output_hash().as_slice() },
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows")
+    }
+
+    fn rollback_to(conn: &mut Connection, account_id: i64, height: u64) {
+        let tx = conn.transaction().expect("tx");
+        crate::scan::reorg::rollback_from_height(&tx, account_id, height, None).expect("rollback");
+        tx.commit().expect("commit");
+    }
+
+    #[test]
+    fn a_block_read_twice_credits_and_debits_once() {
+        let wallet = test_wallet();
+        let conn = wallet.pool.get().expect("conn");
+        let a = test_wallet_output(10_000, 1);
+        let b = test_wallet_output(3_000, 2);
+        let tip = block(20, vec![b.clone()], vec![a.output_hash()]);
+        process(
+            &mut processor(&wallet, false),
+            &conn,
+            wallet.account_id,
+            &[block(10, vec![a.clone()], Vec::new()), tip.clone()],
+        );
+        // The Continuous scan reads the tip again on its next poll.
+        process(
+            &mut processor(&wallet, false),
+            &conn,
+            wallet.account_id,
+            std::slice::from_ref(&tip),
+        );
+
+        assert_eq!(ledger(&conn, wallet.account_id), (2, 1, 3_000));
+        assert_eq!(instances(&conn, wallet.account_id, &b).len(), 1);
+        assert_eq!(
+            instances(&conn, wallet.account_id, &a)[0].2.as_deref(),
+            Some(tip.block_hash.as_slice())
+        );
+    }
+
+    #[test]
+    fn an_input_repeated_within_one_result_debits_once() {
+        let wallet = test_wallet();
+        let conn = wallet.pool.get().expect("conn");
+        let a = test_wallet_output(10_000, 1);
+        process(
+            &mut processor(&wallet, false),
+            &conn,
+            wallet.account_id,
+            &[
+                block(10, vec![a.clone()], Vec::new()),
+                block(20, Vec::new(), vec![a.output_hash(); 3]),
+            ],
+        );
+
+        assert_eq!(ledger(&conn, wallet.account_id), (1, 1, 0));
+        let inputs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM inputs", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(inputs, 1);
+    }
+
+    #[test]
+    fn a_block_split_across_two_results_records_each_part_once() {
+        let wallet = test_wallet();
+        let conn = wallet.pool.get().expect("conn");
+        let a = test_wallet_output(10_000, 1);
+        let b = test_wallet_output(5_000, 2);
+        let c = test_wallet_output(2_000, 3);
+        let d = test_wallet_output(1_000, 4);
+        // Both results share block 20's hash; the second also repeats the first's input.
+        let first = block(20, vec![c.clone()], vec![a.output_hash()]);
+        let second = block(20, vec![d.clone()], vec![b.output_hash(), a.output_hash()]);
+        process(
+            &mut processor(&wallet, false),
+            &conn,
+            wallet.account_id,
+            &[block(10, vec![a.clone(), b.clone()], Vec::new()), first, second],
+        );
+
+        assert_eq!(ledger(&conn, wallet.account_id), (4, 2, 3_000));
+    }
+
+    #[test]
+    fn a_spend_re_listed_in_a_later_block_is_ignored() {
+        let wallet = test_wallet();
+        let conn = wallet.pool.get().expect("conn");
+        let a = test_wallet_output(10_000, 1);
+        let spend = block(20, Vec::new(), vec![a.output_hash()]);
+        process(
+            &mut processor(&wallet, false),
+            &conn,
+            wallet.account_id,
+            &[
+                block(10, vec![a.clone()], Vec::new()),
+                spend.clone(),
+                block(30, Vec::new(), vec![a.output_hash()]),
+            ],
+        );
+
+        // Logged as a warning and skipped: no second input row, debit or status change.
+        assert_eq!(ledger(&conn, wallet.account_id), (1, 1, 0));
+        let rows = instances(&conn, wallet.account_id, &a);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].2.as_deref(), Some(spend.block_hash.as_slice()));
+        let inputs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM inputs", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(inputs, 1);
+        assert_eq!(output_row(&conn, &a.output_hash()).1, "SPENT");
+    }
+
+    #[test]
+    fn a_re_created_output_is_credited_and_debited_once_per_instance() {
+        let wallet = test_wallet();
+        let conn = wallet.pool.get().expect("conn");
+        let a = test_wallet_output(10_000, 1);
+        let blocks = [
+            block(10, vec![a.clone()], Vec::new()),
+            block(20, Vec::new(), vec![a.output_hash()]),
+            block(30, vec![a.clone()], Vec::new()),
+            block(40, Vec::new(), vec![a.output_hash()]),
+        ];
+        process(&mut processor(&wallet, false), &conn, wallet.account_id, &blocks);
+
+        let rows = instances(&conn, wallet.account_id, &a);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].2.as_deref(), Some(blocks[1].block_hash.as_slice()));
+        assert_eq!(rows[1].2.as_deref(), Some(blocks[3].block_hash.as_slice()));
+        assert_ne!(rows[0].1, rows[1].1, "each instance has its own tx_id");
+        assert_eq!(
+            rows[0].1,
+            TxId::new_deterministic(wallet.view_key.as_bytes(), &a.output_hash()).as_i64_wrapped(),
+            "the first instance keeps the original tx_id"
+        );
+        assert_eq!(ledger(&conn, wallet.account_id), (2, 2, 0));
+
+        // Reading every block again changes nothing, the tx_ids included.
+        process(&mut processor(&wallet, false), &conn, wallet.account_id, &blocks);
+        assert_eq!(instances(&conn, wallet.account_id, &a), rows);
+        assert_eq!(ledger(&conn, wallet.account_id), (2, 2, 0));
+    }
+
+    #[test]
+    fn a_re_created_output_re_mined_in_another_block_after_a_reorg_keeps_its_tx_id() {
+        let wallet = test_wallet();
+        let mut conn = wallet.pool.get().expect("conn");
+        let a = test_wallet_output(10_000, 1);
+        process(
+            &mut processor(&wallet, false),
+            &conn,
+            wallet.account_id,
+            &[
+                block(10, vec![a.clone()], Vec::new()),
+                block(20, Vec::new(), vec![a.output_hash()]),
+                block(30, vec![a.clone()], Vec::new()),
+            ],
+        );
+        let tx_id = instances(&conn, wallet.account_id, &a)[1].1;
+
+        rollback_to(&mut conn, wallet.account_id, 30);
+        assert_eq!(instances(&conn, wallet.account_id, &a).len(), 1);
+
+        let remined = BlockScanResult {
+            block_hash: hash(99),
+            ..block(31, vec![a.clone()], Vec::new())
+        };
+        process(
+            &mut processor(&wallet, false),
+            &conn,
+            wallet.account_id,
+            std::slice::from_ref(&remined),
+        );
+
+        let rows = instances(&conn, wallet.account_id, &a);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].1, tx_id);
+        assert_eq!(ledger(&conn, wallet.account_id).2, 10_000);
+    }
+
+    #[test]
+    fn an_output_in_two_accounts_is_credited_and_debited_once_in_each() {
+        let wallet = test_wallet();
+        let conn = wallet.pool.get().expect("conn");
+        let other = WalletType::SeedWords(SeedWordsWallet::construct_new(CipherSeed::random()).unwrap());
+        create_account(&conn, "second", &other, "password").unwrap();
+        let second_id = get_account_by_name(&conn, "second").unwrap().unwrap().id;
+        // The same view key for both, so the two rows share a tx_id as well.
+        let mut processor = BlockProcessor::new(
+            vec![
+                (wallet.account_id, wallet.view_key.clone()),
+                (second_id, wallet.view_key.clone()),
+            ],
+            3,
+        );
+        let a = test_wallet_output(10_000, 1);
+        let mut created = block(10, Vec::new(), Vec::new());
+        created.wallet_outputs = vec![(a.output_hash(), a.clone(), 0), (a.output_hash(), a.clone(), 1)];
+        let spent = block(20, Vec::new(), vec![a.output_hash()]);
+
+        for _ in 0..2 {
+            for account_id in [wallet.account_id, second_id] {
+                process(&mut processor, &conn, account_id, &[created.clone(), spent.clone()]);
+            }
+        }
+
+        for account_id in [wallet.account_id, second_id] {
+            assert_eq!(ledger(&conn, account_id), (1, 1, 0));
+            assert_eq!(instances(&conn, account_id, &a).len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_spend_block_presented_again_and_again_debits_once() {
+        // Regression: each presentation of a spend block added another debit.
+        let wallet = test_wallet();
+        let conn = wallet.pool.get().expect("conn");
+        let a = test_wallet_output(10_000, 1);
+        let b = test_wallet_output(4_000, 2);
+        process(
+            &mut processor(&wallet, false),
+            &conn,
+            wallet.account_id,
+            &[block(10, vec![a.clone(), b], Vec::new())],
+        );
+        let spend = block(20, Vec::new(), vec![a.output_hash()]);
+        for _ in 0..3 {
+            process(
+                &mut processor(&wallet, false),
+                &conn,
+                wallet.account_id,
+                std::slice::from_ref(&spend),
+            );
+        }
+
+        let (_, debits, total) = ledger(&conn, wallet.account_id);
+        assert_eq!(debits, 1);
+        assert_eq!(total, 4_000);
+    }
+
+    #[test]
+    fn a_reorg_below_a_re_read_spend_restores_the_balance_exactly() {
+        let wallet = test_wallet();
+        let mut conn = wallet.pool.get().expect("conn");
+        let a = test_wallet_output(10_000, 1);
+        let b = test_wallet_output(4_000, 2);
+        let spend = block(20, Vec::new(), vec![a.output_hash()]);
+        process(
+            &mut processor(&wallet, false),
+            &conn,
+            wallet.account_id,
+            &[block(10, vec![a.clone(), b], Vec::new()), spend.clone()],
+        );
+        for _ in 0..2 {
+            process(
+                &mut processor(&wallet, false),
+                &conn,
+                wallet.account_id,
+                std::slice::from_ref(&spend),
+            );
+        }
+        assert_eq!(ledger(&conn, wallet.account_id).2, 4_000);
+
+        rollback_to(&mut conn, wallet.account_id, 20);
+        assert_eq!(ledger(&conn, wallet.account_id).2, 14_000, "the pre-spend balance");
+
+        // The reorg left the row SPENT but removed its input: mined again, the spend debits again.
+        process(
+            &mut processor(&wallet, false),
+            &conn,
+            wallet.account_id,
+            std::slice::from_ref(&spend),
+        );
+        assert_eq!(ledger(&conn, wallet.account_id).2, 4_000);
     }
 }
