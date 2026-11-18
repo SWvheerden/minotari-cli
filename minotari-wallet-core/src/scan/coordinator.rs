@@ -1184,19 +1184,28 @@ impl ScanCoordinator {
 
         // Resolve SpentUnconfirmed outputs:
         // 1. Mark outputs with matching inputs as Spent
-        // 2. Verify remaining outputs against the base node
+        // 2. Mark older copies of a re-created output as Spent
+        // 3. Verify remaining outputs against the base node
         for target in &targets {
             let unresolved = {
-                let conn = self.pool.get().map_err(|e| ScanError::DbError(e.into()))?;
-                let marked_spent = crate::db::resolve_spent_unconfirmed_with_inputs(&conn, target.account.id)
+                let mut conn = self.pool.get().map_err(|e| ScanError::DbError(e.into()))?;
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|e| ScanError::DbError(WalletDbError::from(e)))?;
+                let marked_spent = crate::db::resolve_spent_unconfirmed_with_inputs(&tx, target.account.id)
+                    .map_err(ScanError::DbError)?;
+                let superseded = crate::db::resolve_superseded_spent_unconfirmed(&tx, target.account.id)
                     .map_err(ScanError::DbError)?;
                 info!(
                     account_id = target.account.id,
-                    marked_spent = marked_spent;
-                    "Resolved SpentUnconfirmed outputs with matching inputs"
+                    marked_spent = marked_spent,
+                    superseded = superseded;
+                    "Resolved SpentUnconfirmed outputs with matching inputs or a newer copy"
                 );
-                crate::db::get_unresolved_spent_unconfirmed_outputs(&conn, target.account.id)
-                    .map_err(ScanError::DbError)?
+                let unresolved = crate::db::get_unresolved_spent_unconfirmed_outputs(&tx, target.account.id)
+                    .map_err(ScanError::DbError)?;
+                tx.commit().map_err(|e| ScanError::DbError(WalletDbError::from(e)))?;
+                unresolved
             };
 
             if !unresolved.is_empty() {
@@ -1586,8 +1595,8 @@ impl ScanCoordinator {
     ) -> Result<(), ScanError> {
         use std::collections::HashMap;
 
-        // `unresolved` is ordered by mined height, so a hash re-created after a
-        // spend maps to its newest row: the instance the base node reports on.
+        // Older copies of a re-created hash were resolved without the node, so
+        // each hash here is its newest copy: the one the node's answer is about.
         let hash_to_output: HashMap<Vec<u8>, &crate::db::UnresolvedSpentOutput> =
             unresolved.iter().map(|o| (o.output_hash.clone(), o)).collect();
 

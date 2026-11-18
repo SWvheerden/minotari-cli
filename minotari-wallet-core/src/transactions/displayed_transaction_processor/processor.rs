@@ -62,7 +62,16 @@ impl DisplayedTransactionProcessor {
         let mut new_debit = Vec::new();
         'output_loop: for (balance_change, output) in accumulator.credit_balance_changes() {
             for tx in current_display_transactions {
-                if tx.details.outputs.iter().any(|o| o.hash == output.output.output_hash()) {
+                // This copy's own entry, or one listing its hash before it was mined (a
+                // pending send's change). An entry for another copy of a re-created hash
+                // is mined in another block.
+                if tx.id == output.tx_id
+                    || tx.details.outputs.iter().any(|o| {
+                        o.hash == output.output.output_hash()
+                            && (o.mined_in_block_hash == output.mined_in_block_hash
+                                || o.mined_in_block_hash == FixedHash::default())
+                    })
+                {
                     let mut updated = tx.clone();
                     updated.blockchain.block_height = output.height;
                     updated.blockchain.timestamp = balance_change.effective_date;
@@ -83,12 +92,12 @@ impl DisplayedTransactionProcessor {
         }
         'input_loop: for (balance_change, output) in accumulator.debit_balance_changes() {
             for tx in current_display_transactions {
-                if tx
-                    .details
-                    .inputs
-                    .iter()
-                    .any(|o| o.output_hash == output.output.output_hash())
-                {
+                // Matched on the spent row, so a spend of another copy of a re-created
+                // hash gets its own entry. 0 is an entry that never recorded the row.
+                if tx.details.inputs.iter().any(|o| {
+                    o.output_hash == output.output.output_hash()
+                        && (o.matched_output_id == output.output_id || o.matched_output_id == 0)
+                }) {
                     let mut updated = tx.clone();
                     updated.blockchain.block_height = output.mined_in_block_height;
                     updated.blockchain.timestamp = balance_change.effective_date;
@@ -539,7 +548,11 @@ impl DisplayedTransactionProcessor {
                     matched_output_id: input.output_id,
                 }])
                 .output_type(None)
-                .build(input.tx_id)?;
+                // Not the spent output's own id, which its receive entry holds.
+                .build(TxId::new_deterministic(
+                    &input.tx_id.as_u64().to_le_bytes(),
+                    &input.mined_in_block,
+                ))?;
             results.push(tx);
         }
 
@@ -597,7 +610,7 @@ impl DisplayedTransactionProcessor {
                     ))?;
                     let spent_input = SpentInput {
                         tx_id: TxId::from(output.tx_id as u64),
-                        output_id: input.id,
+                        output_id: input.output_id,
                         mined_in_block: FixedHash::try_from(input.mined_in_block_hash)
                             .map_err(|e| ProcessorError::ParseError(e.to_string()))?,
                         mined_in_block_height: input.mined_in_block_height as u64,

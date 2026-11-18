@@ -107,6 +107,11 @@ pub struct BlockProcessor<E: EventSender = NoopEventSender> {
     /// What the block being processed showed of the wallet's own sends. Only
     /// collected while `has_pending_outbound` is set. See [`Self::match_sends`].
     send_block: Option<SendBlock>,
+    /// `(account, block hash, input hashes)`: the inputs of the block being
+    /// processed that matched none of the account's outputs. A block arrives as
+    /// several results in no fixed order, so the output an input spends can come
+    /// in a later result; it is retried then.
+    unmatched_inputs: Option<(i64, FixedHash, HashSet<FixedHash>)>,
 }
 
 /// The parts of one block needed to recognise the wallet's own sends in it.
@@ -151,6 +156,7 @@ impl BlockProcessor<NoopEventSender> {
             backfill_mode: false,
             inputs_excluded: false,
             send_block: None,
+            unmatched_inputs: None,
         }
     }
 }
@@ -187,6 +193,7 @@ impl<E: EventSender> BlockProcessor<E> {
             backfill_mode: false,
             inputs_excluded: false,
             send_block: None,
+            unmatched_inputs: None,
         }
     }
 
@@ -281,8 +288,28 @@ impl<E: EventSender> BlockProcessor<E> {
             block.block_hash.to_vec(),
         ));
 
+        let same_block = matches!(
+            &self.unmatched_inputs,
+            Some((open_account, open_hash, _)) if *open_account == account_id && *open_hash == block.block_hash
+        );
+        if !same_block {
+            self.unmatched_inputs = Some((account_id, block.block_hash, HashSet::new()));
+        }
+
         let mut request_ids = self.process_outputs(tx, block, account_id, &account_view_key)?;
-        request_ids.extend(self.process_inputs(tx, block, account_id)?);
+        // Inputs of earlier results of this block that spend an output stored just now.
+        let mut inputs = Vec::new();
+        if let Some((_, _, unmatched)) = &mut self.unmatched_inputs {
+            for (hash, _output, wallet_idx) in &block.wallet_outputs {
+                if self.wallet_index_to_account_id.get(*wallet_idx).copied() == Some(account_id)
+                    && unmatched.remove(hash)
+                {
+                    inputs.push(*hash);
+                }
+            }
+        }
+        inputs.extend_from_slice(&block.inputs);
+        request_ids.extend(self.process_inputs(tx, block, account_id, &inputs)?);
         if !self.inputs_excluded && (self.has_pending_outbound || !request_ids.is_empty()) {
             self.collect_send_block(block, account_id, request_ids);
         }
@@ -693,7 +720,7 @@ impl<E: EventSender> BlockProcessor<E> {
     /// Processes all inputs in the block to detect spent outputs.
     ///
     /// For each input that references a wallet-owned output:
-    /// - Picks the output row it spends (see [`db::get_output_info_by_hash_for_account`])
+    /// - Picks the output row it spends (see [`db::get_output_copies`])
     /// - Inserts the input record into the database
     /// - Records the balance change (debit)
     /// - Updates the output status to Spent
@@ -707,30 +734,50 @@ impl<E: EventSender> BlockProcessor<E> {
         tx: &Connection,
         block: &BlockScanResult,
         account_id: i64,
+        inputs: &[FixedHash],
     ) -> Result<Vec<String>, BlockProcessorError> {
         let mut request_ids = Vec::new();
-        for input_hash in &block.inputs {
-            // Already recorded for this block: a re-read, a later result of it, or a repeat within one.
-            if db::is_output_spent_in_block(tx, account_id, input_hash, block.block_hash.as_slice())? {
+        for input_hash in inputs {
+            let copies = db::get_output_copies(tx, account_id, input_hash)?;
+            if copies.is_empty() {
+                // Not the account's, or its output is in a later result of this block.
+                if let Some((_, _, unmatched)) = &mut self.unmatched_inputs {
+                    unmatched.insert(*input_hash);
+                }
                 continue;
             }
-            let Some((output_id, tx_id, output)) =
-                db::get_output_info_by_hash_for_account(tx, account_id, input_hash, block.height)?
-            else {
+            // Already recorded for this block: a re-read, a later result of it, or a repeat within one.
+            if copies
+                .iter()
+                .any(|c| c.spent_in_block_hash.as_deref() == Some(block.block_hash.as_slice()))
+            {
+                continue;
+            }
+            // The newest copy mined at or below this block that is not spent yet. An
+            // older copy was spent before a newer one was created, even when that
+            // spend is not recorded yet (FastSync processes spends out of height order).
+            let Some(copy) = copies.iter().rev().find(|c| {
+                c.spent_in_block_hash.is_none()
+                    && u64::try_from(c.mined_in_block_height).is_ok_and(|h| h <= block.height)
+            }) else {
                 // Nothing left to spend. A spend already recorded in another block
                 // cannot happen again (a reorg would have removed that record first).
-                if let Some((_, spent_in_block)) = db::get_output_spend(tx, account_id, input_hash)? {
+                if let Some(spent_in_block) = copies.iter().rev().find_map(|c| c.spent_in_block_hash.as_ref()) {
                     warn!(
                         target: "audit",
                         account_id = account_id,
                         block_height = block.height,
                         block_hash = &*hex::encode(block.block_hash),
-                        spent_in_block_hash = &*hex::encode(&spent_in_block);
+                        spent_in_block_hash = &*hex::encode(spent_in_block);
                         "Input lists a wallet output already spent in another block; ignoring it"
                     );
                 }
                 continue;
             };
+            let output_id = copy.id;
+            #[allow(clippy::cast_sign_loss)]
+            let tx_id = TxId::from(copy.tx_id as u64);
+            let output: WalletOutput = serde_json::from_str(&copy.wallet_output_json).map_err(WalletDbError::from)?;
 
             info!(
                 target: "audit",
@@ -1459,10 +1506,11 @@ mod tests {
         for byte in input_bytes {
             let output = test_wallet_output(10_000, *byte);
             // An input another send released can be spent again.
-            if let Some((output_id, ..)) =
-                db::get_output_info_by_hash_for_account(conn, wallet.account_id, &output.output_hash(), u64::MAX)
-                    .expect("lookup")
+            if let Some(copy) = db::get_output_copies(conn, wallet.account_id, &output.output_hash())
+                .expect("lookup")
+                .pop()
             {
+                let output_id = copy.id;
                 db::lock_output(conn, output_id, &request_id, Utc::now()).expect("lock input");
                 input_hashes.push(output.output_hash());
                 inputs.push(TransactionInput::new_with_output_hash(
@@ -2925,11 +2973,7 @@ mod tests {
         // A send in play, likewise.
         let send = record_send(&wallet, &conn, 2, &[3], Some(9));
         insert_locked(&conn, 22, 60, &send.request_id);
-        let send_input =
-            db::get_output_info_by_hash_for_account(&conn, wallet.account_id, &send.input_hashes[0], u64::MAX)
-                .expect("lookup")
-                .expect("send input")
-                .0;
+        let send_input = output_row(&conn, &send.input_hashes[0]).0;
 
         let tx = conn.transaction().expect("tx");
         let info = crate::scan::reorg::rollback_from_height(&tx, wallet.account_id, 50, None).expect("rollback");
@@ -2977,6 +3021,19 @@ mod tests {
         .expect("query")
         .collect::<Result<_, _>>()
         .expect("rows")
+    }
+
+    /// Block heights of the account's history entries, lowest first.
+    fn history_heights(conn: &Connection, account_id: i64) -> Vec<i64> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT block_height FROM displayed_transactions WHERE account_id = :account_id ORDER BY block_height",
+            )
+            .expect("prepare");
+        stmt.query_map(named_params! { ":account_id": account_id }, |row| row.get(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows")
     }
 
     fn rollback_to(conn: &mut Connection, account_id: i64, height: u64) {
@@ -3110,6 +3167,11 @@ mod tests {
             "the first instance keeps the original tx_id"
         );
         assert_eq!(ledger(&conn, wallet.account_id), (2, 2, 0));
+        assert_eq!(
+            history_heights(&conn, wallet.account_id),
+            vec![10, 20, 30, 40],
+            "one history entry per credit and per spend"
+        );
 
         // Reading every block again changes nothing, the tx_ids included.
         process(&mut processor(&wallet, false), &conn, wallet.account_id, &blocks);
@@ -3161,7 +3223,7 @@ mod tests {
         let other = WalletType::SeedWords(SeedWordsWallet::construct_new(CipherSeed::random()).unwrap());
         create_account(&conn, "second", &other, "password").unwrap();
         let second_id = get_account_by_name(&conn, "second").unwrap().unwrap().id;
-        // The same view key for both, so the two rows share a tx_id as well.
+        // The same view key for both, so the tx_id derivation has to step past the first account's id.
         let mut processor = BlockProcessor::new(
             vec![
                 (wallet.account_id, wallet.view_key.clone()),
@@ -3183,7 +3245,17 @@ mod tests {
         for account_id in [wallet.account_id, second_id] {
             assert_eq!(ledger(&conn, account_id), (1, 1, 0));
             assert_eq!(instances(&conn, account_id, &a).len(), 1);
+            assert_eq!(
+                history_heights(&conn, account_id),
+                vec![10, 20],
+                "each account keeps its own receive and spend entries"
+            );
         }
+        assert_ne!(
+            instances(&conn, wallet.account_id, &a)[0].1,
+            instances(&conn, second_id, &a)[0].1,
+            "tx_ids are unique across accounts"
+        );
     }
 
     #[test]
@@ -3285,5 +3357,121 @@ mod tests {
         assert_eq!(rows[0].2.as_deref(), Some(first_spend.block_hash.as_slice()));
         assert_eq!(rows[1].2.as_deref(), Some(second_spend.block_hash.as_slice()));
         assert_eq!(ledger(&conn, wallet.account_id), (2, 2, 0));
+        assert_eq!(history_heights(&conn, wallet.account_id), vec![10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn an_older_copy_found_after_a_newer_one_gets_its_own_row_and_tx_id() {
+        // FastSync stores the unspent copy first, then backfill finds the older copy and its spend.
+        let wallet = test_wallet();
+        let conn = wallet.pool.get().expect("conn");
+        let a = test_wallet_output(10_000, 1);
+        process(
+            &mut processor(&wallet, false),
+            &conn,
+            wallet.account_id,
+            &[block(30, vec![a.clone()], Vec::new())],
+        );
+        let mut backfill = processor(&wallet, false);
+        backfill.set_backfill_mode(true);
+        let spend = block(20, Vec::new(), vec![a.output_hash()]);
+        process(
+            &mut backfill,
+            &conn,
+            wallet.account_id,
+            &[block(10, vec![a.clone()], Vec::new()), spend.clone()],
+        );
+
+        let rows = instances(&conn, wallet.account_id, &a);
+        assert_eq!(rows.len(), 2);
+        assert_ne!(rows[0].1, rows[1].1);
+        assert_eq!(rows[0].2.as_deref(), Some(spend.block_hash.as_slice()));
+        assert_eq!(rows[1].2, None);
+        assert_eq!(ledger(&conn, wallet.account_id), (2, 1, 10_000));
+    }
+
+    #[test]
+    fn an_input_in_an_earlier_result_of_its_block_than_its_output_is_debited() {
+        let wallet = test_wallet();
+        let conn = wallet.pool.get().expect("conn");
+        let a = test_wallet_output(10_000, 1);
+        // Created and spent in block 20, whose results arrive input first.
+        let input_first = block(20, Vec::new(), vec![a.output_hash()]);
+        let output_second = block(20, vec![a.clone()], Vec::new());
+        process(
+            &mut processor(&wallet, false),
+            &conn,
+            wallet.account_id,
+            &[input_first, output_second],
+        );
+
+        assert_eq!(ledger(&conn, wallet.account_id), (1, 1, 0));
+        assert_eq!(output_row(&conn, &a.output_hash()).1, "SPENT");
+    }
+
+    #[test]
+    fn an_older_spent_unconfirmed_copy_is_resolved_spent_by_its_newer_copy() {
+        let wallet = test_wallet();
+        let conn = wallet.pool.get().expect("conn");
+        let a = test_wallet_output(10_000, 1);
+        let newer = block(30, vec![a.clone()], Vec::new());
+        process(
+            &mut processor(&wallet, false),
+            &conn,
+            wallet.account_id,
+            std::slice::from_ref(&newer),
+        );
+        let mut backfill = processor(&wallet, false);
+        backfill.set_backfill_mode(true);
+        process(
+            &mut backfill,
+            &conn,
+            wallet.account_id,
+            &[block(10, vec![a.clone()], Vec::new())],
+        );
+
+        assert_eq!(
+            db::resolve_superseded_spent_unconfirmed(&conn, wallet.account_id).expect("resolve"),
+            1
+        );
+        // Never asked about again, and never marked unspent.
+        assert!(
+            db::get_unresolved_spent_unconfirmed_outputs(&conn, wallet.account_id)
+                .expect("unresolved")
+                .is_empty()
+        );
+        let rows = instances(&conn, wallet.account_id, &a);
+        assert_eq!(rows[0].2.as_deref(), Some(newer.block_hash.as_slice()));
+        assert_eq!(rows[1].2, None);
+        assert_eq!(ledger(&conn, wallet.account_id), (2, 1, 10_000));
+        assert_eq!(
+            db::resolve_superseded_spent_unconfirmed(&conn, wallet.account_id).expect("resolve again"),
+            0
+        );
+        assert_eq!(ledger(&conn, wallet.account_id), (2, 1, 10_000));
+    }
+
+    #[test]
+    fn only_the_newest_of_two_spent_unconfirmed_copies_is_left_for_the_base_node() {
+        let wallet = test_wallet();
+        let conn = wallet.pool.get().expect("conn");
+        let a = test_wallet_output(10_000, 1);
+        let mut backfill = processor(&wallet, false);
+        backfill.set_backfill_mode(true);
+        process(
+            &mut backfill,
+            &conn,
+            wallet.account_id,
+            &[
+                block(10, vec![a.clone()], Vec::new()),
+                block(30, vec![a.clone()], Vec::new()),
+            ],
+        );
+
+        db::resolve_superseded_spent_unconfirmed(&conn, wallet.account_id).expect("resolve");
+        let unresolved = db::get_unresolved_spent_unconfirmed_outputs(&conn, wallet.account_id).expect("unresolved");
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].mined_in_block_height, 30);
+        assert_eq!(ledger(&conn, wallet.account_id), (2, 1, 10_000));
     }
 }
