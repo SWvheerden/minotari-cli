@@ -22,6 +22,7 @@ use tari_transaction_components::MicroMinotari;
 use tari_transaction_components::transaction_components::WalletOutput;
 use tari_transaction_components::utxo_selection::UtxoValue;
 use tari_utilities::ByteArray;
+use zeroize::Zeroizing;
 
 /// The `tx_id` for a new row of the account's output `output_hash`, mined at
 /// `block_height`.
@@ -70,7 +71,7 @@ pub fn output_tx_id(
         let tx_id = if counter == 0 {
             TxId::new_deterministic(account_view_key.as_bytes(), output_hash)
         } else {
-            let key = [account_view_key.as_bytes(), &counter.to_le_bytes()].concat();
+            let key = Zeroizing::new([account_view_key.as_bytes(), &counter.to_le_bytes()].concat());
             TxId::new_deterministic(&key, output_hash)
         }
         .as_i64_wrapped();
@@ -93,6 +94,9 @@ pub fn output_tx_id(
 /// scan re-reads the tip every poll cycle, and a large block arrives as several
 /// results), so an existing row is returned with `newly_inserted = false`; the
 /// caller then skips the detection event, webhook and credit.
+///
+/// `output_hash` keys the row and derives its `tx_id`; the caller checks it is
+/// `output.output_hash()`, so both come from the same value.
 #[allow(clippy::too_many_arguments)]
 pub fn insert_output(
     conn: &Connection,

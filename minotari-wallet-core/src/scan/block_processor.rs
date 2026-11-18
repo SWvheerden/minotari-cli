@@ -435,6 +435,18 @@ impl<E: EventSender> BlockProcessor<E> {
                 continue;
             }
 
+            // The listed hash keys the output's row and its tx_id, so it must be the
+            // output's own: one output listed under several hashes is one output.
+            if *hash != output.output_hash() {
+                warn!(
+                    target: "audit",
+                    account_id = account_id,
+                    block_height = block.height;
+                    "Wallet output listed under a hash that is not its own; ignoring it"
+                );
+                continue;
+            }
+
             let memo = MemoInfo::from_output(output);
 
             // Compute the payment reference from block hash and output hash
@@ -843,6 +855,14 @@ impl<E: EventSender> BlockProcessor<E> {
     /// carried into a rollback or the next poll.
     pub fn finish_batch(&mut self) {
         self.close_unmatched_inputs();
+    }
+
+    /// Drops what the processor holds of a batch whose transaction was rolled back.
+    pub fn discard_batch(&mut self) {
+        self.current_block = None;
+        self.send_block = None;
+        self.unmatched_inputs = None;
+        self.wallet_events.clear();
     }
 
     #[cfg(test)]
@@ -3782,5 +3802,26 @@ mod tests {
             )
             .expect("count");
         assert_eq!(spend_entries, 1, "no second entry for the same spend");
+    }
+
+    #[test]
+    fn an_output_listed_under_a_hash_that_is_not_its_own_is_ignored() {
+        let wallet = test_wallet();
+        let conn = wallet.pool.get().expect("conn");
+        let a = test_wallet_output(10_000, 1);
+        let mut listed = block(10, Vec::new(), Vec::new());
+        listed.wallet_outputs = vec![(a.output_hash(), a.clone(), 0), (hash(99), a.clone(), 0)];
+        process(
+            &mut processor(&wallet, false),
+            &conn,
+            wallet.account_id,
+            std::slice::from_ref(&listed),
+        );
+
+        assert_eq!(ledger(&conn, wallet.account_id), (1, 0, 10_000));
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM outputs", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(rows, 1);
     }
 }
