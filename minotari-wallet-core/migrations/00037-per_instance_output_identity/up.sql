@@ -15,3 +15,6 @@ CREATE INDEX idx_balance_changes_caused_by_output
     ON balance_changes(caused_by_output_id) WHERE caused_by_output_id IS NOT NULL;
 CREATE INDEX idx_balance_changes_caused_by_input
     ON balance_changes(caused_by_input_id) WHERE caused_by_input_id IS NOT NULL;
+
+-- Finds outputs whose spend a reorg removed (a soft-deleted input record).
+CREATE INDEX idx_inputs_output_id_deleted ON inputs(output_id) WHERE deleted_at IS NOT NULL;
