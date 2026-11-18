@@ -864,6 +864,17 @@ impl ScanCoordinator {
     async fn run_post_scan(&self, targets: &[AccountSyncTarget]) -> Result<Vec<WalletEvent>, ScanError> {
         let mut wallet_events = Vec::new();
         for target in targets {
+            // A reorg leaves outputs whose spend it removed SpentUnconfirmed; caught
+            // up, the rescan has re-read every block that could spend them again.
+            match self.resolve_spent_unconfirmed(target).await {
+                Ok(()) => {},
+                Err(ScanError::Intermittent(e)) => warn!(
+                    account_id = target.account.id,
+                    error:% = e;
+                    "Base node request failed while verifying SpentUnconfirmed outputs; retrying next cycle"
+                ),
+                Err(e) => return Err(e),
+            }
             let scanned_height = target.next_block_to_scan.saturating_sub(1);
             let monitor_res = match target
                 .transaction_monitor
@@ -1182,40 +1193,8 @@ impl ScanCoordinator {
             return Ok((all_events, more_blocks));
         }
 
-        // Resolve SpentUnconfirmed outputs:
-        // 1. Mark outputs with matching inputs as Spent
-        // 2. Mark older copies of a re-created output as Spent
-        // 3. Verify remaining outputs against the base node
         for target in &targets {
-            let unresolved = {
-                let mut conn = self.pool.get().map_err(|e| ScanError::DbError(e.into()))?;
-                let tx = conn
-                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                    .map_err(|e| ScanError::DbError(WalletDbError::from(e)))?;
-                let marked_spent = crate::db::resolve_spent_unconfirmed_with_inputs(&tx, target.account.id)
-                    .map_err(ScanError::DbError)?;
-                let superseded = crate::db::resolve_superseded_spent_unconfirmed(&tx, target.account.id)
-                    .map_err(ScanError::DbError)?;
-                info!(
-                    account_id = target.account.id,
-                    marked_spent = marked_spent,
-                    superseded = superseded;
-                    "Resolved SpentUnconfirmed outputs with matching inputs or a newer copy"
-                );
-                let unresolved = crate::db::get_unresolved_spent_unconfirmed_outputs(&tx, target.account.id)
-                    .map_err(ScanError::DbError)?;
-                tx.commit().map_err(|e| ScanError::DbError(WalletDbError::from(e)))?;
-                unresolved
-            };
-
-            if !unresolved.is_empty() {
-                info!(
-                    account_id = target.account.id,
-                    count = unresolved.len();
-                    "Verifying remaining SpentUnconfirmed outputs against base node"
-                );
-                self.verify_spent_unconfirmed_outputs(target, &unresolved).await?;
-            }
+            self.resolve_spent_unconfirmed(target).await?;
 
             self.events
                 .send(ProcessingEvent::ScanStatus(ScanStatusEvent::FastSyncPhaseCompleted {
@@ -1582,6 +1561,44 @@ impl ScanCoordinator {
         }
 
         Ok((all_events, stop, total_scanned))
+    }
+
+    /// Resolves the account's SpentUnconfirmed outputs (left by backfill, or by a
+    /// reorg that removed their spends):
+    /// 1. Mark outputs with matching inputs as Spent
+    /// 2. Mark older copies of a re-created output as Spent
+    /// 3. Verify remaining outputs against the base node
+    async fn resolve_spent_unconfirmed(&self, target: &AccountSyncTarget) -> Result<(), ScanError> {
+        let unresolved = {
+            let mut conn = self.pool.get().map_err(|e| ScanError::DbError(e.into()))?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| ScanError::DbError(WalletDbError::from(e)))?;
+            let marked_spent =
+                crate::db::resolve_spent_unconfirmed_with_inputs(&tx, target.account.id).map_err(ScanError::DbError)?;
+            let superseded =
+                crate::db::resolve_superseded_spent_unconfirmed(&tx, target.account.id).map_err(ScanError::DbError)?;
+            info!(
+                account_id = target.account.id,
+                marked_spent = marked_spent,
+                superseded = superseded;
+                "Resolved SpentUnconfirmed outputs with matching inputs or a newer copy"
+            );
+            let unresolved = crate::db::get_unresolved_spent_unconfirmed_outputs(&tx, target.account.id)
+                .map_err(ScanError::DbError)?;
+            tx.commit().map_err(|e| ScanError::DbError(WalletDbError::from(e)))?;
+            unresolved
+        };
+
+        if !unresolved.is_empty() {
+            info!(
+                account_id = target.account.id,
+                count = unresolved.len();
+                "Verifying remaining SpentUnconfirmed outputs against base node"
+            );
+            self.verify_spent_unconfirmed_outputs(target, &unresolved).await?;
+        }
+        Ok(())
     }
 
     /// Verifies remaining SpentUnconfirmed outputs against the base node using

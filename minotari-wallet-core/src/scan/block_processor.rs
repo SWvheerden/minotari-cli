@@ -836,6 +836,18 @@ impl<E: EventSender> BlockProcessor<E> {
         Ok(request_ids)
     }
 
+    /// Ends the batch: its last block is complete (a base node never splits a
+    /// block across batches), so its unmatched inputs are settled now rather than
+    /// carried into a rollback or the next poll.
+    pub fn finish_batch(&mut self) {
+        self.close_unmatched_inputs();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_unmatched_inputs(&self) -> bool {
+        self.unmatched_inputs.is_some()
+    }
+
     /// Ends the open block's unmatched inputs. One that lists a copy already spent
     /// in another block is logged: that spend cannot happen again (a reorg would
     /// have removed its record first), so the input is ignored.
@@ -1711,6 +1723,7 @@ mod tests {
         for block in blocks {
             processor.process_block(conn, block, account_id).expect("process block");
         }
+        processor.finish_batch();
         processor.match_sends(conn, false).expect("match sends");
         if let Some(last) = blocks.last() {
             processor
@@ -3148,8 +3161,9 @@ mod tests {
         let conn = wallet.pool.get().expect("conn");
         let a = test_wallet_output(10_000, 1);
         let spend = block(20, Vec::new(), vec![a.output_hash()]);
+        let mut re_listing = processor(&wallet, false);
         process(
-            &mut processor(&wallet, false),
+            &mut re_listing,
             &conn,
             wallet.account_id,
             &[
@@ -3160,6 +3174,8 @@ mod tests {
         );
 
         // Logged as a warning and skipped: no second input row, debit or status change.
+        // Nothing of the batch's last block is left open for a rollback or the next poll.
+        assert!(!re_listing.has_unmatched_inputs());
         assert_eq!(ledger(&conn, wallet.account_id), (1, 1, 0));
         let rows = instances(&conn, wallet.account_id, &a);
         assert_eq!(rows.len(), 1);
@@ -3471,8 +3487,8 @@ mod tests {
         let rows = instances(&conn, wallet.account_id, &a);
         assert_eq!(
             rows[0].2.as_deref(),
-            Some(block(10, Vec::new(), Vec::new()).block_hash.as_slice()),
-            "the inferred spend is in the copy's own block"
+            Some(newer.block_hash.as_slice()),
+            "the inferred spend is in the newer copy's block"
         );
         assert_eq!(rows[1].2, None);
         assert_eq!(ledger(&conn, wallet.account_id), (2, 1, 10_000));
@@ -3539,6 +3555,8 @@ mod tests {
             wallet.account_id,
             std::slice::from_ref(&newer),
         );
+        // What the scan's post-scan pass does once caught up.
+        db::resolve_superseded_spent_unconfirmed(&conn, wallet.account_id).expect("resolve");
 
         assert_eq!(ledger(&conn, wallet.account_id).2, before);
         assert!(
@@ -3612,5 +3630,49 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].2.as_deref(), Some(input_first.block_hash.as_slice()));
         assert_eq!(ledger(&conn, wallet.account_id), (2, 2, 0));
+    }
+
+    #[test]
+    fn a_reorg_between_an_older_copy_and_its_spend_unsettles_an_inferred_spend() {
+        // The copy at 10 was inferred spent (its newer copy is at 30). A fork at 15
+        // removes the newer copy, and the new chain does not spend the copy at 10.
+        let wallet = test_wallet();
+        let mut conn = wallet.pool.get().expect("conn");
+        let a = test_wallet_output(10_000, 1);
+        process(
+            &mut processor(&wallet, false),
+            &conn,
+            wallet.account_id,
+            &[block(30, vec![a.clone()], Vec::new())],
+        );
+        let mut backfill = processor(&wallet, false);
+        backfill.set_backfill_mode(true);
+        process(
+            &mut backfill,
+            &conn,
+            wallet.account_id,
+            &[block(10, vec![a.clone()], Vec::new())],
+        );
+        db::resolve_superseded_spent_unconfirmed(&conn, wallet.account_id).expect("resolve");
+
+        rollback_to(&mut conn, wallet.account_id, 15);
+        let fork = BlockScanResult {
+            block_hash: hash(98),
+            ..block(15, Vec::new(), Vec::new())
+        };
+        process(
+            &mut processor(&wallet, false),
+            &conn,
+            wallet.account_id,
+            std::slice::from_ref(&fork),
+        );
+        db::resolve_superseded_spent_unconfirmed(&conn, wallet.account_id).expect("resolve");
+
+        let (_, status, ..) = output_row(&conn, &a.output_hash());
+        assert_eq!(status, "SPENT_UNCONFIRMED", "not left spent; the base node settles it");
+        let unresolved = db::get_unresolved_spent_unconfirmed_outputs(&conn, wallet.account_id).expect("unresolved");
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].mined_in_block_height, 10);
+        assert_eq!(ledger(&conn, wallet.account_id).2, 10_000, "the copy's value is back");
     }
 }

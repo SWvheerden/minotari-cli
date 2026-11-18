@@ -117,6 +117,8 @@ impl<E: EventSender + Clone + Send + 'static> ScanDbHandler<E> {
                     .map_err(|e| WalletDbError::Unexpected(e.to_string()))?;
             }
 
+            processor.finish_batch();
+
             // Match the wallet's sends in the last block of the batch. The node
             // sends blocks whole (see above), so that block is complete; still,
             // defensively, a mismatch there does not reject a send until the
@@ -236,6 +238,21 @@ mod tests {
             .await
             .expect_err("a batch starting past the resume height must abort");
         assert!(err.to_string().contains("non-contiguous"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn no_unmatched_input_of_a_batch_outlives_it() {
+        let (mut handler, account_id, _dir) = handler("unmatched.db");
+
+        let mut last = block(101);
+        last.inputs = vec![FixedHash::from([7u8; 32])];
+        handler
+            .process_blocks(Arc::new(vec![block(100), last]), account_id, false, None, 100)
+            .await
+            .expect("batch");
+
+        let processor = handler.block_processor.as_ref().expect("processor");
+        assert!(!processor.has_unmatched_inputs());
     }
 
     #[tokio::test]

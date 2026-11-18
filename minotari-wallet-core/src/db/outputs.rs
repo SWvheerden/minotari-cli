@@ -1339,25 +1339,30 @@ pub fn resolve_spent_unconfirmed_with_inputs(conn: &Connection, account_id: i64)
 /// Marks the account's `SpentUnconfirmed` rows that have a newer active copy of
 /// their hash `Spent`, with an input record and its debit. An older copy was
 /// spent before the newer one was created, and the base node only answers for
-/// the newest, so it is not asked. The exact spend block is not known, so the
-/// input is recorded in the copy's own block: only a reorg that removes the copy
-/// itself (and with it the row) removes this spend. A block later than that could
-/// be rolled back without the real spend ever being read again.
+/// the newest, so it is not asked. The exact spend block is not known: the input
+/// is recorded in the block that mined the next copy, the latest block the spend
+/// can be in, so a reorg that removes the evidence (the next copy) removes the
+/// guess too. The rollback then returns the row to `SpentUnconfirmed` (see
+/// [`unsettle_spent_outputs_without_input`]), and it is settled again: by the
+/// rescan if its spend is re-mined, by this function if a newer copy survives,
+/// or by the base node.
 ///
 /// Returns the number of rows resolved.
 pub fn resolve_superseded_spent_unconfirmed(conn: &Connection, account_id: i64) -> WalletDbResult<u64> {
     let superseded: Vec<(i64, i64, i64, Vec<u8>)> = {
         let mut stmt = conn.prepare_cached(
             r#"
-            SELECT o.id, o.value, o.mined_in_block_height, o.mined_in_block_hash
+            SELECT o.id, o.value, n.mined_in_block_height, n.mined_in_block_hash
             FROM outputs o
+            JOIN outputs n ON n.id = (
+                SELECT c.id FROM outputs c
+                WHERE c.account_id = o.account_id AND c.output_hash = o.output_hash AND c.deleted_at IS NULL
+                  AND c.mined_in_block_height > o.mined_in_block_height
+                  AND c.status NOT IN (:unconfirmed, :rejected)
+                ORDER BY c.mined_in_block_height, c.id
+                LIMIT 1
+            )
             WHERE o.account_id = :account_id AND o.status = :spent_unconfirmed AND o.deleted_at IS NULL
-              AND EXISTS (
-                  SELECT 1 FROM outputs c
-                  WHERE c.account_id = o.account_id AND c.output_hash = o.output_hash AND c.deleted_at IS NULL
-                    AND c.mined_in_block_height > o.mined_in_block_height
-                    AND c.status NOT IN (:unconfirmed, :rejected)
-              )
             "#,
         )?;
         let rows = stmt.query_map(
@@ -1401,6 +1406,35 @@ pub fn resolve_superseded_spent_unconfirmed(conn: &Connection, account_id: i64) 
         update_output_status(conn, *output_id, OutputStatus::Spent)?;
     }
     Ok(superseded.len() as u64)
+}
+
+/// After a reorg removed their spends, turns the account's surviving `SPENT`
+/// rows without an active input record back into `SpentUnconfirmed`, so they are
+/// settled again instead of staying spent on evidence that is gone (such as an
+/// inferred spend, see [`resolve_superseded_spent_unconfirmed`]). The inputs of
+/// a send that can still land (reset to be rebroadcast) are left `SPENT`, as
+/// before: the scan spends them again when the send is re-mined.
+///
+/// Returns the number of rows changed.
+pub fn unsettle_spent_outputs_without_input(conn: &Connection, account_id: i64) -> WalletDbResult<u64> {
+    let live = lock_holder_is_live_sql("outputs.locked_by_request_id");
+    let changed = conn.execute(
+        &format!(
+            r#"
+            UPDATE outputs
+            SET status = :spent_unconfirmed
+            WHERE account_id = :account_id AND status = :spent AND deleted_at IS NULL
+              AND NOT EXISTS (SELECT 1 FROM inputs i WHERE i.output_id = outputs.id AND i.deleted_at IS NULL)
+              AND NOT (locked_by_request_id IS NOT NULL AND {live})
+            "#
+        ),
+        named_params! {
+            ":spent_unconfirmed": OutputStatus::SpentUnconfirmed.to_string(),
+            ":spent": OutputStatus::Spent.to_string(),
+            ":account_id": account_id,
+        },
+    )?;
+    Ok(changed as u64)
 }
 
 /// Returned data for an unresolved SpentUnconfirmed output.
