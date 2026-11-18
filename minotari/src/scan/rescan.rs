@@ -11,6 +11,7 @@ use crate::{
     config::defaults::WalletConfig,
     db::{self, WalletDbError, init_db},
     scan::{EventReceiver, ScanError, ScanMode, Scanner, reorg::rollback_from_height},
+    utils::network::ensure_global_network,
     webhooks::WebhookTriggerConfig,
 };
 
@@ -79,6 +80,8 @@ async fn rollback_and_build_scanner(
     mode: ScanMode,
     cancel_token: Option<CancellationToken>,
 ) -> Result<Scanner, ScanError> {
+    // The scanner hashes outputs with the process-global network; check it before rolling anything back.
+    ensure_global_network(config.network)?;
     let webhook_config = config.webhook.url.clone().map(|url| WebhookTriggerConfig {
         url,
         send_only_event_types: config.webhook.send_only_event_types.clone(),
@@ -357,6 +360,7 @@ mod tests {
             database_path,
             batch_size: 5,
             burn_proofs_dir: Some(dir.path().join("burn_proofs")),
+            network: tari_common::configuration::Network::get_current(),
             ..WalletConfig::default()
         };
         Setup {

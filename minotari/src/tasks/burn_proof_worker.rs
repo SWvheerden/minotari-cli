@@ -34,6 +34,7 @@ use crate::{
     },
     http::{HttpError, WalletHttpClient},
     transactions::burn::proof_files::{proof_file_path, remove_proof_file},
+    utils::network::ensure_global_network,
 };
 
 const LOG_TARGET: &str = "wallet::tasks::burn_proof_worker";
@@ -54,14 +55,16 @@ impl BurnProofWorker {
         burn_proofs_dir: PathBuf,
         network: Network,
         required_confirmations: u64,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, anyhow::Error> {
+        // The proof check compares output hashes, which take their domain from the process-global network.
+        ensure_global_network(network)?;
+        Ok(Self {
             db_pool,
             client,
             burn_proofs_dir,
             consensus_manager: ConsensusManager::builder(network).build(),
             required_confirmations,
-        }
+        })
     }
 
     pub fn run(self, mut shutdown_rx: broadcast::Receiver<()>) -> JoinHandle<Result<(), anyhow::Error>> {
