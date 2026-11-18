@@ -690,6 +690,7 @@ impl<E: EventSender> BlockProcessor<E> {
     /// Processes all inputs in the block to detect spent outputs.
     ///
     /// For each input that references a wallet-owned output:
+    /// - Picks the output row it spends (see [`db::get_output_info_by_hash_for_account`])
     /// - Inserts the input record into the database
     /// - Records the balance change (debit)
     /// - Updates the output status to Spent
@@ -706,8 +707,25 @@ impl<E: EventSender> BlockProcessor<E> {
     ) -> Result<Vec<String>, BlockProcessorError> {
         let mut request_ids = Vec::new();
         for input_hash in &block.inputs {
-            let Some((output_id, tx_id, output)) = db::get_output_info_by_hash_for_account(tx, account_id, input_hash)?
+            // Already recorded for this block: a re-read, a later result of it, or a repeat within one.
+            if db::is_output_spent_in_block(tx, account_id, input_hash, block.block_hash.as_slice())? {
+                continue;
+            }
+            let Some((output_id, tx_id, output)) =
+                db::get_output_info_by_hash_for_account(tx, account_id, input_hash, block.height)?
             else {
+                // Nothing left to spend. A spend already recorded in another block
+                // cannot happen again (a reorg would have removed that record first).
+                if let Some((_, spent_in_block)) = db::get_output_spend(tx, account_id, input_hash)? {
+                    warn!(
+                        target: "audit",
+                        account_id = account_id,
+                        block_height = block.height,
+                        block_hash = &*hex::encode(block.block_hash),
+                        spent_in_block_hash = &*hex::encode(&spent_in_block);
+                        "Input lists a wallet output already spent in another block; ignoring it"
+                    );
+                }
                 continue;
             };
 
@@ -1050,12 +1068,8 @@ impl<E: EventSender> BlockProcessor<E> {
             reversal_of_balance_change_id: None,
             is_reversed: false,
         };
-
-        if self.backfill_mode {
-            db::insert_balance_change_if_not_exists(tx, &change)?;
-        } else {
-            db::insert_balance_change(tx, &change)?;
-        }
+        // One debit per input row, however often its block is read.
+        db::insert_balance_change_if_not_exists(tx, &change)?;
         Ok(change)
     }
 
@@ -1442,7 +1456,8 @@ mod tests {
             let output = test_wallet_output(10_000, *byte);
             // An input another send released can be spent again.
             if let Some((output_id, ..)) =
-                db::get_output_info_by_hash_for_account(conn, wallet.account_id, &output.output_hash()).expect("lookup")
+                db::get_output_info_by_hash_for_account(conn, wallet.account_id, &output.output_hash(), u64::MAX)
+                    .expect("lookup")
             {
                 db::lock_output(conn, output_id, &request_id, Utc::now()).expect("lock input");
                 input_hashes.push(output.output_hash());
@@ -2906,10 +2921,11 @@ mod tests {
         // A send in play, likewise.
         let send = record_send(&wallet, &conn, 2, &[3], Some(9));
         insert_locked(&conn, 22, 60, &send.request_id);
-        let send_input = db::get_output_info_by_hash_for_account(&conn, wallet.account_id, &send.input_hashes[0])
-            .expect("lookup")
-            .expect("send input")
-            .0;
+        let send_input =
+            db::get_output_info_by_hash_for_account(&conn, wallet.account_id, &send.input_hashes[0], u64::MAX)
+                .expect("lookup")
+                .expect("send input")
+                .0;
 
         let tx = conn.transaction().expect("tx");
         let info = crate::scan::reorg::rollback_from_height(&tx, wallet.account_id, 50, None).expect("rollback");

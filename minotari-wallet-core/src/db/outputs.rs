@@ -714,6 +714,36 @@ pub fn get_output_spend(
     })
 }
 
+/// Whether the scan already recorded a spend of the account's output
+/// `output_hash` in the block `block_hash` (an active input record there).
+pub fn is_output_spent_in_block(
+    conn: &Connection,
+    account_id: i64,
+    output_hash: &FixedHash,
+    block_hash: &[u8],
+) -> WalletDbResult<bool> {
+    let spent: bool = conn.query_row(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 FROM inputs i
+            JOIN outputs o ON i.output_id = o.id
+            WHERE o.account_id = :account_id
+              AND o.output_hash = :hash
+              AND o.deleted_at IS NULL
+              AND i.deleted_at IS NULL
+              AND i.mined_in_block_hash = :block_hash
+        )
+        "#,
+        named_params! {
+            ":account_id": account_id,
+            ":hash": output_hash.as_slice(),
+            ":block_hash": block_hash,
+        },
+        |row| row.get(0),
+    )?;
+    Ok(spent)
+}
+
 /// Hashes of the wallet's outputs the scan saw spent in the block at `height`
 /// with `block_hash` (active input records).
 pub fn get_output_hashes_spent_in_block(
@@ -1047,22 +1077,41 @@ pub fn revert_change_outputs_from_height(
     Ok(outputs_to_revert)
 }
 
+/// The account's output row that an input of `output_hash` in a block at
+/// `spend_height` spends: the oldest active row mined at or below that height
+/// that is not spent yet. An `UNCONFIRMED` or `REJECTED` change row was never
+/// mined (its height 0 is a sentinel), so it is never spent here.
+///
+/// "Not spent" means no active input record: a reorg soft-deletes the input of
+/// a removed block but leaves the row's status `SPENT`. A hash re-created after
+/// a spend has one row per instance, so each spend consumes its own row.
 pub fn get_output_info_by_hash_for_account(
     conn: &Connection,
     account_id: i64,
     output_hash: &FixedHash,
+    spend_height: u64,
 ) -> WalletDbResult<Option<(i64, TxId, WalletOutput)>> {
+    #[allow(clippy::cast_possible_wrap)]
+    let spend_height = spend_height.min(i64::MAX as u64) as i64;
     let mut stmt = conn.prepare_cached(
         r#"
-        SELECT id, tx_id, wallet_output_json
-        FROM outputs
-        WHERE account_id = :account_id AND output_hash = :output_hash AND deleted_at IS NULL
+        SELECT o.id, o.tx_id, o.wallet_output_json
+        FROM outputs o
+        WHERE o.account_id = :account_id AND o.output_hash = :output_hash AND o.deleted_at IS NULL
+          AND o.mined_in_block_height <= :spend_height
+          AND o.status NOT IN (:unconfirmed, :rejected)
+          AND NOT EXISTS (SELECT 1 FROM inputs i WHERE i.output_id = o.id AND i.deleted_at IS NULL)
+        ORDER BY o.mined_in_block_height ASC, o.id ASC
+        LIMIT 1
         "#,
     )?;
 
     let rows = stmt.query(named_params! {
         ":account_id": account_id,
         ":output_hash": output_hash.as_slice(),
+        ":spend_height": spend_height,
+        ":unconfirmed": OutputStatus::Unconfirmed.to_string(),
+        ":rejected": OutputStatus::Rejected.to_string(),
     })?;
     let row: Option<WalletOutputRow> = from_rows(rows).next().transpose()?;
     let data = match row {
