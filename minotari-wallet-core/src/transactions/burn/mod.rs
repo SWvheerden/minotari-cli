@@ -48,6 +48,7 @@ use crate::{
         idempotency::{IdempotencyBinding, IdempotencyConflict, IdempotencyOperation, RequestFingerprint},
         input_selector::map_change_required_error,
     },
+    utils::network::ensure_global_network,
 };
 
 /// Result returned from a successful burn transaction build.
@@ -126,6 +127,7 @@ pub fn create_burn_tx(
     password: &str,
     params: BurnTxParams,
 ) -> Result<BurnTxResult, anyhow::Error> {
+    ensure_global_network(network)?;
     let Some(claim_public_key) = params.claim_public_key.as_ref() else {
         return Err(anyhow!("claim_public_key is required to generate a burn proof"));
     };
@@ -691,7 +693,7 @@ pub(crate) mod tests {
             confirmation_window: 100,
         };
 
-        let result = create_burn_tx(&account, &mut conn, Network::LocalNet, "pass", params).expect("burn builds");
+        let result = create_burn_tx(&account, &mut conn, Network::get_current(), "pass", params).expect("burn builds");
 
         let tx = &result.transaction;
         let sum = |keys: Vec<CompressedPublicKey>| {
@@ -730,6 +732,40 @@ pub(crate) mod tests {
         );
         assert_eq!(result.new_burn_proof.claim_public_key, claim_public_key.to_hex());
         assert_eq!(tx.body.outputs().len(), 2, "an L2 burn relies on its change output");
+    }
+
+    #[test]
+    fn a_burn_for_another_network_than_the_global_one_is_refused_before_locking() {
+        let (pool, account, _temp) = setup_funded_account(1_000_000);
+        let mut conn = pool.get().expect("conn");
+        let other = crate::utils::network::a_network_other_than_the_global_one();
+        let params = BurnTxParams {
+            account_id: account.id,
+            amount: MicroMinotari(10_000),
+            claim_public_key: Some(
+                KeyManager::new_random()
+                    .expect("l2 wallet")
+                    .get_random_key(None, None)
+                    .expect("key")
+                    .pub_key,
+            ),
+            sidechain_deployment_key: None,
+            fee_per_gram: MicroMinotari(5),
+            payment_id: None,
+            idempotency_key: Some(KEY.to_string()),
+            seconds_to_lock: 3600,
+            confirmation_window: 100,
+        };
+
+        let Err(err) = create_burn_tx(&account, &mut conn, other, "pass", params) else {
+            panic!("a burn for another network must be refused");
+        };
+
+        assert!(err.to_string().contains("process-global network"), "{err}");
+        let locked: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_transactions", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(locked, 0, "a refused burn must not lock funds");
     }
 
     /// What an L2 validator checks: the commitment mask signed the commitment together with the

@@ -34,6 +34,7 @@ use crate::{
     },
     http::{HttpError, WalletHttpClient},
     transactions::burn::proof_files::{proof_file_path, remove_proof_file},
+    utils::network::ensure_global_network,
 };
 
 const LOG_TARGET: &str = "wallet::tasks::burn_proof_worker";
@@ -54,14 +55,16 @@ impl BurnProofWorker {
         burn_proofs_dir: PathBuf,
         network: Network,
         required_confirmations: u64,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, anyhow::Error> {
+        // The proof check compares output hashes, which take their domain from the process-global network.
+        ensure_global_network(network)?;
+        Ok(Self {
             db_pool,
             client,
             burn_proofs_dir,
             consensus_manager: ConsensusManager::builder(network).build(),
             required_confirmations,
-        }
+        })
     }
 
     pub fn run(self, mut shutdown_rx: broadcast::Receiver<()>) -> JoinHandle<Result<(), anyhow::Error>> {
@@ -609,5 +612,23 @@ mod tests {
         fs::rename(&temporary, &final_path).await.unwrap();
         let published: CompleteClaimBurnProof = serde_json::from_slice(&fs::read(&final_path).await.unwrap()).unwrap();
         assert_eq!(published.claim_proof.output_proof, complete.claim_proof.output_proof);
+    }
+
+    #[test]
+    fn a_worker_for_another_network_than_the_global_one_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let other = if Network::get_current() == Network::LocalNet {
+            Network::Esmeralda
+        } else {
+            Network::LocalNet
+        };
+        let result = BurnProofWorker::new(
+            crate::db::init_db(dir.path().join("wallet.db")).expect("init db"),
+            WalletHttpClient::new("http://127.0.0.1:1".parse().expect("url")).expect("client"),
+            dir.path().to_path_buf(),
+            other,
+            3,
+        );
+        assert!(result.is_err());
     }
 }

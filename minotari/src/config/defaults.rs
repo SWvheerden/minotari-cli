@@ -63,7 +63,7 @@ pub struct WalletConfig {
 impl Default for WalletConfig {
     fn default() -> Self {
         Self {
-            network: Network::MainNet,
+            network: Network::default(),
             base_url: "https://rpc.tari.com".to_string(),
             database_path: PathBuf::from("data/wallet.db"),
             batch_size: 25,

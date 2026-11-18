@@ -63,7 +63,10 @@ use minotari::{
     api::{ApiAuth, accounts::LockFundsRequest, auth::API_TOKEN_ENV_VAR, resolve_api_token},
     cli::{ApplyArgs, Cli, Commands, DaemonArgs},
     commands::{abandon_send, burn::handle_burn_funds, validator_nodes},
-    config::{defaults::WalletConfig, loader::load_configuration},
+    config::{
+        defaults::WalletConfig,
+        loader::{load_configuration, set_global_network},
+    },
     daemon::{self, ApiServerConfig},
     db::{self, get_accounts, get_balance, init_db},
     log::{init_logging, mask_string},
@@ -109,6 +112,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let cli = Cli::parse();
     let config_obj = load_configuration(&cli.config, cli.network)?;
     let mut wallet_config = WalletConfig::load_from(&config_obj)?;
+    set_global_network(wallet_config.network)?;
     // A config file setting `confirmation_window = 0` would let the wallet spend
     // outputs from the block it is still scanning.
     wallet_config.enforce_minimum_confirmation_window();

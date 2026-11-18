@@ -122,6 +122,7 @@ use crate::{
         input_selector::{InputSelector, UtxoSelection, map_change_required_error},
         one_sided_transaction::{Recipient, check_recipient_networks, total_recipient_amount},
     },
+    utils::network::ensure_global_network,
 };
 use zeroize::Zeroizing;
 
@@ -355,6 +356,7 @@ impl TransactionSender {
         network: Network,
         confirmation_window: u64,
     ) -> Result<Self, anyhow::Error> {
+        ensure_global_network(network)?;
         let connection = db_pool.get()?;
         let account_of_processed_transaction: AccountRow = db::get_account_by_name(&connection, &account_name)?
             .ok_or_else(|| anyhow!("Account with name '{}' not found", account_name))?;
@@ -1581,12 +1583,12 @@ mod tests {
             .expect("build single-connection pool");
 
         let password = Zeroizing::new("pass".to_string());
-        let mut sender = TransactionSender::new(pool, "test".to_string(), password.clone(), Network::LocalNet, 3)
+        let mut sender = TransactionSender::new(pool, "test".to_string(), password.clone(), Network::get_current(), 3)
             .expect("build sender");
         let recipient = Recipient {
             address: sender
                 .account
-                .get_address(Network::LocalNet, &password)
+                .get_address(Network::get_current(), &password)
                 .expect("account address"),
             amount: MicroMinotari(1_000),
             payment_id: None,
@@ -1691,12 +1693,27 @@ mod tests {
         (pool, temp)
     }
 
+    #[test]
+    fn a_sender_for_another_network_than_the_global_one_is_refused() {
+        let (pool, _temp) = setup_funded_wallet(1);
+        let err = TransactionSender::new(
+            pool,
+            "test".to_string(),
+            Zeroizing::new(PASSWORD.to_string()),
+            crate::utils::network::a_network_other_than_the_global_one(),
+            100,
+        )
+        .err()
+        .expect("wrong network must be refused");
+        assert!(err.to_string().contains("process-global network"), "{err}");
+    }
+
     fn sender_for(pool: &SqlitePool) -> TransactionSender {
         TransactionSender::new(
             pool.clone(),
             "test".to_string(),
             Zeroizing::new(PASSWORD.to_string()),
-            Network::LocalNet,
+            Network::get_current(),
             100,
         )
         .expect("build sender")
@@ -1707,7 +1724,7 @@ mod tests {
     fn request(sender: &TransactionSender, key: &str, amount: u64) -> ProcessedTransaction {
         let address = sender
             .account
-            .get_address(Network::LocalNet, &sender.password)
+            .get_address(Network::get_current(), &sender.password)
             .expect("account address");
         ProcessedTransaction::new(
             None,
@@ -2566,7 +2583,7 @@ mod tests {
         let recipient = Recipient {
             address: sender
                 .account
-                .get_address(Network::LocalNet, &Zeroizing::new(PASSWORD.to_string()))
+                .get_address(Network::get_current(), &Zeroizing::new(PASSWORD.to_string()))
                 .expect("address"),
             amount: MicroMinotari(1_000),
             payment_id: None,
@@ -2605,7 +2622,7 @@ mod tests {
         let deposit = TariAddress::new_dual_address_with_default_features(
             CompressedPublicKey::from_secret_key(&PrivateKey::from(7u64)),
             CompressedPublicKey::from_secret_key(&PrivateKey::from(9u64)),
-            Network::LocalNet,
+            Network::get_current(),
         )
         .expect("address")
         .with_memo_field_payment_id(embedded.clone())
@@ -2632,7 +2649,7 @@ mod tests {
         let address = TariAddress::new_dual_address_with_default_features(
             CompressedPublicKey::from_secret_key(&PrivateKey::from(7u64)),
             CompressedPublicKey::from_secret_key(&PrivateKey::from(9u64)),
-            Network::LocalNet,
+            Network::get_current(),
         )
         .expect("address");
         let signed = SignedTransaction {
@@ -2689,12 +2706,12 @@ mod tests {
         let mut sender = sender_for(&pool);
         let sender_address = sender
             .account
-            .get_address(Network::LocalNet, &Zeroizing::new(PASSWORD.to_string()))
+            .get_address(Network::get_current(), &Zeroizing::new(PASSWORD.to_string()))
             .expect("address");
         let other = TariAddress::new_dual_address_with_default_features(
             CompressedPublicKey::from_secret_key(&PrivateKey::from(7u64)),
             CompressedPublicKey::from_secret_key(&PrivateKey::from(9u64)),
-            Network::LocalNet,
+            Network::get_current(),
         )
         .expect("address");
         let recipient = Recipient {
@@ -2858,7 +2875,7 @@ mod tests {
         tari_common_types::tari_address::TariAddress::new_dual_address(
             CompressedPublicKey::from_secret_key(&PrivateKey::from(seed)),
             CompressedPublicKey::from_secret_key(&PrivateKey::from(seed + 1_000)),
-            Network::LocalNet,
+            Network::get_current(),
             TariAddressFeatures::create_one_sided_only(),
             None,
         )
@@ -2870,10 +2887,10 @@ mod tests {
     fn signer_fee_and_change(
         prepared: &PrepareOneSidedTransactionForSigningResult,
     ) -> (MicroMinotari, Option<MicroMinotari>) {
-        let consensus_constants = ConsensusConstantsBuilder::new(Network::LocalNet).build();
+        let consensus_constants = ConsensusConstantsBuilder::new(Network::get_current()).build();
         let key_manager = KeyManager::new_random().expect("key manager");
         let mut builder =
-            TransactionBuilder::new(consensus_constants, key_manager, Network::LocalNet).expect("builder");
+            TransactionBuilder::new(consensus_constants, key_manager, Network::get_current()).expect("builder");
         builder.with_fee_per_gram(prepared.info.fee_per_gram);
         // As the signer does.
         builder.with_change_required();
@@ -2954,7 +2971,7 @@ mod tests {
             // the transaction memo is the first recipient's plain payment id.
             let sender_address = sender
                 .account
-                .get_address(Network::LocalNet, &sender.password)
+                .get_address(Network::get_current(), &sender.password)
                 .expect("address");
             assert_eq!(prepared.info.recipients.len(), wanted.len());
             for (paid, recipient) in prepared.info.recipients.iter().zip(&wanted) {
@@ -2990,7 +3007,8 @@ mod tests {
                 "{n} recipients: {signer_fee} > {}",
                 estimate.estimated_fee
             );
-            let (recipients_size, change_size) = one_sided_output_sizes(&wanted, Network::LocalNet).expect("sizes");
+            let (recipients_size, change_size) =
+                one_sided_output_sizes(&wanted, Network::get_current()).expect("sizes");
             let exact_fee = tari_transaction_components::fee::Fee::new(
                 tari_transaction_components::weight::TransactionWeight::latest(),
             )
@@ -3021,7 +3039,7 @@ mod tests {
         let embedded = TariAddress::new_dual_address(
             plain.public_view_key().expect("view key").clone(),
             plain.public_spend_key().clone(),
-            Network::LocalNet,
+            Network::get_current(),
             TariAddressFeatures::create_one_sided_only(),
             // An exchange-sized reference: the change memo carries it twice, in the address
             // and as the payment id, so a much longer one cannot be sent at all.
@@ -3159,7 +3177,7 @@ mod tests {
         let estimate = crate::transactions::fee_estimator::FeeEstimator::new(pool.clone(), "http://127.0.0.1:1".into())
             .estimate_fees_send_all(
                 "test",
-                Network::LocalNet,
+                Network::get_current(),
                 &other_address(1),
                 Some(&payment_id),
                 sender.fee_per_gram,
@@ -3355,7 +3373,7 @@ mod tests {
         crate::transactions::fee_estimator::FeeEstimator::new(pool.clone(), "http://127.0.0.1:1".into())
             .estimate_fees_send_all(
                 "test",
-                Network::LocalNet,
+                Network::get_current(),
                 &other_address(1),
                 None,
                 sender.fee_per_gram,

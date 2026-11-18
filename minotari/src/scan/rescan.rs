@@ -11,6 +11,7 @@ use crate::{
     config::defaults::WalletConfig,
     db::{self, WalletDbError, init_db},
     scan::{EventReceiver, ScanError, ScanMode, Scanner, reorg::rollback_from_height},
+    utils::network::ensure_global_network,
     webhooks::WebhookTriggerConfig,
 };
 
@@ -79,6 +80,8 @@ async fn rollback_and_build_scanner(
     mode: ScanMode,
     cancel_token: Option<CancellationToken>,
 ) -> Result<Scanner, ScanError> {
+    // The scanner hashes outputs with the process-global network; check it before rolling anything back.
+    ensure_global_network(config.network)?;
     let webhook_config = config.webhook.url.clone().map(|url| WebhookTriggerConfig {
         url,
         send_only_event_types: config.webhook.send_only_event_types.clone(),
@@ -194,6 +197,7 @@ mod tests {
     use crate::db::{create_account, get_account_by_name};
     use crate::scan::{ProcessingEvent, ScanStatusEvent};
     use std::time::Duration;
+    use tari_common::configuration::Network;
     use tari_common_types::seeds::cipher_seed::CipherSeed;
     use tari_script::script;
     use tari_transaction_components::{
@@ -357,6 +361,7 @@ mod tests {
             database_path,
             batch_size: 5,
             burn_proofs_dir: Some(dir.path().join("burn_proofs")),
+            network: Network::get_current(),
             ..WalletConfig::default()
         };
         Setup {
@@ -462,6 +467,29 @@ mod tests {
             )
             .unwrap();
         assert_eq!(pending, 2);
+    }
+
+    #[tokio::test]
+    async fn a_rescan_for_another_network_than_the_global_one_rolls_nothing_back() {
+        let setup = setup().await;
+        rescan(PASSWORD, &setup.config, "default", 0, full_rescan(), None)
+            .await
+            .expect("first scan");
+        let config = WalletConfig {
+            network: if Network::get_current() == Network::LocalNet {
+                Network::Esmeralda
+            } else {
+                Network::LocalNet
+            },
+            ..setup.config.clone()
+        };
+
+        let err = rescan(PASSWORD, &config, "default", 0, full_rescan(), None)
+            .await
+            .expect_err("wrong network must be refused");
+
+        assert!(err.to_string().contains("process-global network"), "{err}");
+        assert_eq!(output_rows(&setup.config, &setup.output_hash), (1, 0));
     }
 
     #[tokio::test]

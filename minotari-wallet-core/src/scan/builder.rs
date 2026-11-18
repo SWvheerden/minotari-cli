@@ -53,6 +53,12 @@ use zeroize::Zeroizing;
 /// let (event_rx, scan_future) = scanner.run_with_events();
 /// ```
 ///
+/// # Network
+///
+/// Output hashes take their domain from the process-global network, so set it with
+/// `Network::set_current` at startup, before any wallet-core call; the scanner has no
+/// network of its own to check.
+///
 /// # Thread Safety
 ///
 /// The `Scanner` is not designed to be shared across threads. Create separate

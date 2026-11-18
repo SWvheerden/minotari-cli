@@ -239,7 +239,7 @@ impl Daemon {
             self.burn_proofs_dir.clone(),
             self.network,
             self.required_confirmations,
-        );
+        )?;
         let burn_proof_handle = burn_proof_worker.run(shutdown_tx.subscribe());
 
         let webhook_worker = std::sync::Arc::new(WebhookWorker::new(db_pool.clone(), self.webhook_config.clone()));
