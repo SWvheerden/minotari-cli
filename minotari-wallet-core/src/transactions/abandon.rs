@@ -342,7 +342,7 @@ mod tests {
             &conn,
             account_id,
             &view_key,
-            input.output_hash().to_vec(),
+            &input.output_hash(),
             &input,
             10,
             &FixedHash::from([10u8; 32]),
@@ -352,7 +352,8 @@ mod tests {
             FixedHash::zero(),
             false,
         )
-        .expect("input");
+        .expect("input")
+        .0;
         db::lock_output(&conn, input_id, &request_id, Utc::now()).expect("lock");
         let transaction = Transaction::new(
             vec![TransactionInput::new_with_output_hash(

@@ -45,6 +45,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::models::Id;
 use crate::transactions::DisplayedTransaction;
+use tari_common_types::transaction::TxId;
 use tari_common_types::types::FixedHash;
 use tari_transaction_components::MicroMinotari;
 use tari_transaction_components::transaction_components::WalletOutput;
@@ -97,6 +98,8 @@ pub struct BlockProcessedEvent {
 
 #[derive(Debug, Clone)]
 pub struct DetectedOutput {
+    /// `tx_id` of the output's row.
+    pub tx_id: TxId,
     pub height: u64,
     pub mined_in_block_hash: FixedHash,
     pub output: WalletOutput,
@@ -104,6 +107,8 @@ pub struct DetectedOutput {
 
 #[derive(Debug, Clone)]
 pub struct SpentInput {
+    /// `tx_id` of the spent output's row.
+    pub tx_id: TxId,
     pub output_id: Id,
     pub mined_in_block: FixedHash,
     pub mined_in_block_height: u64,

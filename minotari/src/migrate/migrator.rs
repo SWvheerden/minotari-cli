@@ -36,17 +36,14 @@ use anyhow::{Context, anyhow};
 use chrono::{DateTime, Utc};
 use log::{info, trace};
 use rusqlite::{Connection, named_params};
-use tari_common_types::{
-    seeds::cipher_seed::CipherSeed, tari_address::TariAddress, transaction::TxId, types::FixedHash,
-};
+use tari_common_types::{seeds::cipher_seed::CipherSeed, tari_address::TariAddress, types::PrivateKey};
 use tari_transaction_components::MicroMinotari;
 use tari_transaction_components::key_manager::wallet_types::{SeedWordsWallet, WalletType};
 use tari_transaction_components::key_manager::{KeyManager, TransactionKeyManagerInterface};
 use tari_transaction_components::transaction_components::memo_field::MemoField;
-use tari_utilities::ByteArray;
 
 use crate::db::{self, init_db};
-use crate::models::{BalanceChange, Id, OutputStatus};
+use crate::models::{BalanceChange, OutputStatus};
 
 use super::console_db::{ConsoleCompletedTxRow, ConsoleScannedTip, ConsoleWalletReader};
 use super::output_converter::{ConvertedOutput, LegacyOutputStatus, convert_output};
@@ -252,13 +249,12 @@ fn migrate_in_transaction(
         .context("Failed to look up newly-created account id")?;
 
     // 4b. Derive the view key once for output tx_id derivation. Using the
-    //     same `TxId::new_deterministic(view_key, output_hash)` formula the
-    //     scan path uses means a freshly-scanned wallet and a migrated wallet
-    //     end up with identical `outputs.tx_id` values for the same outputs.
+    //     scan path's `db::output_tx_id` means a freshly-scanned wallet and a
+    //     migrated wallet end up with identical `outputs.tx_id` values for the
+    //     same outputs.
     let key_manager = KeyManager::new(wallet_type)
         .map_err(|e| anyhow!("Failed to construct KeyManager for the migrated account: {e}"))?;
     let view_key = key_manager.get_private_view_key();
-    let view_key_bytes = view_key.as_bytes().to_vec();
 
     // Indexes used by step 6. Built incrementally during step 5 so we touch
     // each output exactly once.
@@ -282,7 +278,7 @@ fn migrate_in_transaction(
             report.source_balance = report.source_balance.saturating_add(converted.value);
         }
 
-        let inserted_id = insert_converted_output(tx, account_id, &converted, &view_key_bytes)?;
+        let inserted_id = insert_converted_output(tx, account_id, &converted, &view_key)?;
         report.outputs_migrated = report.outputs_migrated.saturating_add(1);
 
         // Index for the displayed-transactions join in step 6.
@@ -386,20 +382,11 @@ fn migrate_in_transaction(
     Ok(report)
 }
 
-/// Derive the destination `outputs.tx_id` from the account view key and the
-/// output hash, matching the scan path's
-/// `TxId::new_deterministic(view_key, output_hash)` exactly. This ensures a
-/// migrated wallet and a scan-built wallet store the same `tx_id` for the
-/// same output, so cross-references between them stay consistent.
-fn deterministic_tx_id(view_key_bytes: &[u8], output_hash: &FixedHash) -> Id {
-    TxId::new_deterministic(view_key_bytes, output_hash).as_i64_wrapped()
-}
-
 fn insert_converted_output(
     tx: &Connection,
     account_id: i64,
     converted: &ConvertedOutput,
-    view_key_bytes: &[u8],
+    view_key: &PrivateKey,
 ) -> Result<i64, anyhow::Error> {
     let output_json =
         serde_json::to_string(&converted.wallet_output).context("Failed to serialise migrated WalletOutput as JSON")?;
@@ -407,7 +394,8 @@ fn insert_converted_output(
     let value_i64 = converted.value.as_u64() as i64;
     let height_i64 = i64::try_from(converted.mined_height).unwrap_or(i64::MAX);
     let mined_dt = DateTime::<Utc>::from_naive_utc_and_offset(converted.mined_timestamp, Utc);
-    let tx_id = deterministic_tx_id(view_key_bytes, &converted.output_hash);
+    let tx_id = db::output_tx_id(tx, account_id, view_key, &converted.output_hash, converted.mined_height)
+        .map_err(|e| anyhow!("Failed to derive migrated output tx_id: {e}"))?;
 
     // Per maintainer feedback (round 2) on PR #121:
     //   * Spent / SpentMinedUnconfirmed are both mined-in-block spends -
@@ -580,49 +568,6 @@ fn insert_debit_balance_change(
     };
     db::insert_balance_change(tx, &change).map_err(|e| anyhow!("Failed to insert debit balance_change: {e}"))?;
     Ok(())
-}
-
-#[cfg(test)]
-mod deterministic_tx_id_tests {
-    //! Direct unit tests for the new view-key-aware tx_id derivation. The
-    //! key correctness invariant: same (view_key, output_hash) always
-    //! produces the same tx_id, and different output hashes produce
-    //! different ids.
-    use tari_common_types::types::FixedHash;
-
-    use super::deterministic_tx_id;
-
-    fn hash(seed: u8) -> FixedHash {
-        FixedHash::from([seed; 32])
-    }
-
-    #[test]
-    fn deterministic_across_calls() {
-        let view_key = [0xCDu8; 32];
-        let h = hash(0x7F);
-        let a = deterministic_tx_id(&view_key, &h);
-        let b = deterministic_tx_id(&view_key, &h);
-        assert_eq!(a, b, "same inputs must produce the same tx_id");
-    }
-
-    #[test]
-    fn different_hashes_produce_different_ids() {
-        let view_key = [0xABu8; 32];
-        let a = deterministic_tx_id(&view_key, &hash(0x01));
-        let b = deterministic_tx_id(&view_key, &hash(0x02));
-        assert_ne!(a, b, "distinct output hashes must produce distinct tx_ids");
-    }
-
-    #[test]
-    fn different_view_keys_produce_different_ids_for_same_hash() {
-        let h = hash(0xAA);
-        let a = deterministic_tx_id(&[0x11u8; 32], &h);
-        let b = deterministic_tx_id(&[0x22u8; 32], &h);
-        assert_ne!(
-            a, b,
-            "the same output hash under different view keys must produce different tx_ids",
-        );
-    }
 }
 
 #[cfg(test)]

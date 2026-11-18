@@ -97,8 +97,8 @@ pub fn insert_balance_change(conn: &Connection, change: &BalanceChange) -> Walle
     Ok(id)
 }
 
-/// Inserts a balance change only if one does not already exist for the given output or input.
-/// Used during backfill to avoid duplicate balance entries (balance_changes has no unique constraint).
+/// Inserts a balance change only if an active one does not already exist for the given output or input,
+/// so a block read more than once credits or debits once (balance_changes has no unique constraint).
 /// Returns `Some(id)` if inserted, `None` if a matching record already existed.
 pub fn insert_balance_change_if_not_exists(conn: &Connection, change: &BalanceChange) -> WalletDbResult<Option<i64>> {
     // Check by output_id or input_id to see if this balance change was already recorded

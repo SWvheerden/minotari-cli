@@ -291,7 +291,7 @@ impl<E: EventSender> BlockProcessor<E> {
 
         if let Some(acc) = self.current_block.take() {
             if !acc.is_empty() {
-                self.save_and_emit_displayed_transactions(tx, block.height, account_id, &account_view_key, &acc)?;
+                self.save_and_emit_displayed_transactions(tx, block.height, account_id, &acc)?;
             }
 
             let block_event = acc.into_event();
@@ -306,18 +306,13 @@ impl<E: EventSender> BlockProcessor<E> {
         tx: &Connection,
         block_height: u64,
         account_id: i64,
-        account_view_key: &PrivateKey,
         accumulator: &BlockEventAccumulator,
     ) -> Result<(), BlockProcessorError> {
         if accumulator.is_empty() {
             return Ok(());
         }
 
-        let processor = DisplayedTransactionProcessor::new(
-            self.current_tip_height,
-            self.required_confirmations,
-            account_view_key.clone(),
-        );
+        let processor = DisplayedTransactionProcessor::new(self.current_tip_height, self.required_confirmations);
         let (mut updated_transactions, mut new_transactions) = processor
             .create_new_updated_display_transactions_for_height(accumulator, tx)
             .map_err(|e| {
@@ -464,7 +459,7 @@ impl<E: EventSender> BlockProcessor<E> {
                     tx,
                     account_id,
                     account_view_key,
-                    hash.to_vec(),
+                    hash,
                     output,
                     block.height,
                     &block.block_hash,
@@ -478,11 +473,11 @@ impl<E: EventSender> BlockProcessor<E> {
                     None => continue, // Output already exists, skip events and balance changes
                 }
             } else {
-                db::insert_output(
+                let (output_id, newly_inserted) = db::insert_output(
                     tx,
                     account_id,
                     account_view_key,
-                    hash.to_vec(),
+                    hash,
                     output,
                     block.height,
                     &block.block_hash,
@@ -491,8 +486,14 @@ impl<E: EventSender> BlockProcessor<E> {
                     memo.hex.clone(),
                     payment_reference,
                     is_burn,
-                )?
+                )?;
+                if !newly_inserted {
+                    // A re-read of this block: its event, webhook and credit are already recorded.
+                    continue;
+                }
+                output_id
             };
+            let tx_id = db::get_output_tx_id(tx, output_id)?;
 
             info!(
                 target: "audit",
@@ -515,6 +516,7 @@ impl<E: EventSender> BlockProcessor<E> {
                 acc.add_credit_change(
                     balance_change,
                     DetectedOutput {
+                        tx_id,
                         height: block.height,
                         mined_in_block_hash: block.block_hash,
                         output: output.clone(),
@@ -680,13 +682,8 @@ impl<E: EventSender> BlockProcessor<E> {
         output: &WalletOutput,
     ) -> Result<BalanceChange, BlockProcessorError> {
         let change = make_balance_change_for_output(account_id, output_id, block.mined_timestamp, block.height, output);
-
-        if self.backfill_mode {
-            db::insert_balance_change_if_not_exists(tx, &change)?;
-        } else {
-            db::insert_balance_change(tx, &change)?;
-        }
-
+        // One credit per output row, however often its block is read.
+        db::insert_balance_change_if_not_exists(tx, &change)?;
         Ok(change)
     }
 
@@ -749,6 +746,7 @@ impl<E: EventSender> BlockProcessor<E> {
                 acc.add_debit_change(
                     balance_change,
                     SpentInput {
+                        tx_id,
                         mined_in_block: block.block_hash,
                         mined_in_block_height: block.height,
                         output_id,
@@ -1455,11 +1453,11 @@ mod tests {
                 ));
                 continue;
             }
-            let output_id = db::insert_output(
+            let (output_id, _) = db::insert_output(
                 conn,
                 wallet.account_id,
                 &wallet.view_key,
-                output.output_hash().to_vec(),
+                &output.output_hash(),
                 &output,
                 10,
                 &hash(10),
@@ -2856,11 +2854,11 @@ mod tests {
         let mut conn = wallet.pool.get().expect("conn");
         let insert_locked = |conn: &Connection, byte: u8, height: u64, request_id: &str| -> i64 {
             let output = test_wallet_output(10_000, byte);
-            let id = db::insert_output(
+            let (id, _) = db::insert_output(
                 conn,
                 wallet.account_id,
                 &wallet.view_key,
-                output.output_hash().to_vec(),
+                &output.output_hash(),
                 &output,
                 height,
                 &hash(byte),

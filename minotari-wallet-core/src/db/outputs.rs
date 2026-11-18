@@ -21,12 +21,66 @@ use tari_transaction_components::transaction_components::WalletOutput;
 use tari_transaction_components::utxo_selection::UtxoValue;
 use tari_utilities::ByteArray;
 
+/// The `tx_id` for a new row of the account's output `output_hash`, mined at
+/// `block_height`.
+///
+/// The same hash can be on chain more than once (created, spent, created
+/// again), with one row per instance. The first keeps `H(view key, hash)`; a
+/// later one also hashes in the number of active instances mined in earlier
+/// blocks, so each has its own id, and a re-mine after a reorg (which
+/// soft-deletes the row) counts the same instances and gets the same id back.
+///
+/// Derive it only when inserting a row, never again for an existing one: if an
+/// earlier instance is reorged out while a later one survives, the later one's
+/// count drops.
+pub fn output_tx_id(
+    conn: &Connection,
+    account_id: i64,
+    account_view_key: &PrivateKey,
+    output_hash: &FixedHash,
+    block_height: u64,
+) -> WalletDbResult<i64> {
+    #[allow(clippy::cast_possible_wrap)]
+    let earlier_instances: i64 = conn.query_row(
+        r#"
+        SELECT COUNT(*) FROM outputs
+        WHERE account_id = :account_id
+          AND output_hash = :hash
+          AND mined_in_block_height < :height
+          AND deleted_at IS NULL
+          AND status NOT IN (:unconfirmed, :rejected)
+        "#,
+        named_params! {
+            ":account_id": account_id,
+            ":hash": output_hash.as_slice(),
+            ":height": block_height as i64,
+            ":unconfirmed": OutputStatus::Unconfirmed.to_string(),
+            ":rejected": OutputStatus::Rejected.to_string(),
+        },
+        |row| row.get(0),
+    )?;
+    let tx_id = if earlier_instances == 0 {
+        TxId::new_deterministic(account_view_key.as_bytes(), output_hash)
+    } else {
+        let key = [account_view_key.as_bytes(), &earlier_instances.to_le_bytes()].concat();
+        TxId::new_deterministic(&key, output_hash)
+    };
+    Ok(tx_id.as_i64_wrapped())
+}
+
+/// Records a detected output, returning `(output_id, newly_inserted)`.
+///
+/// A row is one instance: (account, output hash, block it was mined in). The
+/// same block is presented more than once in normal operation (a Continuous
+/// scan re-reads the tip every poll cycle, and a large block arrives as several
+/// results), so an existing row is returned with `newly_inserted = false`; the
+/// caller then skips the detection event, webhook and credit.
 #[allow(clippy::too_many_arguments)]
 pub fn insert_output(
     conn: &Connection,
     account_id: i64,
     account_view_key: &PrivateKey,
-    output_hash: Vec<u8>,
+    output_hash: &FixedHash,
     output: &WalletOutput,
     block_height: u64,
     block_hash: &FixedHash,
@@ -35,7 +89,26 @@ pub fn insert_output(
     memo_hex: Option<String>,
     payment_reference: PaymentReference,
     is_burn: bool,
-) -> WalletDbResult<i64> {
+) -> WalletDbResult<(i64, bool)> {
+    let existing: Option<i64> = conn
+        .query_row(
+            r#"
+            SELECT id FROM outputs
+            WHERE account_id = :account_id AND output_hash = :hash AND mined_in_block_hash = :block_hash
+              AND deleted_at IS NULL
+            "#,
+            named_params! {
+                ":account_id": account_id,
+                ":hash": output_hash.as_slice(),
+                ":block_hash": block_hash.as_slice(),
+            },
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(id) = existing {
+        return Ok((id, false));
+    }
+
     info!(
         target: "audit",
         account_id = account_id,
@@ -44,7 +117,7 @@ pub fn insert_output(
         "DB: Inserting output"
     );
 
-    let tx_id = TxId::new_deterministic(account_view_key.as_bytes(), &output.output_hash()).as_i64_wrapped();
+    let tx_id = output_tx_id(conn, account_id, account_view_key, output_hash, block_height)?;
 
     let output_json = serde_json::to_string(&output)?;
 
@@ -96,7 +169,7 @@ pub fn insert_output(
         named_params! {
             ":account_id": account_id,
             ":tx_id": tx_id,
-            ":output_hash": output_hash,
+            ":output_hash": output_hash.as_slice(),
             ":block_height": block_height,
             ":block_hash": block_hash.as_slice(),
             ":value": value,
@@ -110,7 +183,7 @@ pub fn insert_output(
         },
     )?;
 
-    Ok(conn.last_insert_rowid())
+    Ok((conn.last_insert_rowid(), true))
 }
 
 /// Inserts an output with `SpentUnconfirmed` status using `INSERT OR IGNORE`.
@@ -121,7 +194,7 @@ pub fn insert_spent_output_if_not_exists(
     conn: &Connection,
     account_id: i64,
     account_view_key: &PrivateKey,
-    output_hash: Vec<u8>,
+    output_hash: &FixedHash,
     output: &WalletOutput,
     block_height: u64,
     block_hash: &FixedHash,
@@ -131,7 +204,7 @@ pub fn insert_spent_output_if_not_exists(
     payment_reference: PaymentReference,
     is_burn: bool,
 ) -> WalletDbResult<Option<i64>> {
-    let tx_id = TxId::new_deterministic(account_view_key.as_bytes(), &output.output_hash()).as_i64_wrapped();
+    let tx_id = output_tx_id(conn, account_id, account_view_key, output_hash, block_height)?;
     let output_json = serde_json::to_string(&output)?;
 
     #[allow(clippy::cast_possible_wrap)]
@@ -181,7 +254,7 @@ pub fn insert_spent_output_if_not_exists(
         named_params! {
             ":account_id": account_id,
             ":tx_id": tx_id,
-            ":output_hash": output_hash,
+            ":output_hash": output_hash.as_slice(),
             ":block_height": block_height,
             ":block_hash": block_hash.as_slice(),
             ":value": value,
@@ -212,8 +285,7 @@ pub fn insert_spent_output_if_not_exists(
 ///
 /// The output has not been mined, so the NOT NULL `mined_*` columns hold
 /// sentinel values: height 0, an empty block hash and the epoch as timestamp.
-/// `tx_id` uses the same deterministic formula as [`insert_output`], so the scan
-/// finds the same row. Senders that assemble a transaction outside
+/// `tx_id` comes from [`output_tx_id`] like the scan's rows. Senders that assemble a transaction outside
 /// `TransactionManager` should call this after recording the completed
 /// transaction.
 pub fn insert_unconfirmed_change_output(
@@ -231,7 +303,7 @@ pub fn insert_unconfirmed_change_output(
     );
 
     let output_hash = output.output_hash();
-    let tx_id = TxId::new_deterministic(account_view_key.as_bytes(), &output_hash).as_i64_wrapped();
+    let tx_id = output_tx_id(conn, account_id, account_view_key, &output_hash, 0)?;
     let output_json = serde_json::to_string(&output)?;
     let mined_timestamp = DateTime::<Utc>::from_timestamp(0, 0)
         .ok_or_else(|| WalletDbError::Unexpected("Epoch timestamp is out of range".to_string()))?;
@@ -519,6 +591,16 @@ pub fn get_change_output_hash_for_request(
         )),
         None => Ok(None),
     }
+}
+
+/// The stored `tx_id` of output row `output_id`.
+pub fn get_output_tx_id(conn: &Connection, output_id: i64) -> WalletDbResult<TxId> {
+    let tx_id: i64 = conn.query_row(
+        "SELECT tx_id FROM outputs WHERE id = :id",
+        named_params! { ":id": output_id },
+        |row| row.get(0),
+    )?;
+    Ok(TxId::from(tx_id as u64))
 }
 
 /// The request (`pending_transactions.id`) that has this output locked, if any.
@@ -1350,6 +1432,7 @@ struct WalletOutputRow {
 pub struct DbOutput {
     pub id: i64,
     pub account_id: i64,
+    pub tx_id: i64,
     pub output_hash: Vec<u8>,
     pub mined_in_block_hash: Vec<u8>,
     pub mined_in_block_height: i64,
@@ -1384,7 +1467,7 @@ impl DbOutput {
 pub fn get_output_by_id(conn: &Connection, output_id: i64) -> WalletDbResult<Option<DbOutput>> {
     let mut stmt = conn.prepare_cached(
         r#"
-        SELECT id, account_id, output_hash, mined_in_block_hash, mined_in_block_height,
+        SELECT id, account_id, tx_id, output_hash, mined_in_block_hash, mined_in_block_height,
                value, created_at, wallet_output_json, mined_timestamp, confirmed_height,
                confirmed_hash, memo_parsed, memo_hex, status, locked_at, locked_by_request_id,
                deleted_at, deleted_in_block_height, payment_reference, maturity
