@@ -77,7 +77,7 @@ pub fn set_global_network(network: Network) -> Result<()> {
         warn!("TARI_NETWORK is {env_network} but the configured network is {network}; using {network}");
     }
     set_network_if_choice_valid(network).with_context(|| {
-        format!("Network {network} is not supported by this build; pass `--network <network>`, or change or remove the `network` key in the config file")
+        format!("Network {network} is not supported by this build; pass `--network <network>`, unset `TARI_NETWORK`, or change or remove the `network` key in the config file")
     })?;
     // `set_network_if_choice_valid` reports success even when another network was already set.
     let current = Network::get_current();

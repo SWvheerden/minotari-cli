@@ -738,10 +738,7 @@ pub(crate) mod tests {
     fn a_burn_for_another_network_than_the_global_one_is_refused_before_locking() {
         let (pool, account, _temp) = setup_funded_account(1_000_000);
         let mut conn = pool.get().expect("conn");
-        let other = [Network::LocalNet, Network::Esmeralda]
-            .into_iter()
-            .find(|n| *n != Network::get_current())
-            .expect("a network other than the global one");
+        let other = crate::utils::network::a_network_other_than_the_global_one();
         let params = BurnTxParams {
             account_id: account.id,
             amount: MicroMinotari(10_000),

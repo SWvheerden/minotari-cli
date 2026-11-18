@@ -13,3 +13,14 @@ pub fn ensure_global_network(network: Network) -> Result<(), anyhow::Error> {
     }
     Ok(())
 }
+
+/// A network other than the process-global one, for tests of the check above.
+#[cfg(test)]
+pub(crate) fn a_network_other_than_the_global_one() -> Network {
+    let global = Network::get_current();
+    if global == Network::LocalNet {
+        Network::Esmeralda
+    } else {
+        Network::LocalNet
+    }
+}

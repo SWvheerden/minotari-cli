@@ -126,3 +126,36 @@ pub(crate) fn build_vn_pay_to_self_tx(
     )
     .map_err(map_change_required_error)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{transactions::burn::tests::setup_funded_account, utils::network::a_network_other_than_the_global_one};
+
+    #[test]
+    fn a_vn_transaction_for_another_network_than_the_global_one_is_refused_before_locking() {
+        let (pool, account, _temp) = setup_funded_account(1_000_000);
+        let mut conn = pool.get().expect("conn");
+
+        let err = build_vn_pay_to_self_tx(
+            &account,
+            &mut conn,
+            a_network_other_than_the_global_one(),
+            "pass",
+            OutputFeatures::default(),
+            MicroMinotari(5),
+            None,
+            None,
+            3600,
+            100,
+            IdempotencyOperation::ValidatorNodeRegistration,
+        )
+        .expect_err("wrong network must be refused");
+
+        assert!(err.to_string().contains("process-global network"), "{err}");
+        let locked: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_transactions", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(locked, 0, "a refused VN transaction must not lock funds");
+    }
+}

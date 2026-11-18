@@ -613,4 +613,22 @@ mod tests {
         let published: CompleteClaimBurnProof = serde_json::from_slice(&fs::read(&final_path).await.unwrap()).unwrap();
         assert_eq!(published.claim_proof.output_proof, complete.claim_proof.output_proof);
     }
+
+    #[test]
+    fn a_worker_for_another_network_than_the_global_one_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let other = if Network::get_current() == Network::LocalNet {
+            Network::Esmeralda
+        } else {
+            Network::LocalNet
+        };
+        let result = BurnProofWorker::new(
+            crate::db::init_db(dir.path().join("wallet.db")).expect("init db"),
+            WalletHttpClient::new("http://127.0.0.1:1".parse().expect("url")).expect("client"),
+            dir.path().to_path_buf(),
+            other,
+            3,
+        );
+        assert!(result.is_err());
+    }
 }
