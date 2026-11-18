@@ -784,6 +784,7 @@ impl<E: EventSender> BlockProcessor<E> {
                 continue;
             };
             let output_id = copy.id;
+            let other_copy_ids: Vec<i64> = copies.iter().map(|c| c.id).filter(|id| *id != output_id).collect();
             #[allow(clippy::cast_sign_loss)]
             let tx_id = TxId::from(copy.tx_id as u64);
             let output: WalletOutput = serde_json::from_str(&copy.wallet_output_json).map_err(WalletDbError::from)?;
@@ -827,6 +828,7 @@ impl<E: EventSender> BlockProcessor<E> {
                         mined_in_block: block.block_hash,
                         mined_in_block_height: block.height,
                         output_id,
+                        other_copy_ids,
                         output,
                     },
                 );
@@ -3735,5 +3737,50 @@ mod tests {
         assert_eq!(input, ("SPENT".to_string(), Some(send.request_id.clone())));
         // Nothing can land under the dead lock: the spend is settled again.
         assert_eq!(output_row(&conn, &other.output_hash()).1, "SPENT_UNCONFIRMED");
+    }
+
+    #[test]
+    fn a_send_re_mined_after_a_reorg_that_also_replaced_its_input_keeps_one_history_entry() {
+        let wallet = test_wallet();
+        let mut conn = wallet.pool.get().expect("conn");
+        let x = test_wallet_output(10_000, 1);
+        let received = block(10, vec![x.clone()], Vec::new());
+        process(
+            &mut processor(&wallet, false),
+            &conn,
+            wallet.account_id,
+            std::slice::from_ref(&received),
+        );
+        let send = record_send(&wallet, &conn, 1, &[1], Some(3));
+        // The entry names the spent row, as `TransactionManager` records it.
+        let (old_row, ..) = output_row(&conn, &x.output_hash());
+        let mut entry = db::get_displayed_transaction_by_id(&conn, &send.tx_id.to_string())
+            .expect("query")
+            .expect("entry");
+        entry.details.inputs[0].matched_output_id = old_row;
+        db::insert_displayed_transaction(&conn, &entry).expect("entry");
+
+        let mined = block(50, vec![send.change.clone().unwrap()], vec![x.output_hash()]);
+        let blocks = [received, mined, block(51, Vec::new(), Vec::new())];
+        process(&mut processor(&wallet, true), &conn, wallet.account_id, &blocks[1..]);
+
+        // The reorg reaches back past the block X was received in; X gets a new row.
+        rollback_to(&mut conn, wallet.account_id, 10);
+        db::mark_completed_transaction_as_broadcasted(&conn, send.tx_id, 1).expect("rebroadcast");
+        process(&mut processor(&wallet, true), &conn, wallet.account_id, &blocks);
+        assert_ne!(output_row(&conn, &x.output_hash()).0, old_row);
+
+        let displayed = db::get_displayed_transaction_by_id(&conn, &send.tx_id.to_string())
+            .expect("query")
+            .expect("send entry");
+        assert_eq!(displayed.blockchain.block_height, 50);
+        let spend_entries: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM displayed_transactions WHERE account_id = :account_id AND block_height = 50",
+                named_params! { ":account_id": wallet.account_id },
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(spend_entries, 1, "no second entry for the same spend");
     }
 }

@@ -110,6 +110,9 @@ pub struct SpentInput {
     /// `tx_id` of the spent output's row.
     pub tx_id: TxId,
     pub output_id: Id,
+    /// The other active rows of the spent output's hash (copies of a re-created
+    /// output): a history entry naming one of them is not this spend's.
+    pub other_copy_ids: Vec<Id>,
     pub mined_in_block: FixedHash,
     pub mined_in_block_height: u64,
     pub output: WalletOutput,

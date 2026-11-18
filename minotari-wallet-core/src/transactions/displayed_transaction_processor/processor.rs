@@ -92,11 +92,12 @@ impl DisplayedTransactionProcessor {
         }
         'input_loop: for (balance_change, output) in accumulator.debit_balance_changes() {
             for tx in current_display_transactions {
-                // Matched on the spent row, so a spend of another copy of a re-created
-                // hash gets its own entry. 0 is an entry that never recorded the row.
+                // Not an entry naming another active copy of a re-created hash, so its
+                // spend gets its own entry. An entry naming this row, a row a reorg
+                // replaced with this one, or none (0) is this spend's.
                 if tx.details.inputs.iter().any(|o| {
                     o.output_hash == output.output.output_hash()
-                        && (o.matched_output_id == output.output_id || o.matched_output_id == 0)
+                        && !output.other_copy_ids.contains(&o.matched_output_id)
                 }) {
                     let mut updated = tx.clone();
                     updated.blockchain.block_height = output.mined_in_block_height;
@@ -611,6 +612,7 @@ impl DisplayedTransactionProcessor {
                     let spent_input = SpentInput {
                         tx_id: TxId::from(output.tx_id as u64),
                         output_id: input.output_id,
+                        other_copy_ids: Vec::new(),
                         mined_in_block: FixedHash::try_from(input.mined_in_block_hash)
                             .map_err(|e| ProcessorError::ParseError(e.to_string()))?,
                         mined_in_block_height: input.mined_in_block_height as u64,
@@ -1554,6 +1556,7 @@ mod tests {
         SpentInput {
             tx_id: TxId::from(u64::from(hash_byte)),
             output_id: 0,
+            other_copy_ids: Vec::new(),
             mined_in_block: mock_fixed_hash(hash_byte),
             mined_in_block_height: 10,
             output: mock_wallet_output(value),
