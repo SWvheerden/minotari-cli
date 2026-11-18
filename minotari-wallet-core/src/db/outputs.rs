@@ -652,16 +652,19 @@ pub fn get_output_lock_request_id(conn: &Connection, output_id: i64) -> WalletDb
 /// soft-deleted row is restored as `UNCONFIRMED`, so the scan updates it in
 /// place and the change stays the send's change (`created_by_request_id`),
 /// which a reorg then reverts rather than deletes. Nothing is restored if an
-/// active row with that hash already exists.
+/// active row with that hash already exists. While the row was deleted, an
+/// account sharing the view key can have taken its `tx_id`; the restored row
+/// then gets a fresh one from [`output_tx_id`].
 pub fn restore_change_of_rejected_send(
     conn: &Connection,
     account_id: i64,
+    account_view_key: &PrivateKey,
     output_hash: &FixedHash,
 ) -> WalletDbResult<Option<(String, TxId)>> {
-    let row: Option<(i64, String, i64, bool)> = conn
+    let row: Option<(i64, String, i64, bool, i64)> = conn
         .query_row(
             r#"
-            SELECT o.id, o.created_by_request_id, c.id, o.deleted_at IS NOT NULL
+            SELECT o.id, o.created_by_request_id, c.id, o.deleted_at IS NOT NULL, o.tx_id
             FROM outputs o
             JOIN completed_transactions c ON c.pending_tx_id = o.created_by_request_id
             WHERE o.account_id = :account_id
@@ -679,10 +682,10 @@ pub fn restore_change_of_rejected_send(
                 ":rejected_output": OutputStatus::Rejected.to_string(),
                 ":rejected_tx": crate::db::CompletedTransactionStatus::Rejected.to_string(),
             },
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .optional()?;
-    let Some((output_id, request_id, completed_id, is_deleted)) = row else {
+    let Some((output_id, request_id, completed_id, is_deleted, tx_id)) = row else {
         return Ok(None);
     };
 
@@ -695,9 +698,23 @@ pub fn restore_change_of_rejected_send(
         if active > 0 {
             return Ok(None);
         }
+        let taken: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM outputs WHERE tx_id = :tx_id AND deleted_at IS NULL)",
+            named_params! { ":tx_id": tx_id },
+            |row| row.get(0),
+        )?;
+        let tx_id = if taken {
+            output_tx_id(conn, account_id, account_view_key, output_hash, 0)?
+        } else {
+            tx_id
+        };
         conn.execute(
-            "UPDATE outputs SET deleted_at = NULL, status = :unconfirmed WHERE id = :id",
-            named_params! { ":unconfirmed": OutputStatus::Unconfirmed.to_string(), ":id": output_id },
+            "UPDATE outputs SET deleted_at = NULL, status = :unconfirmed, tx_id = :tx_id WHERE id = :id",
+            named_params! {
+                ":unconfirmed": OutputStatus::Unconfirmed.to_string(),
+                ":tx_id": tx_id,
+                ":id": output_id,
+            },
         )?;
     }
 
@@ -1322,26 +1339,25 @@ pub fn resolve_spent_unconfirmed_with_inputs(conn: &Connection, account_id: i64)
 /// Marks the account's `SpentUnconfirmed` rows that have a newer active copy of
 /// their hash `Spent`, with an input record and its debit. An older copy was
 /// spent before the newer one was created, and the base node only answers for
-/// the newest, so it is not asked. The exact spend block is not known: the input
-/// is recorded in the block that mined the next copy, the latest block the spend
-/// can be in, so a reorg that removes that copy removes this spend as well.
+/// the newest, so it is not asked. The exact spend block is not known, so the
+/// input is recorded in the copy's own block: only a reorg that removes the copy
+/// itself (and with it the row) removes this spend. A block later than that could
+/// be rolled back without the real spend ever being read again.
 ///
 /// Returns the number of rows resolved.
 pub fn resolve_superseded_spent_unconfirmed(conn: &Connection, account_id: i64) -> WalletDbResult<u64> {
     let superseded: Vec<(i64, i64, i64, Vec<u8>)> = {
         let mut stmt = conn.prepare_cached(
             r#"
-            SELECT o.id, o.value, n.mined_in_block_height, n.mined_in_block_hash
+            SELECT o.id, o.value, o.mined_in_block_height, o.mined_in_block_hash
             FROM outputs o
-            JOIN outputs n ON n.id = (
-                SELECT c.id FROM outputs c
-                WHERE c.account_id = o.account_id AND c.output_hash = o.output_hash AND c.deleted_at IS NULL
-                  AND c.mined_in_block_height > o.mined_in_block_height
-                  AND c.status NOT IN (:unconfirmed, :rejected)
-                ORDER BY c.mined_in_block_height, c.id
-                LIMIT 1
-            )
             WHERE o.account_id = :account_id AND o.status = :spent_unconfirmed AND o.deleted_at IS NULL
+              AND EXISTS (
+                  SELECT 1 FROM outputs c
+                  WHERE c.account_id = o.account_id AND c.output_hash = o.output_hash AND c.deleted_at IS NULL
+                    AND c.mined_in_block_height > o.mined_in_block_height
+                    AND c.status NOT IN (:unconfirmed, :rejected)
+              )
             "#,
         )?;
         let rows = stmt.query_map(

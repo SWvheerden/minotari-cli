@@ -107,11 +107,10 @@ pub struct BlockProcessor<E: EventSender = NoopEventSender> {
     /// What the block being processed showed of the wallet's own sends. Only
     /// collected while `has_pending_outbound` is set. See [`Self::match_sends`].
     send_block: Option<SendBlock>,
-    /// `(account, block hash, input hashes)`: the inputs of the block being
-    /// processed that matched none of the account's outputs. A block arrives as
-    /// several results in no fixed order, so the output an input spends can come
-    /// in a later result; it is retried then.
-    unmatched_inputs: Option<(i64, FixedHash, HashSet<FixedHash>)>,
+    /// The inputs of the block being processed that spent none of the account's
+    /// outputs. A block arrives as several results in no fixed order, so the
+    /// output an input spends can come in a later result; it is retried then.
+    unmatched_inputs: Option<UnmatchedInputs>,
 }
 
 /// The parts of one block needed to recognise the wallet's own sends in it.
@@ -129,6 +128,15 @@ struct SendBlock {
     wallet_outputs: HashSet<FixedHash>,
     /// `locked_by_request_id` of every wallet output the block spends.
     request_ids: Vec<String>,
+}
+
+/// See [`BlockProcessor::unmatched_inputs`].
+struct UnmatchedInputs {
+    account_id: i64,
+    height: u64,
+    block_hash: FixedHash,
+    /// Each input hash, with the block a copy of it was already spent in, if any.
+    inputs: HashMap<FixedHash, Option<Vec<u8>>>,
 }
 
 impl BlockProcessor<NoopEventSender> {
@@ -290,19 +298,25 @@ impl<E: EventSender> BlockProcessor<E> {
 
         let same_block = matches!(
             &self.unmatched_inputs,
-            Some((open_account, open_hash, _)) if *open_account == account_id && *open_hash == block.block_hash
+            Some(open) if open.account_id == account_id && open.block_hash == block.block_hash
         );
         if !same_block {
-            self.unmatched_inputs = Some((account_id, block.block_hash, HashSet::new()));
+            self.close_unmatched_inputs();
+            self.unmatched_inputs = Some(UnmatchedInputs {
+                account_id,
+                height: block.height,
+                block_hash: block.block_hash,
+                inputs: HashMap::new(),
+            });
         }
 
         let mut request_ids = self.process_outputs(tx, block, account_id, &account_view_key)?;
         // Inputs of earlier results of this block that spend an output stored just now.
         let mut inputs = Vec::new();
-        if let Some((_, _, unmatched)) = &mut self.unmatched_inputs {
+        if let Some(open) = &mut self.unmatched_inputs {
             for (hash, _output, wallet_idx) in &block.wallet_outputs {
                 if self.wallet_index_to_account_id.get(*wallet_idx).copied() == Some(account_id)
-                    && unmatched.remove(hash)
+                    && open.inputs.remove(hash).is_some()
                 {
                     inputs.push(*hash);
                 }
@@ -435,7 +449,8 @@ impl<E: EventSender> BlockProcessor<E> {
             // history is built, so the block updates that one entry. The send is
             // then matched under the full rule (all inputs and change).
             if !self.backfill_mode
-                && let Some((request_id, completed_tx_id)) = db::restore_change_of_rejected_send(tx, account_id, hash)?
+                && let Some((request_id, completed_tx_id)) =
+                    db::restore_change_of_rejected_send(tx, account_id, account_view_key, hash)?
             {
                 if let Some(displayed) = db::get_displayed_transaction_by_id(tx, &completed_tx_id.to_string())?
                     && displayed.status == TransactionDisplayStatus::Rejected
@@ -461,9 +476,9 @@ impl<E: EventSender> BlockProcessor<E> {
             }
 
             // A send's change output was written at send time as `UNCONFIRMED`.
-            // Update that row in place rather than inserting a second one (which
-            // the active unique index on `output_hash` forbids); the credit,
-            // event and accumulator entry below are recorded as for a new output.
+            // Update that row in place rather than inserting a second one, so it
+            // stays the send's change; the credit, event and accumulator entry
+            // below are recorded as for a new output.
             let status_when_found = if self.backfill_mode {
                 OutputStatus::SpentUnconfirmed
             } else {
@@ -741,8 +756,8 @@ impl<E: EventSender> BlockProcessor<E> {
             let copies = db::get_output_copies(tx, account_id, input_hash)?;
             if copies.is_empty() {
                 // Not the account's, or its output is in a later result of this block.
-                if let Some((_, _, unmatched)) = &mut self.unmatched_inputs {
-                    unmatched.insert(*input_hash);
+                if let Some(open) = &mut self.unmatched_inputs {
+                    open.inputs.entry(*input_hash).or_insert(None);
                 }
                 continue;
             }
@@ -760,17 +775,11 @@ impl<E: EventSender> BlockProcessor<E> {
                 c.spent_in_block_hash.is_none()
                     && u64::try_from(c.mined_in_block_height).is_ok_and(|h| h <= block.height)
             }) else {
-                // Nothing left to spend. A spend already recorded in another block
-                // cannot happen again (a reorg would have removed that record first).
-                if let Some(spent_in_block) = copies.iter().rev().find_map(|c| c.spent_in_block_hash.as_ref()) {
-                    warn!(
-                        target: "audit",
-                        account_id = account_id,
-                        block_height = block.height,
-                        block_hash = &*hex::encode(block.block_hash),
-                        spent_in_block_hash = &*hex::encode(spent_in_block);
-                        "Input lists a wallet output already spent in another block; ignoring it"
-                    );
+                // Nothing left to spend yet: a later result of this block can still
+                // store a re-created copy. See `close_unmatched_inputs`.
+                if let Some(open) = &mut self.unmatched_inputs {
+                    let spent_in = copies.iter().rev().find_map(|c| c.spent_in_block_hash.clone());
+                    open.inputs.insert(*input_hash, spent_in);
                 }
                 continue;
             };
@@ -825,6 +834,25 @@ impl<E: EventSender> BlockProcessor<E> {
         }
 
         Ok(request_ids)
+    }
+
+    /// Ends the open block's unmatched inputs. One that lists a copy already spent
+    /// in another block is logged: that spend cannot happen again (a reorg would
+    /// have removed its record first), so the input is ignored.
+    fn close_unmatched_inputs(&mut self) {
+        let Some(open) = self.unmatched_inputs.take() else {
+            return;
+        };
+        for spent_in_block in open.inputs.values().flatten() {
+            warn!(
+                target: "audit",
+                account_id = open.account_id,
+                block_height = open.height,
+                block_hash = &*hex::encode(open.block_hash),
+                spent_in_block_hash = &*hex::encode(spent_in_block);
+                "Input lists a wallet output already spent in another block; ignoring it"
+            );
+        }
     }
 
     /// Adds this block result's inputs, wallet outputs and spent requests to
@@ -3441,7 +3469,11 @@ mod tests {
                 .is_empty()
         );
         let rows = instances(&conn, wallet.account_id, &a);
-        assert_eq!(rows[0].2.as_deref(), Some(newer.block_hash.as_slice()));
+        assert_eq!(
+            rows[0].2.as_deref(),
+            Some(block(10, Vec::new(), Vec::new()).block_hash.as_slice()),
+            "the inferred spend is in the copy's own block"
+        );
         assert_eq!(rows[1].2, None);
         assert_eq!(ledger(&conn, wallet.account_id), (2, 1, 10_000));
         assert_eq!(
@@ -3473,5 +3505,112 @@ mod tests {
         assert_eq!(unresolved.len(), 1);
         assert_eq!(unresolved[0].mined_in_block_height, 30);
         assert_eq!(ledger(&conn, wallet.account_id), (2, 1, 10_000));
+    }
+
+    #[test]
+    fn a_reorg_between_an_inferred_spend_and_the_newer_copy_keeps_the_balance() {
+        // The real spend of the copy at 10 (at 20) was never stored; the newer copy is at 30.
+        let wallet = test_wallet();
+        let mut conn = wallet.pool.get().expect("conn");
+        let a = test_wallet_output(10_000, 1);
+        let newer = block(30, vec![a.clone()], Vec::new());
+        process(
+            &mut processor(&wallet, false),
+            &conn,
+            wallet.account_id,
+            std::slice::from_ref(&newer),
+        );
+        let mut backfill = processor(&wallet, false);
+        backfill.set_backfill_mode(true);
+        process(
+            &mut backfill,
+            &conn,
+            wallet.account_id,
+            &[block(10, vec![a.clone()], Vec::new())],
+        );
+        db::resolve_superseded_spent_unconfirmed(&conn, wallet.account_id).expect("resolve");
+        let before = ledger(&conn, wallet.account_id).2;
+        assert_eq!(before, 10_000);
+
+        rollback_to(&mut conn, wallet.account_id, 25);
+        process(
+            &mut processor(&wallet, false),
+            &conn,
+            wallet.account_id,
+            std::slice::from_ref(&newer),
+        );
+
+        assert_eq!(ledger(&conn, wallet.account_id).2, before);
+        assert!(
+            instances(&conn, wallet.account_id, &a)[0].2.is_some(),
+            "the older copy stays spent"
+        );
+    }
+
+    #[test]
+    fn a_rejected_sends_change_restored_after_another_account_took_its_tx_id_gets_a_fresh_one() {
+        let wallet = test_wallet();
+        let conn = wallet.pool.get().expect("conn");
+        let other = WalletType::SeedWords(SeedWordsWallet::construct_new(CipherSeed::random()).unwrap());
+        create_account(&conn, "second", &other, "password").unwrap();
+        let second_id = get_account_by_name(&conn, "second").unwrap().unwrap().id;
+        let send = record_send(&wallet, &conn, 1, &[1, 2], Some(3));
+        let change = send.change.clone().unwrap();
+        reject_as_the_monitor_does(&conn, &send);
+
+        // Both accounts share the view key; the second finds the change while the
+        // first's change row is soft-deleted, and takes its tx_id.
+        let mut processor = BlockProcessor::new(
+            vec![
+                (wallet.account_id, wallet.view_key.clone()),
+                (second_id, wallet.view_key.clone()),
+            ],
+            3,
+        );
+        let mut mined = block(50, Vec::new(), send.input_hashes.clone());
+        mined.wallet_outputs = vec![
+            (change.output_hash(), change.clone(), 1),
+            (change.output_hash(), change.clone(), 0),
+        ];
+        process(&mut processor, &conn, second_id, std::slice::from_ref(&mined));
+        process(&mut processor, &conn, wallet.account_id, std::slice::from_ref(&mined));
+
+        assert_eq!(
+            completed(&conn, send.tx_id).status,
+            db::CompletedTransactionStatus::MinedUnconfirmed
+        );
+        let (change_id, status, ..) = change_row(&conn, &send);
+        assert_eq!(status, "UNSPENT");
+        let first = instances(&conn, wallet.account_id, &change);
+        let second = instances(&conn, second_id, &change);
+        assert_eq!(first[0].0, change_id);
+        assert_ne!(first[0].1, second[0].1);
+        assert_eq!(ledger(&conn, second_id), (1, 0, 3_000));
+    }
+
+    #[test]
+    fn a_re_created_output_spent_in_a_split_block_with_the_input_first_is_debited() {
+        let wallet = test_wallet();
+        let conn = wallet.pool.get().expect("conn");
+        let a = test_wallet_output(10_000, 1);
+        // Block 60 re-creates and spends the hash; its input arrives in the first result.
+        let input_first = block(60, Vec::new(), vec![a.output_hash()]);
+        let output_second = block(60, vec![a.clone()], Vec::new());
+        process(
+            &mut processor(&wallet, false),
+            &conn,
+            wallet.account_id,
+            &[
+                block(10, vec![a.clone()], Vec::new()),
+                block(20, Vec::new(), vec![a.output_hash()]),
+                input_first.clone(),
+                output_second,
+            ],
+        );
+
+        let rows = instances(&conn, wallet.account_id, &a);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].2.as_deref(), Some(input_first.block_hash.as_slice()));
+        assert_eq!(ledger(&conn, wallet.account_id), (2, 2, 0));
     }
 }
