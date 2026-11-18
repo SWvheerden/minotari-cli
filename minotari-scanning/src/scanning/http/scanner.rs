@@ -833,8 +833,7 @@ where
                                     .iter()
                                     .position(|o| *o.encrypted_data() == output.encrypted_data)
                                 {
-                                    let tx_output =
-                                        block_response.outputs.get(index).expect("should exist").clone();
+                                    let tx_output = block_response.outputs.get(index).expect("should exist").clone();
                                     let output_hash = output.output_hash;
                                     let final_output_optional = output.to_wallet_output(
                                         tx_output,
@@ -844,18 +843,16 @@ where
                                             .expect("should exist"),
                                     )?;
                                     if let Some(final_output) = final_output_optional {
-                                        block.wallet_outputs.push((
-                                            output_hash,
-                                            final_output,
-                                            output.key_manager_index,
-                                        ))
+                                        block
+                                            .wallet_outputs
+                                            .push((output_hash, final_output, output.key_manager_index))
                                     }
                                 }
                             }
                             Ok(block)
                         }
                     })
-                    .collect::<FuturesUnordered<_>>()  // concurrent, not sequential
+                    .collect::<FuturesUnordered<_>>() // concurrent, not sequential
                     .collect::<Vec<_>>();
                 let network_results = tokio::select! {
                     network_results = network_results => network_results,

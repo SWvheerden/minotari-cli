@@ -1092,7 +1092,7 @@ mod tests {
             .status(TransactionDisplayStatus::Confirmed)
             .credits_and_debits(MicroMinotari::from(5000000), MicroMinotari::from(0))
             .blockchain_info(45, mock_fixed_hash(1), mock_timestamp(), 55)
-            .inputs(vec![])  // Empty inputs
+            .inputs(vec![]) // Empty inputs
             .outputs(vec![TransactionOutput {
                 hash: mock_fixed_hash(99),
                 amount: MicroMinotari::from(5000000),
@@ -1133,7 +1133,7 @@ mod tests {
                 mined_in_block_hash: mock_fixed_hash(1),
                 matched_output_id: 0,
             }])
-            .outputs(vec![])  // Empty outputs
+            .outputs(vec![]) // Empty outputs
             .output_type(None)
             .build(1u64.into())
             .unwrap();
