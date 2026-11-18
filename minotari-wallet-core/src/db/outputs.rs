@@ -1078,8 +1078,10 @@ pub fn revert_change_outputs_from_height(
 }
 
 /// The account's output row that an input of `output_hash` in a block at
-/// `spend_height` spends: the oldest active row mined at or below that height
-/// that is not spent yet. An `UNCONFIRMED` or `REJECTED` change row was never
+/// `spend_height` spends: the newest active row mined at or below that height
+/// that is not spent yet. An older instance was spent before the newer one was
+/// created, even when FastSync has not recorded that spend yet (it processes
+/// spends out of height order). An `UNCONFIRMED` or `REJECTED` change row was never
 /// mined (its height 0 is a sentinel), so it is never spent here.
 ///
 /// "Not spent" means no active input record: a reorg soft-deletes the input of
@@ -1101,7 +1103,7 @@ pub fn get_output_info_by_hash_for_account(
           AND o.mined_in_block_height <= :spend_height
           AND o.status NOT IN (:unconfirmed, :rejected)
           AND NOT EXISTS (SELECT 1 FROM inputs i WHERE i.output_id = o.id AND i.deleted_at IS NULL)
-        ORDER BY o.mined_in_block_height ASC, o.id ASC
+        ORDER BY o.mined_in_block_height DESC, o.id DESC
         LIMIT 1
         "#,
     )?;

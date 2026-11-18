@@ -382,6 +382,9 @@ impl<E: EventSender> BlockProcessor<E> {
         let mut generated_events: Vec<(i64, WalletEvent)> = Vec::new();
         let mut request_ids = Vec::new();
 
+        // The scanner (`scan_for_recoverable_output`) attributes each output to the
+        // first account whose keys recover it, so an output shared by two accounts
+        // scanned together reaches only one of them here.
         for (hash, output, wallet_idx) in &block.wallet_outputs {
             let Some(mapped_account_id) = self.wallet_index_to_account_id.get(*wallet_idx).copied() else {
                 continue;
@@ -3245,5 +3248,42 @@ mod tests {
             std::slice::from_ref(&spend),
         );
         assert_eq!(ledger(&conn, wallet.account_id).2, 4_000);
+    }
+
+    #[test]
+    fn a_re_created_output_whose_spends_arrive_out_of_height_order_debits_each_instance() {
+        // FastSync scans recent blocks before it backfills history.
+        let wallet = test_wallet();
+        let conn = wallet.pool.get().expect("conn");
+        let a = test_wallet_output(10_000, 1);
+        let first_spend = block(20, Vec::new(), vec![a.output_hash()]);
+        let second_spend = block(40, Vec::new(), vec![a.output_hash()]);
+        process(
+            &mut processor(&wallet, false),
+            &conn,
+            wallet.account_id,
+            &[
+                block(10, vec![a.clone()], Vec::new()),
+                block(30, vec![a.clone()], Vec::new()),
+            ],
+        );
+        process(
+            &mut processor(&wallet, false),
+            &conn,
+            wallet.account_id,
+            std::slice::from_ref(&second_spend),
+        );
+        process(
+            &mut processor(&wallet, false),
+            &conn,
+            wallet.account_id,
+            std::slice::from_ref(&first_spend),
+        );
+
+        let rows = instances(&conn, wallet.account_id, &a);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].2.as_deref(), Some(first_spend.block_hash.as_slice()));
+        assert_eq!(rows[1].2.as_deref(), Some(second_spend.block_hash.as_slice()));
+        assert_eq!(ledger(&conn, wallet.account_id), (2, 2, 0));
     }
 }
