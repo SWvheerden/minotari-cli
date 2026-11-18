@@ -3475,12 +3475,12 @@ mod tests {
         );
 
         assert_eq!(
-            db::resolve_superseded_spent_unconfirmed(&conn, wallet.account_id).expect("resolve"),
+            db::resolve_superseded_spent_unconfirmed(&conn, wallet.account_id, false).expect("resolve"),
             1
         );
         // Never asked about again, and never marked unspent.
         assert!(
-            db::get_unresolved_spent_unconfirmed_outputs(&conn, wallet.account_id)
+            db::get_unresolved_spent_unconfirmed_outputs(&conn, wallet.account_id, false)
                 .expect("unresolved")
                 .is_empty()
         );
@@ -3493,7 +3493,7 @@ mod tests {
         assert_eq!(rows[1].2, None);
         assert_eq!(ledger(&conn, wallet.account_id), (2, 1, 10_000));
         assert_eq!(
-            db::resolve_superseded_spent_unconfirmed(&conn, wallet.account_id).expect("resolve again"),
+            db::resolve_superseded_spent_unconfirmed(&conn, wallet.account_id, false).expect("resolve again"),
             0
         );
         assert_eq!(ledger(&conn, wallet.account_id), (2, 1, 10_000));
@@ -3516,8 +3516,9 @@ mod tests {
             ],
         );
 
-        db::resolve_superseded_spent_unconfirmed(&conn, wallet.account_id).expect("resolve");
-        let unresolved = db::get_unresolved_spent_unconfirmed_outputs(&conn, wallet.account_id).expect("unresolved");
+        db::resolve_superseded_spent_unconfirmed(&conn, wallet.account_id, false).expect("resolve");
+        let unresolved =
+            db::get_unresolved_spent_unconfirmed_outputs(&conn, wallet.account_id, false).expect("unresolved");
         assert_eq!(unresolved.len(), 1);
         assert_eq!(unresolved[0].mined_in_block_height, 30);
         assert_eq!(ledger(&conn, wallet.account_id), (2, 1, 10_000));
@@ -3544,7 +3545,7 @@ mod tests {
             wallet.account_id,
             &[block(10, vec![a.clone()], Vec::new())],
         );
-        db::resolve_superseded_spent_unconfirmed(&conn, wallet.account_id).expect("resolve");
+        db::resolve_superseded_spent_unconfirmed(&conn, wallet.account_id, false).expect("resolve");
         let before = ledger(&conn, wallet.account_id).2;
         assert_eq!(before, 10_000);
 
@@ -3556,7 +3557,7 @@ mod tests {
             std::slice::from_ref(&newer),
         );
         // What the scan's post-scan pass does once caught up.
-        db::resolve_superseded_spent_unconfirmed(&conn, wallet.account_id).expect("resolve");
+        db::resolve_superseded_spent_unconfirmed(&conn, wallet.account_id, true).expect("resolve");
 
         assert_eq!(ledger(&conn, wallet.account_id).2, before);
         assert!(
@@ -3653,7 +3654,7 @@ mod tests {
             wallet.account_id,
             &[block(10, vec![a.clone()], Vec::new())],
         );
-        db::resolve_superseded_spent_unconfirmed(&conn, wallet.account_id).expect("resolve");
+        db::resolve_superseded_spent_unconfirmed(&conn, wallet.account_id, false).expect("resolve");
 
         rollback_to(&mut conn, wallet.account_id, 15);
         let fork = BlockScanResult {
@@ -3666,13 +3667,73 @@ mod tests {
             wallet.account_id,
             std::slice::from_ref(&fork),
         );
-        db::resolve_superseded_spent_unconfirmed(&conn, wallet.account_id).expect("resolve");
+        db::resolve_superseded_spent_unconfirmed(&conn, wallet.account_id, true).expect("resolve");
 
         let (_, status, ..) = output_row(&conn, &a.output_hash());
         assert_eq!(status, "SPENT_UNCONFIRMED", "not left spent; the base node settles it");
-        let unresolved = db::get_unresolved_spent_unconfirmed_outputs(&conn, wallet.account_id).expect("unresolved");
+        let unresolved =
+            db::get_unresolved_spent_unconfirmed_outputs(&conn, wallet.account_id, true).expect("unresolved");
         assert_eq!(unresolved.len(), 1);
         assert_eq!(unresolved[0].mined_in_block_height, 10);
         assert_eq!(ledger(&conn, wallet.account_id).2, 10_000, "the copy's value is back");
+    }
+
+    #[test]
+    fn a_reorg_keeps_a_rebroadcast_sends_inputs_spent_and_unsettles_a_spend_by_a_request_that_is_gone() {
+        let wallet = test_wallet();
+        let mut conn = wallet.pool.get().expect("conn");
+        let send = record_send(&wallet, &conn, 1, &[1], Some(3));
+        // Another output, spent in the same block under a lock of a request that is gone.
+        let other = test_wallet_output(7_000, 5);
+        let (other_id, _) = db::insert_output(
+            &conn,
+            wallet.account_id,
+            &wallet.view_key,
+            &other.output_hash(),
+            &other,
+            10,
+            &hash(11),
+            1_700_000_000,
+            None,
+            None,
+            FixedHash::zero(),
+            false,
+        )
+        .expect("other output");
+        db::lock_output(&conn, other_id, "gone", Utc::now()).expect("lock");
+
+        let mined = block(
+            50,
+            vec![send.change.clone().unwrap()],
+            vec![send.input_hashes[0], other.output_hash()],
+        );
+        process(
+            &mut processor(&wallet, true),
+            &conn,
+            wallet.account_id,
+            &[mined, block(51, Vec::new(), Vec::new())],
+        );
+        assert_eq!(
+            completed(&conn, send.tx_id).status,
+            db::CompletedTransactionStatus::MinedUnconfirmed
+        );
+
+        rollback_to(&mut conn, wallet.account_id, 50);
+
+        // The send is rebroadcast: its input stays spent and its own.
+        assert_eq!(
+            completed(&conn, send.tx_id).status,
+            db::CompletedTransactionStatus::Completed
+        );
+        let input: (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, locked_by_request_id FROM outputs WHERE output_hash = :hash AND deleted_at IS NULL",
+                named_params! { ":hash": send.input_hashes[0].as_slice() },
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("input");
+        assert_eq!(input, ("SPENT".to_string(), Some(send.request_id.clone())));
+        // Nothing can land under the dead lock: the spend is settled again.
+        assert_eq!(output_row(&conn, &other.output_hash()).1, "SPENT_UNCONFIRMED");
     }
 }

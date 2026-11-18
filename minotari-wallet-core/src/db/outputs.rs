@@ -1347,8 +1347,16 @@ pub fn resolve_spent_unconfirmed_with_inputs(conn: &Connection, account_id: i64)
 /// rescan if its spend is re-mined, by this function if a newer copy survives,
 /// or by the base node.
 ///
+/// With `only_unsettled_by_reorg`, only rows whose spend a reorg removed (they
+/// have a soft-deleted input record) are resolved; see
+/// [`get_unresolved_spent_unconfirmed_outputs`].
+///
 /// Returns the number of rows resolved.
-pub fn resolve_superseded_spent_unconfirmed(conn: &Connection, account_id: i64) -> WalletDbResult<u64> {
+pub fn resolve_superseded_spent_unconfirmed(
+    conn: &Connection,
+    account_id: i64,
+    only_unsettled_by_reorg: bool,
+) -> WalletDbResult<u64> {
     let superseded: Vec<(i64, i64, i64, Vec<u8>)> = {
         let mut stmt = conn.prepare_cached(
             r#"
@@ -1363,6 +1371,9 @@ pub fn resolve_superseded_spent_unconfirmed(conn: &Connection, account_id: i64) 
                 LIMIT 1
             )
             WHERE o.account_id = :account_id AND o.status = :spent_unconfirmed AND o.deleted_at IS NULL
+              AND (NOT :only_reorged OR EXISTS (
+                  SELECT 1 FROM inputs d WHERE d.output_id = o.id AND d.deleted_at IS NOT NULL
+              ))
             "#,
         )?;
         let rows = stmt.query_map(
@@ -1371,6 +1382,7 @@ pub fn resolve_superseded_spent_unconfirmed(conn: &Connection, account_id: i64) 
                 ":spent_unconfirmed": OutputStatus::SpentUnconfirmed.to_string(),
                 ":unconfirmed": OutputStatus::Unconfirmed.to_string(),
                 ":rejected": OutputStatus::Rejected.to_string(),
+                ":only_reorged": only_unsettled_by_reorg,
             },
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
@@ -1447,9 +1459,15 @@ pub struct UnresolvedSpentOutput {
 
 /// Returns info for remaining `SpentUnconfirmed` outputs that have no matching input.
 /// These need to be verified against the base node.
+///
+/// With `only_unsettled_by_reorg`, only rows whose spend a reorg removed (a
+/// soft-deleted input record) are returned. A row a FastSync backfill stored has
+/// never had an input record, so the scan's post-scan pass leaves an unfinished
+/// backfill's rows to the backfill, which reads their real spends.
 pub fn get_unresolved_spent_unconfirmed_outputs(
     conn: &Connection,
     account_id: i64,
+    only_unsettled_by_reorg: bool,
 ) -> WalletDbResult<Vec<UnresolvedSpentOutput>> {
     let spent_unconfirmed = OutputStatus::SpentUnconfirmed.to_string();
 
@@ -1460,6 +1478,9 @@ pub fn get_unresolved_spent_unconfirmed_outputs(
         WHERE account_id = :account_id
           AND status = :status
           AND deleted_at IS NULL
+          AND (NOT :only_reorged OR EXISTS (
+              SELECT 1 FROM inputs d WHERE d.output_id = outputs.id AND d.deleted_at IS NOT NULL
+          ))
         ORDER BY mined_in_block_height
         "#,
     )?;
@@ -1468,6 +1489,7 @@ pub fn get_unresolved_spent_unconfirmed_outputs(
         named_params! {
             ":account_id": account_id,
             ":status": spent_unconfirmed,
+            ":only_reorged": only_unsettled_by_reorg,
         },
         |row| {
             Ok(UnresolvedSpentOutput {
