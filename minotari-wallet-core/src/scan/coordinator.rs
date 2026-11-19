@@ -455,6 +455,7 @@ impl ScanCoordinator {
 
                 let shared_blocks = Arc::new(scanned_blocks);
 
+                let mut chain_changed = None;
                 for account_id in &active_account_ids {
                     let Some(target) = targets.iter_mut().find(|target| target.account.id == *account_id) else {
                         return Err(ScanError::Fatal(anyhow::anyhow!(
@@ -467,7 +468,7 @@ impl ScanCoordinator {
                         .transaction_monitor
                         .refresh_pending_outbound(&self.pool, target.account.id)
                         .map_err(ScanError::Fatal)?;
-                    let events = db_handler
+                    let events = match db_handler
                         .process_blocks(
                             shared_blocks.clone(),
                             *account_id,
@@ -475,7 +476,17 @@ impl ScanCoordinator {
                             self.webhook_config.clone(),
                             target.next_block_to_scan,
                         )
-                        .await?;
+                        .await
+                    {
+                        Ok(events) => events,
+                        // A different block at a height already scanned: nothing of the
+                        // batch was recorded. See the reorg check below.
+                        Err(ScanError::Intermittent(e)) => {
+                            chain_changed = Some(e);
+                            break;
+                        },
+                        Err(e) => return Err(e),
+                    };
                     self.forward_block_events(&mut block_events).await;
                     Self::push_events_with_limit(&mut all_events, events, max_buffered_events);
                     if let Some(last) = shared_blocks.last() {
@@ -498,13 +509,23 @@ impl ScanCoordinator {
                     }
                 }
 
-                blocks_since_reorg_check = blocks_since_reorg_check.saturating_add(new_blocks_count);
-                total_scanned_globally = total_scanned_globally.saturating_add(new_blocks_count);
+                if chain_changed.is_none() {
+                    blocks_since_reorg_check = blocks_since_reorg_check.saturating_add(new_blocks_count);
+                    total_scanned_globally = total_scanned_globally.saturating_add(new_blocks_count);
+                }
 
-                if blocks_since_reorg_check >= self.reorg_check_interval {
+                // The chain changed under the scan: the reorg check rolls back from the
+                // changed height, and the scan starts again there.
+                if chain_changed.is_some() || blocks_since_reorg_check >= self.reorg_check_interval {
                     let rewound = self
                         .check_global_reorgs(&mut targets, &db_handler, scanner, scanning_offset, &cancel_token)
                         .await?;
+                    if let Some(e) = chain_changed
+                        && !rewound
+                        && !cancel_token.as_ref().is_some_and(|token| token.is_cancelled())
+                    {
+                        return Err(ScanError::Intermittent(e));
+                    }
                     blocks_since_reorg_check = 0;
                     // The stream still continues from the old heights: rescan from the fork.
                     if rewound {
@@ -1884,7 +1905,9 @@ mod tests {
     /// header requests while `slow_headers`. The birthday is at `BIRTHDAY_HEIGHT`;
     /// its lookup fails if `fail_birthday` and hangs while `slow_birthday`.
     /// `refork_from: Some(from)` forks the chain anew from `from` whenever a
-    /// header at or above it is asked for.
+    /// header at or above it is asked for. While `fork_tip_on_reread` is set, the
+    /// next block download starting at the tip forks the tip first, after the
+    /// header check that came before it saw the old block.
     struct MockChain {
         tip: u64,
         fork_from: Arc<AtomicU64>,
@@ -1898,6 +1921,7 @@ mod tests {
         forks: AtomicU64,
         /// The outputs and input hashes of the tip block.
         tip_utxos: Arc<std::sync::Mutex<TipUtxos>>,
+        fork_tip_on_reread: Arc<AtomicBool>,
     }
 
     type TipUtxos = (Vec<TransactionOutput>, Vec<Vec<u8>>);
@@ -1926,6 +1950,7 @@ mod tests {
                 refork_from: None,
                 forks: AtomicU64::new(0),
                 tip_utxos: Arc::default(),
+                fork_tip_on_reread: Arc::default(),
             }
         }
 
@@ -1992,6 +2017,9 @@ mod tests {
                 },
                 "/sync_utxos_by_block" => {
                     let start = height_of(&query_param(request, "start_header_hash"));
+                    if start == self.tip && self.fork_tip_on_reread.swap(false, Ordering::SeqCst) {
+                        self.fork_from.store(self.tip, Ordering::SeqCst);
+                    }
                     let limit: u64 = query_param(request, "limit").parse().expect("limit");
                     let last = (start + limit - 1).min(self.tip);
                     let mut blocks = Vec::new();
@@ -3040,6 +3068,64 @@ mod tests {
             )
             .expect("ledger");
         assert_eq!((credits, debits), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_continuous_scan_whose_tip_block_changes_before_its_re_read_rolls_the_old_block_back() {
+        let chain = MockChain::new(1505);
+        let tip_utxos = chain.tip_utxos.clone();
+        let fork_on_reread = chain.fork_tip_on_reread.clone();
+        let mut setup = setup_chain(1500, chain, 1_000).await;
+        let account = account(&setup.pool);
+        let key_manager = account.get_key_manager("password").expect("key manager");
+        let received = create_wallet_output_with_data(
+            script!(Nop).unwrap(),
+            OutputFeatures::default(),
+            &TestParams::new(&key_manager),
+            MicroMinotari(2_000_000),
+            &key_manager,
+        )
+        .expect("wallet output")
+        .to_transaction_output()
+        .expect("transaction output");
+        *tip_utxos.lock().expect("tip utxos") = (vec![received.clone()], Vec::new());
+
+        // After the tip is scanned, the next poll's header check still sees its block, but the
+        // re-read finds another block at that height, without the wallet output.
+        let mut waits = 0;
+        run_continuous_until(&mut setup, |e| {
+            if is_waiting(e) {
+                waits += 1;
+                if waits == 1 {
+                    tip_utxos.lock().expect("tip utxos").0.clear();
+                    fork_on_reread.store(true, Ordering::SeqCst);
+                }
+            }
+            waits == 2
+        })
+        .await;
+
+        let conn = setup.pool.get().expect("conn");
+        let (active, total): (i64, i64) = conn
+            .query_row(
+                r#"
+                SELECT
+                    (SELECT COUNT(*) FROM outputs WHERE output_hash = :hash AND deleted_at IS NULL),
+                    (SELECT COALESCE(SUM(balance_credit), 0) - COALESCE(SUM(balance_debit), 0)
+                     FROM balance_changes WHERE account_id = :account_id)
+                "#,
+                rusqlite::named_params! { ":hash": received.hash().to_vec(), ":account_id": setup.account_id },
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("ledger");
+        assert_eq!((active, total), (0, 0), "the replaced block's output is rolled back");
+        let tips: Vec<Vec<u8>> = get_scanned_tip_blocks_by_account(&conn, setup.account_id)
+            .expect("tips")
+            .into_iter()
+            .filter(|t| t.height == 1505)
+            .map(|t| t.hash)
+            .collect();
+        assert_eq!(tips, vec![forked_block_hash(1505)]);
     }
 
     #[tokio::test]

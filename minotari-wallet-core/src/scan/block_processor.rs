@@ -901,6 +901,14 @@ impl<E: EventSender> BlockProcessor<E> {
             .map(Option::as_ref)
     }
 
+    /// Drops what the processor holds of a batch whose transaction was rolled back.
+    pub fn discard_batch(&mut self) {
+        self.current_block = None;
+        self.send_block = None;
+        self.unmatched_inputs.clear();
+        self.wallet_events.clear();
+    }
+
     /// Warns about the inputs still unmatched in each account's open block. Call
     /// at the end of a batch; the inputs stay open, in case the next result
     /// continues the block.
