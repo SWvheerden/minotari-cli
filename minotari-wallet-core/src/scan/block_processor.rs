@@ -901,6 +901,14 @@ impl<E: EventSender> BlockProcessor<E> {
             .map(Option::as_ref)
     }
 
+    /// Drops what the processor holds of a batch whose transaction was rolled back.
+    pub fn discard_batch(&mut self) {
+        self.current_block = None;
+        self.send_block = None;
+        self.unmatched_inputs.clear();
+        self.wallet_events.clear();
+    }
+
     /// Warns about the inputs still unmatched in each account's open block. Call
     /// at the end of a batch; the inputs stay open, in case the next result
     /// continues the block.
@@ -3885,6 +3893,136 @@ mod tests {
         );
     }
 
+    fn rollback_to(conn: &mut Connection, account_id: i64, height: u64) {
+        let tx = conn.transaction().expect("tx");
+        crate::scan::reorg::rollback_from_height(&tx, account_id, height, None).expect("rollback");
+        tx.commit().expect("commit");
+    }
+
+    #[test]
+    fn a_fork_between_an_older_copy_and_its_inferred_spend_gives_the_copy_back() {
+        // The copy at 10 is inferred spent because a newer copy is at 30. A fork at 15
+        // removes the newer copy, and the new chain does not spend the copy at 10.
+        let wallet = test_wallet();
+        let mut conn = wallet.pool.get().expect("conn");
+        let a = test_wallet_output(10_000, 1);
+        store_newer_copy_then_older(&wallet, &conn, &a);
+        db::resolve_spent_unconfirmed_with_newer_copy(&conn, wallet.account_id, false).expect("resolve");
+        assert_eq!(total(&conn, wallet.account_id), 10_000);
+
+        rollback_to(&mut conn, wallet.account_id, 15);
+        process(
+            &mut processor(&wallet, false),
+            &conn,
+            wallet.account_id,
+            &[block_with_hash(15, hash(98), Vec::new(), Vec::new())],
+        );
+        // What the scan's post-scan pass does once caught up.
+        db::resolve_spent_unconfirmed_with_newer_copy(&conn, wallet.account_id, true).expect("resolve");
+
+        let older = &instances(&conn, wallet.account_id, &a)[0];
+        let status = db::get_output_by_id(&conn, older.id)
+            .expect("row")
+            .expect("exists")
+            .status;
+        assert_eq!(
+            status, "SPENT_UNCONFIRMED",
+            "left to be settled again, not spent for good"
+        );
+        assert_eq!(total(&conn, wallet.account_id), 10_000, "the copy's value is back");
+        let unresolved =
+            db::get_unresolved_spent_unconfirmed_outputs(&conn, wallet.account_id, true).expect("unresolved");
+        assert_eq!(unresolved.len(), 1, "the base node settles it");
+        assert_eq!(unresolved[0].output_id, older.id);
+    }
+
+    #[test]
+    fn a_fork_between_an_inferred_spend_and_the_newer_copy_keeps_the_balance() {
+        // The copy at 10 was really spent (at 20, never stored); the newer copy is at 30.
+        // A fork at 25 removes the newer copy and the inferred spend, then the newer copy is mined again.
+        let wallet = test_wallet();
+        let mut conn = wallet.pool.get().expect("conn");
+        let a = test_wallet_output(10_000, 1);
+        store_newer_copy_then_older(&wallet, &conn, &a);
+        db::resolve_spent_unconfirmed_with_newer_copy(&conn, wallet.account_id, false).expect("resolve");
+        // The inferred spend is at the newer copy's block, the latest it can be in.
+        let rows = instances(&conn, wallet.account_id, &a);
+        assert_eq!(rows[0].spent_in_block_hash, Some(rows[1].mined_in_block_hash.clone()));
+        let before = total(&conn, wallet.account_id);
+        assert_eq!(before, 10_000);
+
+        rollback_to(&mut conn, wallet.account_id, 25);
+        process(
+            &mut processor(&wallet, false),
+            &conn,
+            wallet.account_id,
+            &[block(30, vec![a.clone()], Vec::new())],
+        );
+        db::resolve_spent_unconfirmed_with_newer_copy(&conn, wallet.account_id, true).expect("resolve");
+
+        assert_eq!(total(&conn, wallet.account_id), before);
+        assert!(instances(&conn, wallet.account_id, &a)[0].spent_in_block_hash.is_some());
+    }
+
+    #[test]
+    fn a_reorg_keeps_a_rebroadcast_sends_inputs_spent_and_unsettles_a_spend_by_a_request_that_is_gone() {
+        let wallet = test_wallet();
+        let mut conn = wallet.pool.get().expect("conn");
+        let send = record_send(&wallet, &conn, 1, &[1], Some(3));
+        // Another output, spent in the same block under a lock of a request that is gone.
+        let other = test_wallet_output(7_000, 5);
+        let (other_id, _) = db::insert_output(
+            &conn,
+            wallet.account_id,
+            &wallet.view_key,
+            &other.output_hash(),
+            &other,
+            10,
+            &hash(11),
+            1_700_000_000,
+            None,
+            None,
+            FixedHash::zero(),
+            false,
+        )
+        .expect("other output");
+        db::lock_output(&conn, other_id, "gone", Utc::now()).expect("lock");
+
+        let mined = block(
+            50,
+            vec![send.change.clone().unwrap()],
+            vec![send.input_hashes[0], other.output_hash()],
+        );
+        process(
+            &mut processor(&wallet, true),
+            &conn,
+            wallet.account_id,
+            &[mined, block(51, Vec::new(), Vec::new())],
+        );
+        assert_eq!(
+            completed(&conn, send.tx_id).status,
+            db::CompletedTransactionStatus::MinedUnconfirmed
+        );
+
+        rollback_to(&mut conn, wallet.account_id, 50);
+
+        // The send is rebroadcast: its input stays spent and its own.
+        assert_eq!(
+            completed(&conn, send.tx_id).status,
+            db::CompletedTransactionStatus::Completed
+        );
+        let input: (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, locked_by_request_id FROM outputs WHERE output_hash = :hash AND deleted_at IS NULL",
+                named_params! { ":hash": send.input_hashes[0].as_slice() },
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("input");
+        assert_eq!(input, ("SPENT".to_string(), Some(send.request_id.clone())));
+        // Nothing can land under the dead lock: the spend is settled again.
+        assert_eq!(output_row(&conn, &other.output_hash()).1, "SPENT_UNCONFIRMED");
+    }
+
     #[test]
     fn an_older_copy_found_in_backfill_is_resolved_spent_by_its_newer_copy() {
         let wallet = test_wallet();
@@ -3900,7 +4038,7 @@ mod tests {
         }
 
         for _ in 0..2 {
-            db::resolve_spent_unconfirmed_with_newer_copy(&conn, wallet.account_id).expect("resolve");
+            db::resolve_spent_unconfirmed_with_newer_copy(&conn, wallet.account_id, false).expect("resolve");
         }
 
         let rows = instances(&conn, wallet.account_id, &a);
@@ -3918,7 +4056,7 @@ mod tests {
         assert_eq!(total(&conn, wallet.account_id), 10_000);
         // The node is asked about the newer copy only.
         assert!(
-            db::get_unresolved_spent_unconfirmed_outputs(&conn, wallet.account_id)
+            db::get_unresolved_spent_unconfirmed_outputs(&conn, wallet.account_id, false)
                 .expect("unresolved")
                 .is_empty()
         );
@@ -4118,14 +4256,14 @@ mod tests {
             wallet.account_id,
             &[block_with_hash(20, hash(99), vec![a.clone()], Vec::new())],
         );
-        db::resolve_spent_unconfirmed_with_newer_copy(&conn, wallet.account_id).expect("resolve");
+        db::resolve_spent_unconfirmed_with_newer_copy(&conn, wallet.account_id, false).expect("resolve");
 
         assert_eq!(instances(&conn, wallet.account_id, &a).len(), 1);
         assert_eq!(ledger_counts(&conn, wallet.account_id), (1, 0));
         assert_eq!(total(&conn, wallet.account_id), 10_000);
         // Nothing is left for the node to mark unspent.
         assert!(
-            db::get_unresolved_spent_unconfirmed_outputs(&conn, wallet.account_id)
+            db::get_unresolved_spent_unconfirmed_outputs(&conn, wallet.account_id, false)
                 .expect("unresolved")
                 .is_empty()
         );
@@ -4255,7 +4393,7 @@ mod tests {
             wallet.account_id,
             std::slice::from_ref(&old_spend),
         );
-        db::resolve_spent_unconfirmed_with_newer_copy(&conn, wallet.account_id).expect("resolve");
+        db::resolve_spent_unconfirmed_with_newer_copy(&conn, wallet.account_id, false).expect("resolve");
 
         let rows = instances(&conn, wallet.account_id, &a);
         assert_eq!(

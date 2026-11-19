@@ -1,6 +1,6 @@
 use crate::{
     ScanError, WalletEvent,
-    db::{SqlitePool, WalletDbError, prune_scanned_tip_blocks},
+    db::{SqlitePool, WalletDbError, is_other_block_scanned_at_height, prune_scanned_tip_blocks},
     scan::{EventSender, block_processor::BlockProcessor},
     webhooks::WebhookTriggerConfig,
 };
@@ -63,13 +63,14 @@ impl<E: EventSender + Clone + Send + 'static> ScanDbHandler<E> {
         block_processor.set_has_pending_outbound(has_pending_outbound);
         block_processor.set_webhook_config(webhook_config);
 
-        tokio::task::spawn_blocking(move || {
+        let (processor, result) = tokio::task::spawn_blocking(move || {
+            let mut processor = block_processor;
+            let mut process = || {
             let mut conn = pool.get().map_err(WalletDbError::from)?;
 
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(WalletDbError::from)?;
-            let mut processor = block_processor;
 
             // Heights must arrive in an unbroken run starting at `next_block_to_scan`.
             // `block.height` is taken as the current chain tip for this account: it
@@ -86,6 +87,7 @@ impl<E: EventSender + Clone + Send + 'static> ScanDbHandler<E> {
             // block with more outputs than the node's chunk size is split across
             // several `BlockScanResult`s that all carry the same height.
             let mut last_height: Option<u64> = None;
+            let mut last_hash = None;
 
             for block in blocks.iter() {
                 // The base node never truncates a block: it sends every chunk of a
@@ -103,14 +105,34 @@ impl<E: EventSender + Clone + Send + 'static> ScanDbHandler<E> {
                     Some(last) => block.height == last || block.height == last.saturating_add(1),
                 };
                 if !permitted {
-                    return Err(WalletDbError::Unexpected(format!(
+                    return Err(ScanError::DbError(WalletDbError::Unexpected(format!(
                         "Base node returned a non-contiguous block batch for account {}: expected height {}, got {}",
                         target_account_id,
                         last_height.map_or(next_block_to_scan, |h| h.saturating_add(1)),
                         block.height
+                    ))));
+                }
+                // Every result at a height is the block the wallet already has there,
+                // or, for a repeat within the batch, the block of the previous result.
+                // Another block at that height means the chain changed under the scan:
+                // stop before recording anything, so a reorg check rolls back from
+                // that height (the main scan loop runs one at once; other callers
+                // return the error and the next scan's start-up check does). Recorded
+                // next to the first block, the reorg check would stop at it and roll
+                // back only above that height, keeping the first block's outputs.
+                let other_block = if last_height == Some(block.height) {
+                    last_hash != Some(block.block_hash)
+                } else {
+                    is_other_block_scanned_at_height(&tx, target_account_id, block.height, block.block_hash.as_slice())?
+                };
+                if other_block {
+                    return Err(ScanError::Intermittent(format!(
+                        "Base node returned a different block at height {} than the one already scanned there",
+                        block.height
                     )));
                 }
                 last_height = Some(block.height);
+                last_hash = Some(block.block_hash);
 
                 processor
                     .process_block(&tx, block, target_account_id)
@@ -138,19 +160,24 @@ impl<E: EventSender + Clone + Send + 'static> ScanDbHandler<E> {
             let events = processor.take_wallet_events();
             tx.commit().map_err(WalletDbError::from)?;
 
-            Ok::<(Vec<WalletEvent>, BlockProcessor<E>), WalletDbError>((events, processor))
+            Ok::<Vec<WalletEvent>, ScanError>(events)
+            };
+            let result = process();
+            // The processor outlives a failed batch, so the scan can carry on after
+            // the reorg check; what it held of the rolled-back batch is dropped.
+            if result.is_err() {
+                processor.discard_batch();
+            }
+            (processor, result)
         })
         .await
         .map_err(|e| {
             let err = anyhow::anyhow!("Block processing task failed: {}", e);
             error!("Block processing task failed: {}", e);
             ScanError::Fatal(err)
-        })?
-        .map_err(ScanError::from)
-        .map(|(events, processor)| {
-            self.block_processor = Some(processor);
-            events
-        })
+        })?;
+        self.block_processor = Some(processor);
+        result
     }
 
     pub async fn prune_tips(&self, account_id: i64, height: u64) -> Result<(), ScanError> {
@@ -237,6 +264,79 @@ mod tests {
             .await
             .expect_err("a batch starting past the resume height must abort");
         assert!(err.to_string().contains("non-contiguous"), "got: {err}");
+    }
+
+    fn tip_count(handler: &ScanDbHandler<NoopEventSender>, account_id: i64) -> i64 {
+        let conn = handler.pool.get().expect("conn");
+        conn.query_row(
+            "SELECT COUNT(*) FROM scanned_tip_blocks WHERE account_id = ?1",
+            [account_id],
+            |row| row.get(0),
+        )
+        .expect("count")
+    }
+
+    fn other_block(height: u64) -> BlockScanResult {
+        let mut other = block(height);
+        other.block_hash = FixedHash::from([0xEE; 32]);
+        other
+    }
+
+    #[tokio::test]
+    async fn two_blocks_at_one_height_in_a_batch_are_refused_and_nothing_is_written() {
+        let (mut handler, account_id, _dir) = handler("two_blocks.db");
+
+        let err = handler
+            .process_blocks(
+                Arc::new(vec![block(100), other_block(100)]),
+                account_id,
+                false,
+                None,
+                100,
+            )
+            .await
+            .expect_err("two blocks at one height");
+        assert!(matches!(err, ScanError::Intermittent(_)), "got: {err}");
+        assert_eq!(tip_count(&handler, account_id), 0);
+    }
+
+    #[tokio::test]
+    async fn a_different_block_at_an_already_scanned_height_is_refused_and_the_handler_carries_on() {
+        let (mut handler, account_id, _dir) = handler("changed_block.db");
+        handler
+            .process_blocks(Arc::new(vec![block(100)]), account_id, false, None, 100)
+            .await
+            .expect("first read");
+
+        let err = handler
+            .process_blocks(Arc::new(vec![other_block(100)]), account_id, false, None, 100)
+            .await
+            .expect_err("a different block at height 100");
+        assert!(matches!(err, ScanError::Intermittent(_)), "got: {err}");
+        assert_eq!(tip_count(&handler, account_id), 1);
+
+        // The handler keeps its block processor: the same block read again is fine.
+        handler
+            .process_blocks(Arc::new(vec![block(100)]), account_id, false, None, 100)
+            .await
+            .expect("re-read");
+    }
+
+    #[tokio::test]
+    async fn a_block_matching_any_of_two_stored_blocks_at_its_height_is_accepted() {
+        // An older database can hold two blocks at one height; the stale one sorts first.
+        let (mut handler, account_id, _dir) = handler("two_stored.db");
+        {
+            let conn = handler.pool.get().expect("conn");
+            crate::db::insert_scanned_tip_block(&conn, account_id, 100, &[0x01; 32]).expect("stale");
+            crate::db::insert_scanned_tip_block(&conn, account_id, 100, block(100).block_hash.as_slice())
+                .expect("current");
+        }
+
+        handler
+            .process_blocks(Arc::new(vec![block(100)]), account_id, false, None, 100)
+            .await
+            .expect("the block matches one of them");
     }
 
     #[tokio::test]
