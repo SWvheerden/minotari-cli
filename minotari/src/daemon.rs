@@ -425,7 +425,7 @@ impl Daemon {
                             ScanError::InvalidNodeData(err_msg) => {
                                 error!(
                                     error:% = err_msg,
-                                    base_url:% = self.base_url;
+                                    base_url:% = crate::log::node_url_for_log(&self.base_url);
                                     "The base node sent invalid block data; scanning cannot advance until it serves valid data or the wallet is pointed at another node"
                                 );
                                 if self.wait_for_next_cycle(&mut shutdown_rx).await {
@@ -617,16 +617,23 @@ mod tests {
             dir.path().join("burn_proofs"),
         );
 
+        // One cycle must end in `InvalidNodeData`, so the loop below exercises that arm and not a
+        // download retried inside the scanner.
+        let result = daemon.scan_and_sleep().await;
+        assert!(matches!(result, Err(ScanError::InvalidNodeData(_))), "{result:?}");
+        let cycle_downloads = downloads.load(std::sync::atomic::Ordering::SeqCst);
+
         let (_shutdown_tx, shutdown_rx) = broadcast::channel(1);
-        let second_download = async {
-            while downloads.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+        // Two loop cycles on top of the one above, so the loop must have retried after the first.
+        let two_loop_cycles = async {
+            while downloads.load(std::sync::atomic::Ordering::SeqCst) < cycle_downloads * 3 {
                 sleep(Duration::from_millis(10)).await;
             }
         };
         tokio::time::timeout(Duration::from_secs(30), async {
             tokio::select! {
                 result = daemon.scan_and_sleep_loop(shutdown_rx) => panic!("the scan loop stopped: {result:?}"),
-                () = second_download => {},
+                () = two_loop_cycles => {},
             }
         })
         .await

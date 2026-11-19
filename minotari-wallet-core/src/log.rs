@@ -56,6 +56,20 @@ pub fn sanitize_node_text(text: &str) -> String {
         .collect()
 }
 
+/// A base node URL safe to log: any username, password, query and fragment are removed.
+pub fn node_url_for_log(url: &str) -> String {
+    // Without a host (`user:secret@node` parses with scheme `user`), the whole text would be the path.
+    let Some(mut url) = url::Url::parse(url).ok().filter(|url| url.has_host()) else {
+        return "<unparseable base URL>".to_string();
+    };
+    // These only fail for `file:` URLs, which cannot hold credentials.
+    let _unused = url.set_username("");
+    let _unused = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,6 +84,17 @@ mod tests {
         let long = "x".repeat(10_000);
         assert_eq!(sanitize_node_text(&long).chars().count(), 256);
         assert_eq!(sanitize_node_text("DoubleSpend"), "DoubleSpend");
+    }
+
+    #[test]
+    fn node_url_for_log_drops_credentials_and_query() {
+        assert_eq!(
+            node_url_for_log("http://user:secret@node.example:9000/rpc?token=abc#frag"),
+            "http://node.example:9000/rpc"
+        );
+        assert_eq!(node_url_for_log("https://rpc.tari.com"), "https://rpc.tari.com/");
+        assert_eq!(node_url_for_log("user:secret@node"), "<unparseable base URL>");
+        assert_eq!(node_url_for_log("not a url"), "<unparseable base URL>");
     }
 
     /// The `.rs` files under `dir`, recursively.
