@@ -228,11 +228,13 @@ impl Daemon {
         let unlocker = TransactionUnlocker::new(db_pool.clone());
         let unlocker_task_handle = unlocker.run(shutdown_tx.subscribe());
 
-        let http_client = WalletHttpClient::new(
-            self.base_url
-                .parse()
-                .map_err(|e| ScanError::Fatal(anyhow!("Invalid base URL '{}': {}", self.base_url, e)))?,
-        )?;
+        let http_client = WalletHttpClient::new(self.base_url.parse().map_err(|e| {
+            ScanError::Fatal(anyhow!(
+                "Invalid base URL '{}': {}",
+                crate::log::node_url_for_log(&self.base_url),
+                e
+            ))
+        })?)?;
         let burn_proof_worker = BurnProofWorker::new(
             db_pool.clone(),
             http_client,

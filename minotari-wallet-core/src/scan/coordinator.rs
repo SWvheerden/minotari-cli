@@ -1967,7 +1967,8 @@ mod tests {
     /// header at or above it is asked for. While `fork_tip_on_reread` is set, the
     /// next block download starting at the tip forks the tip first, after the
     /// header check that came before it saw the old block. The block at
-    /// `bad_timestamp_at` has an out-of-range mined timestamp.
+    /// `bad_timestamp_at` has an out-of-range mined timestamp and the one at
+    /// `bad_hash_at` a malformed hash.
     struct MockChain {
         tip: u64,
         fork_from: Arc<AtomicU64>,
@@ -1985,6 +1986,7 @@ mod tests {
         /// The answer to `/get_utxos_deleted_info`; the request fails without one.
         deleted_info: Option<GetUtxosDeletedInfoResponse>,
         bad_timestamp_at: Option<u64>,
+        bad_hash_at: Option<u64>,
     }
 
     type TipUtxos = (Vec<TransactionOutput>, Vec<Vec<u8>>);
@@ -2016,6 +2018,7 @@ mod tests {
                 fork_tip_on_reread: Arc::default(),
                 deleted_info: None,
                 bad_timestamp_at: None,
+                bad_hash_at: None,
             }
         }
 
@@ -2106,7 +2109,11 @@ mod tests {
                             (Vec::new(), Vec::new())
                         };
                         blocks.push(BlockUtxoInfo {
-                            header_hash: self.hash(height),
+                            header_hash: if self.bad_hash_at == Some(height) {
+                                vec![1; 3]
+                            } else {
+                                self.hash(height)
+                            },
                             height,
                             outputs,
                             inputs,
@@ -3870,6 +3877,20 @@ mod tests {
             .await;
         assert!(matches!(result, Err(ScanError::InvalidNodeData(_))), "{result:?}");
         assert!(max_tip_height(&setup.pool, setup.account_id) < 1485);
+    }
+
+    #[tokio::test]
+    async fn an_out_of_range_timestamp_is_reported_over_other_bad_data_in_the_same_batch() {
+        let mut chain = MockChain::new(1500);
+        chain.bad_hash_at = Some(1482);
+        chain.bad_timestamp_at = Some(1485);
+        let setup = setup_chain(1480, chain, 1_000).await;
+
+        let result = setup
+            .coordinator
+            .run(vec![account(&setup.pool)], "password", ScanMode::Full, 0, None)
+            .await;
+        assert!(matches!(result, Err(ScanError::InvalidNodeData(_))), "{result:?}");
     }
 
     #[tokio::test]
