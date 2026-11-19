@@ -8,7 +8,9 @@ use crate::{
     BlockHeaderInfo,
     errors::{WalletError, WalletResult},
     http::models::{HttpBlockHeader, HttpTipInfoResponse, IncompleteScannedOutput, ScanningOutputStruct},
-    scanning::{BlockScanResult, InProgressScan, ScanConfig, TipInfo, interface::BlockchainScanner},
+    scanning::{
+        BlockScanResult, InProgressScan, ScanConfig, TipInfo, interface::BlockchainScanner, validate_mined_timestamp,
+    },
 };
 use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -775,6 +777,15 @@ where
                                 return;
                             },
                         };
+                        let mined_timestamp =
+                            match validate_mined_timestamp(http_block.height, &header_hash, http_block.mined_timestamp)
+                            {
+                                Ok(ts) => ts,
+                                Err(e) => {
+                                    errors.write().expect("write lock should not be poisoned").push(e);
+                                    return;
+                                },
+                            };
                         for output in &http_block.outputs {
                             let scanned_output = match output.clone().try_into() {
                                 Ok(o) => o,
@@ -804,7 +815,7 @@ where
                                     .into_iter()
                                     .map(|i| FixedHash::try_from(i).unwrap_or_default())
                                     .collect(),
-                                mined_timestamp: http_block.mined_timestamp,
+                                mined_timestamp,
                             },
                             wallet_outputs,
                         ));

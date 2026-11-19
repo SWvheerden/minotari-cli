@@ -1,5 +1,9 @@
 use log::{info, trace, warn};
-use minotari_scanning::{HttpBlockchainScanner, scanning::BlockchainScanner};
+use minotari_scanning::{
+    HttpBlockchainScanner,
+    errors::{ScanningError, WalletError},
+    scanning::BlockchainScanner,
+};
 use std::{collections::VecDeque, path::PathBuf, sync::Arc, time::Instant};
 use tari_common_types::{seeds::cipher_seed::BIRTHDAY_GENESIS_FROM_UNIX_EPOCH, types::PrivateKey};
 use tari_transaction_components::key_manager::KeyManager;
@@ -410,10 +414,7 @@ impl ScanCoordinator {
                     .best_block_height;
                 refresh_tip = false;
             }
-            let mut utxo_stream = scanner
-                .scan_blocks(&scanner_config)
-                .await
-                .map_err(|e| ScanError::Intermittent(e.to_string()))?;
+            let mut utxo_stream = scanner.scan_blocks(&scanner_config).await.map_err(scanner_error)?;
             let mut is_batch_empty = false;
             let mut max_new_height_in_batch = 0;
             let mut scanned_in_pass = false;
@@ -433,7 +434,7 @@ impl ScanCoordinator {
                 let Some(response) = response else {
                     break;
                 };
-                let scanned_blocks = response.map_err(|e| ScanError::Intermittent(e.to_string()))?;
+                let scanned_blocks = response.map_err(scanner_error)?;
                 let new_blocks_count = scanned_blocks.len() as u64;
                 is_batch_empty = scanned_blocks.is_empty();
                 // Go on, if we stopped on artificial horizon
@@ -1301,10 +1302,7 @@ impl ScanCoordinator {
         scanner_config.exclude_spent = true;
         scanner_config.exclude_inputs = true;
 
-        let mut utxo_stream = scanner
-            .scan_blocks(&scanner_config)
-            .await
-            .map_err(|e| ScanError::Intermittent(e.to_string()))?;
+        let mut utxo_stream = scanner.scan_blocks(&scanner_config).await.map_err(scanner_error)?;
 
         let mut stop = ScanStop::CaughtUp;
         while let Some(response) = utxo_stream.recv().await {
@@ -1315,7 +1313,7 @@ impl ScanCoordinator {
                 break;
             }
 
-            let scanned_blocks = response.map_err(|e| ScanError::Intermittent(e.to_string()))?;
+            let scanned_blocks = response.map_err(scanner_error)?;
             if scanned_blocks.is_empty() {
                 break;
             }
@@ -1407,10 +1405,7 @@ impl ScanCoordinator {
             )
             .await?;
 
-        let mut utxo_stream = scanner
-            .scan_blocks(&scanner_config)
-            .await
-            .map_err(|e| ScanError::Intermittent(e.to_string()))?;
+        let mut utxo_stream = scanner.scan_blocks(&scanner_config).await.map_err(scanner_error)?;
 
         let mut stop = ScanStop::CaughtUp;
         while let Some(response) = utxo_stream.recv().await {
@@ -1421,7 +1416,7 @@ impl ScanCoordinator {
                 break;
             }
 
-            let scanned_blocks = response.map_err(|e| ScanError::Intermittent(e.to_string()))?;
+            let scanned_blocks = response.map_err(scanner_error)?;
             if scanned_blocks.is_empty() {
                 break;
             }
@@ -1532,10 +1527,7 @@ impl ScanCoordinator {
             )
             .await?;
 
-        let mut utxo_stream = scanner
-            .scan_blocks(&scanner_config)
-            .await
-            .map_err(|e| ScanError::Intermittent(e.to_string()))?;
+        let mut utxo_stream = scanner.scan_blocks(&scanner_config).await.map_err(scanner_error)?;
 
         let mut stop = ScanStop::CaughtUp;
         while let Some(response) = utxo_stream.recv().await {
@@ -1546,7 +1538,7 @@ impl ScanCoordinator {
                 break;
             }
 
-            let scanned_blocks = response.map_err(|e| ScanError::Intermittent(e.to_string()))?;
+            let scanned_blocks = response.map_err(scanner_error)?;
             if scanned_blocks.is_empty() {
                 break;
             }
@@ -1845,6 +1837,15 @@ async fn unless_cancelled<T>(cancel: &Option<CancellationToken>, future: impl Fu
     }
 }
 
+/// Maps a block scanner error to a scan error. Bad block data from the node is reported as
+/// `InvalidNodeData` so the operator can tell it apart from connectivity trouble.
+fn scanner_error(e: WalletError) -> ScanError {
+    match e {
+        WalletError::ScanningError(ScanningError::InvalidBlockData(msg)) => ScanError::InvalidNodeData(msg),
+        e => ScanError::Intermittent(e.to_string()),
+    }
+}
+
 /// Height of the block after `height`.
 ///
 /// Returns an error instead of overflowing if a base node reports a block at `u64::MAX`.
@@ -1965,7 +1966,8 @@ mod tests {
     /// `refork_from: Some(from)` forks the chain anew from `from` whenever a
     /// header at or above it is asked for. While `fork_tip_on_reread` is set, the
     /// next block download starting at the tip forks the tip first, after the
-    /// header check that came before it saw the old block.
+    /// header check that came before it saw the old block. The block at
+    /// `bad_timestamp_at` has an out-of-range mined timestamp.
     struct MockChain {
         tip: u64,
         fork_from: Arc<AtomicU64>,
@@ -1982,6 +1984,7 @@ mod tests {
         fork_tip_on_reread: Arc<AtomicBool>,
         /// The answer to `/get_utxos_deleted_info`; the request fails without one.
         deleted_info: Option<GetUtxosDeletedInfoResponse>,
+        bad_timestamp_at: Option<u64>,
     }
 
     type TipUtxos = (Vec<TransactionOutput>, Vec<Vec<u8>>);
@@ -2012,6 +2015,7 @@ mod tests {
                 tip_utxos: Arc::default(),
                 fork_tip_on_reread: Arc::default(),
                 deleted_info: None,
+                bad_timestamp_at: None,
             }
         }
 
@@ -2106,7 +2110,11 @@ mod tests {
                             height,
                             outputs,
                             inputs,
-                            mined_timestamp: 1_700_000_000,
+                            mined_timestamp: if self.bad_timestamp_at == Some(height) {
+                                u64::MAX
+                            } else {
+                                1_700_000_000
+                            },
                         });
                     }
                     let next_header_to_scan = if last < self.tip {
@@ -3835,6 +3843,33 @@ mod tests {
         let reorg = first_reorg(&events);
         assert_eq!(reorg.reorg_from_height, 0);
         assert_eq!(reorg.new_height, 0, "no resume height was chosen");
+    }
+
+    #[test]
+    fn invalid_block_data_maps_to_invalid_node_data_and_other_scanner_errors_stay_intermittent() {
+        let invalid = scanner_error(ScanningError::InvalidBlockData("bad".to_string()).into());
+        assert!(
+            matches!(invalid, ScanError::InvalidNodeData(ref msg) if msg == "bad"),
+            "{invalid:?}"
+        );
+        let other = scanner_error(ScanningError::BlockNotFound("gone".to_string()).into());
+        assert!(matches!(other, ScanError::Intermittent(_)), "{other:?}");
+        let other = scanner_error(WalletError::NetworkError("down".to_string()));
+        assert!(matches!(other, ScanError::Intermittent(_)), "{other:?}");
+    }
+
+    #[tokio::test]
+    async fn a_block_with_an_out_of_range_timestamp_fails_the_scan_without_advancing() {
+        let mut chain = MockChain::new(1500);
+        chain.bad_timestamp_at = Some(1485);
+        let setup = setup_chain(1480, chain, 1_000).await;
+
+        let result = setup
+            .coordinator
+            .run(vec![account(&setup.pool)], "password", ScanMode::Full, 0, None)
+            .await;
+        assert!(matches!(result, Err(ScanError::InvalidNodeData(_))), "{result:?}");
+        assert!(max_tip_height(&setup.pool, setup.account_id) < 1485);
     }
 
     #[tokio::test]

@@ -104,6 +104,9 @@ pub enum ScanningError {
 
     #[error("Scan rate limit exceeded: {0}")]
     ScanRateLimitExceeded(String),
+
+    #[error("Invalid block data from base node: {0}")]
+    InvalidBlockData(String),
 }
 
 impl From<String> for WalletError {

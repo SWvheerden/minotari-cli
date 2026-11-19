@@ -15,6 +15,7 @@
 
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tari_common_types::types::FixedHash;
 use tari_transaction_components::transaction_components::WalletOutput;
@@ -34,7 +35,10 @@ pub use http::scanner as http_scanner;
 #[cfg(feature = "http")]
 pub use http_scanner::HttpBlockchainScanner;
 
-use crate::http::models::IncompleteScannedOutput;
+use crate::{
+    errors::{ScanningError, WalletResult},
+    http::models::IncompleteScannedOutput,
+};
 
 mod interface;
 pub use interface::BlockchainScanner;
@@ -174,6 +178,20 @@ pub struct BlockScanResult {
     pub mined_timestamp: u64,
 }
 
+/// Rejects a node-reported block timestamp that the wallet cannot store as a `DateTime<Utc>`.
+pub(crate) fn validate_mined_timestamp(height: u64, block_hash: &FixedHash, timestamp: u64) -> WalletResult<u64> {
+    i64::try_from(timestamp)
+        .ok()
+        .and_then(|ts| DateTime::<Utc>::from_timestamp(ts, 0))
+        .map(|_| timestamp)
+        .ok_or_else(|| {
+            ScanningError::InvalidBlockData(format!(
+                "Block {height} ({block_hash}) has out-of-range mined timestamp {timestamp}"
+            ))
+            .into()
+        })
+}
+
 /// Block header information
 #[derive(Debug, Clone)]
 pub struct BlockHeaderInfo {
@@ -238,5 +256,41 @@ impl InProgressScan {
 
     pub const fn get_config(&self) -> Option<&ScanConfig> {
         self.config.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::errors::WalletError;
+
+    fn is_valid(timestamp: u64) -> bool {
+        validate_mined_timestamp(1, &FixedHash::default(), timestamp).is_ok()
+    }
+
+    #[test]
+    fn mined_timestamp_bounds() {
+        let max_valid = u64::try_from(DateTime::<Utc>::MAX_UTC.timestamp()).unwrap();
+        let now = u64::try_from(Utc::now().timestamp()).unwrap();
+        assert!(is_valid(0));
+        assert!(is_valid(now));
+        assert!(is_valid(max_valid));
+        assert!(!is_valid(max_valid + 1));
+        assert!(!is_valid(10_000_000_000_000));
+        assert!(!is_valid(i64::MAX as u64));
+        assert!(!is_valid(i64::MAX as u64 + 1));
+        assert!(!is_valid(u64::MAX));
+    }
+
+    #[test]
+    fn out_of_range_mined_timestamp_is_invalid_block_data() {
+        let hash = FixedHash::from([7u8; 32]);
+        let err = validate_mined_timestamp(42, &hash, u64::MAX).unwrap_err();
+        let WalletError::ScanningError(ScanningError::InvalidBlockData(msg)) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(msg.contains("42"), "{msg}");
+        assert!(msg.contains(&hash.to_string()), "{msg}");
+        assert!(msg.contains(&u64::MAX.to_string()), "{msg}");
     }
 }

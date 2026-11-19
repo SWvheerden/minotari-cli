@@ -17,6 +17,7 @@ ignored = [
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
+chrono = "0.4.42"
 
 # === Tari Ecosystem Dependencies ===
 tari_common_types = { workspace = true }

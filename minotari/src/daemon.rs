@@ -391,6 +391,7 @@ impl Daemon {
     ///
     /// - **Fatal errors**: Immediately propagate and trigger shutdown
     /// - **Intermittent errors**: Log and retry after the scan interval
+    /// - **Invalid node data**: Log loudly and retry after the scan interval
     /// - **Timeout errors**: Log retry count and continue after interval
     ///
     /// # Parameters
@@ -417,6 +418,16 @@ impl Daemon {
                             },
                             ScanError::Intermittent(err_msg) => {
                                 warn!(error:% = err_msg; "An intermittent error occurred during the scan cycle");
+                                if self.wait_for_next_cycle(&mut shutdown_rx).await {
+                                    return Ok(());
+                                }
+                            },
+                            ScanError::InvalidNodeData(err_msg) => {
+                                error!(
+                                    error:% = err_msg,
+                                    base_url:% = self.base_url;
+                                    "The base node sent invalid block data; scanning cannot advance until it serves valid data or the wallet is pointed at another node"
+                                );
                                 if self.wait_for_next_cycle(&mut shutdown_rx).await {
                                     return Ok(());
                                 }
@@ -502,5 +513,123 @@ mod tests {
                 "{addr} should parse as a socket address"
             );
         }
+    }
+
+    /// A base node with a short chain whose blocks all carry an out-of-range mined timestamp.
+    /// Counts the block downloads it serves.
+    struct BadTimestampNode {
+        downloads: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    const TIP: u64 = 5;
+
+    fn block_hash(height: u64) -> Vec<u8> {
+        let mut hash = vec![0x5A; 32];
+        hash.splice(0..8, height.to_be_bytes());
+        hash
+    }
+
+    impl wiremock::Respond for BadTimestampNode {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            use tari_transaction_components::rpc::models::{
+                BlockUtxoInfo, SyncUtxosByBlockResponseV0, SyncUtxosByBlockResponseV1,
+            };
+            let ok = wiremock::ResponseTemplate::new(200);
+            match request.url.path() {
+                "/get_tip_info" => ok.set_body_json(serde_json::json!({
+                    "metadata": {
+                        "best_block_height": TIP,
+                        "best_block_hash": block_hash(TIP),
+                        "accumulated_difficulty": "0",
+                        "pruned_height": 0,
+                        "timestamp": 0,
+                    }
+                })),
+                "/get_height_at_time" => ok.set_body_json(0u64),
+                "/get_header_by_height" => {
+                    let height: u64 = request
+                        .url
+                        .query_pairs()
+                        .find(|(key, _)| key == "height")
+                        .and_then(|(_, value)| value.parse().ok())
+                        .expect("height");
+                    ok.set_body_json(serde_json::json!({
+                        "height": height,
+                        "hash": block_hash(height),
+                        "timestamp": 1_700_000_000u64,
+                    }))
+                },
+                "/sync_utxos_by_block" => {
+                    self.downloads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let blocks = (0..=TIP)
+                        .map(|height| BlockUtxoInfo {
+                            header_hash: block_hash(height),
+                            height,
+                            outputs: Vec::new(),
+                            inputs: Vec::new(),
+                            mined_timestamp: u64::MAX,
+                        })
+                        .collect();
+                    ok.set_body_json(SyncUtxosByBlockResponseV1::from(SyncUtxosByBlockResponseV0 {
+                        blocks,
+                        has_next_page: false,
+                        next_header_to_scan: Vec::new(),
+                    }))
+                },
+                _ => wiremock::ResponseTemplate::new(404),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_node_data_is_retried_without_stopping_the_scan_loop() {
+        use tari_common_types::seeds::cipher_seed::CipherSeed;
+        use tari_transaction_components::key_manager::wallet_types::{SeedWordsWallet, WalletType};
+
+        let downloads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(BadTimestampNode {
+                downloads: downloads.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let database_file = dir.path().join("daemon.db");
+        let pool = db::init_db(database_file.clone()).unwrap();
+        let wallet = WalletType::SeedWords(SeedWordsWallet::construct_new(CipherSeed::random()).unwrap());
+        db::create_account(&pool.get().unwrap(), "default", &wallet, "password").unwrap();
+
+        let daemon = Daemon::new(
+            Zeroizing::new("password".to_string()),
+            server.uri(),
+            database_file,
+            100,
+            10,
+            0,
+            config("127.0.0.1"),
+            Network::Esmeralda,
+            3,
+            None,
+            None,
+            None,
+            dir.path().join("burn_proofs"),
+        );
+
+        let (_shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let second_download = async {
+            while downloads.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+                sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                result = daemon.scan_and_sleep_loop(shutdown_rx) => panic!("the scan loop stopped: {result:?}"),
+                () = second_download => {},
+            }
+        })
+        .await
+        .expect("the scan loop retries the rejected block");
     }
 }

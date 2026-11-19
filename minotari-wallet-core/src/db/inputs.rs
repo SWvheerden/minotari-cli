@@ -56,8 +56,9 @@ pub fn insert_input(
         "DB: Inserting input"
     );
 
-    #[allow(clippy::cast_possible_wrap)]
-    let timestamp = DateTime::<Utc>::from_timestamp(mined_timestamp as i64, 0)
+    let timestamp = i64::try_from(mined_timestamp)
+        .ok()
+        .and_then(|ts| DateTime::<Utc>::from_timestamp(ts, 0))
         .ok_or_else(|| WalletDbError::Decoding(format!("Invalid mined timestamp: {}", mined_timestamp)))?;
     #[allow(clippy::cast_possible_wrap)]
     let mined_in_block_height = mined_in_block_height as i64;
@@ -178,4 +179,20 @@ pub fn soft_delete_inputs_from_height(conn: &Connection, account_id: i64, height
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::init_db;
+
+    #[test]
+    fn an_out_of_range_mined_timestamp_is_rejected_instead_of_wrapping() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = init_db(temp.path().join("inputs.db")).expect("init db");
+        let conn = pool.get().expect("conn");
+
+        let result = insert_input(&conn, 1, 1, 10, &[1u8; 32], u64::MAX);
+        assert!(matches!(result, Err(WalletDbError::Decoding(_))), "{result:?}");
+    }
 }

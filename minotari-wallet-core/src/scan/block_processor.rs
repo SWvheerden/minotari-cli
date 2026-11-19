@@ -1202,8 +1202,9 @@ impl<E: EventSender> BlockProcessor<E> {
         value: MicroMinotari,
         block: &BlockScanResult,
     ) -> Result<BalanceChange, BlockProcessorError> {
-        #[allow(clippy::cast_possible_wrap)]
-        let effective_date = DateTime::<Utc>::from_timestamp(block.mined_timestamp as i64, 0)
+        let effective_date = i64::try_from(block.mined_timestamp)
+            .ok()
+            .and_then(|ts| DateTime::<Utc>::from_timestamp(ts, 0))
             .unwrap_or_else(Utc::now)
             .naive_utc();
 
@@ -1393,8 +1394,9 @@ fn make_balance_change_for_output(
     height: u64,
     output: &WalletOutput,
 ) -> BalanceChange {
-    #[allow(clippy::cast_possible_wrap)]
-    let effective_date = DateTime::<Utc>::from_timestamp(timestamp as i64, 0)
+    let effective_date = i64::try_from(timestamp)
+        .ok()
+        .and_then(|ts| DateTime::<Utc>::from_timestamp(ts, 0))
         .unwrap_or_else(Utc::now)
         .naive_utc();
 

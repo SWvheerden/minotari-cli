@@ -13,7 +13,9 @@ use std::{sync::RwLock, time::Duration};
 use crate::{
     BlockHeaderInfo,
     errors::{WalletError, WalletResult},
-    scanning::{BlockScanResult, InProgressScan, ScanConfig, TipInfo, interface::BlockchainScanner},
+    scanning::{
+        BlockScanResult, InProgressScan, ScanConfig, TipInfo, interface::BlockchainScanner, validate_mined_timestamp,
+    },
 };
 use async_trait::async_trait;
 use log::error;
@@ -585,6 +587,20 @@ where
                         return;
                     },
                 };
+                let block_hash = tari_block.hash();
+                let mined_timestamp = match validate_mined_timestamp(
+                    tari_block.header.height,
+                    &block_hash,
+                    tari_block.header.timestamp.as_u64(),
+                ) {
+                    Ok(ts) => ts,
+                    Err(e) => {
+                        let _unused = send_scan_result.send(Err(e)).await.inspect_err(|e| {
+                            error!("Failed to send download result with error: {}", e);
+                        });
+                        return;
+                    },
+                };
                 let errors = RwLock::new(Vec::new());
                 let wallet_outputs = RwLock::new(Vec::new());
                 pool.install(|| {
@@ -618,10 +634,10 @@ where
 
                 let block_res = BlockScanResult {
                     height: tari_block.header.height,
-                    block_hash: tari_block.hash(),
+                    block_hash,
                     wallet_outputs: wallet_outputs.into_inner().expect("wallet_outputs lock poisoned"),
                     inputs,
-                    mined_timestamp: tari_block.header.timestamp.as_u64(),
+                    mined_timestamp,
                 };
                 let _unused = send_scan_result.send(Ok(vec![block_res])).await.inspect_err(|e| {
                     error!("Failed to send scan error with error: {}", e);

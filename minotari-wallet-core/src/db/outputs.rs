@@ -211,8 +211,9 @@ pub fn insert_output(
 
     let output_json = serde_json::to_string(&output)?;
 
-    #[allow(clippy::cast_possible_wrap)]
-    let mined_timestamp_dt = DateTime::<Utc>::from_timestamp(mined_timestamp as i64, 0)
+    let mined_timestamp_dt = i64::try_from(mined_timestamp)
+        .ok()
+        .and_then(|ts| DateTime::<Utc>::from_timestamp(ts, 0))
         .ok_or_else(|| WalletDbError::Decoding(format!("Invalid mined timestamp: {}", mined_timestamp)))?;
 
     #[allow(clippy::cast_possible_wrap)]
@@ -301,8 +302,9 @@ pub fn insert_spent_output_if_not_exists(
     let tx_id = derive_output_tx_id(conn, account_id, account_view_key, output_hash, block_height)?;
     let output_json = serde_json::to_string(&output)?;
 
-    #[allow(clippy::cast_possible_wrap)]
-    let mined_timestamp_dt = DateTime::<Utc>::from_timestamp(mined_timestamp as i64, 0)
+    let mined_timestamp_dt = i64::try_from(mined_timestamp)
+        .ok()
+        .and_then(|ts| DateTime::<Utc>::from_timestamp(ts, 0))
         .ok_or_else(|| WalletDbError::Decoding(format!("Invalid mined timestamp: {}", mined_timestamp)))?;
 
     #[allow(clippy::cast_possible_wrap)]
@@ -511,8 +513,9 @@ pub fn confirm_unconfirmed_change_output(
     payment_reference: PaymentReference,
     new_status: OutputStatus,
 ) -> WalletDbResult<Option<i64>> {
-    #[allow(clippy::cast_possible_wrap)]
-    let mined_timestamp_dt = DateTime::<Utc>::from_timestamp(mined_timestamp as i64, 0)
+    let mined_timestamp_dt = i64::try_from(mined_timestamp)
+        .ok()
+        .and_then(|ts| DateTime::<Utc>::from_timestamp(ts, 0))
         .ok_or_else(|| WalletDbError::Decoding(format!("Invalid mined timestamp: {}", mined_timestamp)))?;
     #[allow(clippy::cast_possible_wrap)]
     let block_height = block_height as i64;

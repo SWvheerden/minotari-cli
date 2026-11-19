@@ -28,6 +28,11 @@ pub enum ScanError {
     #[error("Scan timed out after {0} retries")]
     Timeout(u32),
 
+    /// The base node sent block data the wallet cannot accept. Retrying later, or against
+    /// another node, may succeed.
+    #[error("Invalid data from base node: {0}")]
+    InvalidNodeData(String),
+
     /// DB execution failed
     #[error("Database execution error: {0}")]
     DbError(#[from] WalletDbError),
