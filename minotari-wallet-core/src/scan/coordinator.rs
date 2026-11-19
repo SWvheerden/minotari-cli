@@ -862,7 +862,7 @@ impl ScanCoordinator {
         if !stop.runs_post_scan() {
             return Ok(());
         }
-        let events = self.run_post_scan(targets).await?;
+        let events = self.run_post_scan(targets, stop == ScanStop::CaughtUp).await?;
         Self::push_events_with_limit(all_events, events, max_buffered_events);
         Ok(())
     }
@@ -882,9 +882,34 @@ impl ScanCoordinator {
     /// pauses normally and a Continuous scan keeps running. Should a node error
     /// still reach this point, it is logged and the next account is monitored.
     /// A database failure is [`ScanError::Fatal`].
-    async fn run_post_scan(&self, targets: &[AccountSyncTarget]) -> Result<Vec<WalletEvent>, ScanError> {
+    ///
+    /// When `caught_up`, it first settles outputs a reorg left `SpentUnconfirmed`
+    /// (see [`Self::resolve_spent_unconfirmed`]): only then has the rescan re-read
+    /// every block that could spend them again. Not at a block limit.
+    async fn run_post_scan(
+        &self,
+        targets: &[AccountSyncTarget],
+        caught_up: bool,
+    ) -> Result<Vec<WalletEvent>, ScanError> {
         let mut wallet_events = Vec::new();
         for target in targets {
+            // This sends the hashes of outputs a reorg left SpentUnconfirmed to the
+            // node, which shows it outputs the wallet owns. Kept to those rows, and
+            // only when caught up, as the price of settling them.
+            let settled = if caught_up {
+                self.resolve_spent_unconfirmed(target, true).await
+            } else {
+                Ok(())
+            };
+            match settled {
+                Ok(()) => {},
+                Err(ScanError::Intermittent(e)) => warn!(
+                    account_id = target.account.id,
+                    error:% = e;
+                    "Base node request failed while verifying SpentUnconfirmed outputs; retrying next cycle"
+                ),
+                Err(e) => return Err(e),
+            }
             let scanned_height = target.next_block_to_scan.saturating_sub(1);
             let monitor_res = match target
                 .transaction_monitor
@@ -1203,44 +1228,8 @@ impl ScanCoordinator {
             return Ok((all_events, more_blocks));
         }
 
-        // Resolve SpentUnconfirmed outputs:
-        // 1. Mark outputs with matching inputs as Spent
-        // 2. Verify remaining outputs against the base node
         for target in &targets {
-            let unresolved = {
-                let mut conn = self.pool.get().map_err(|e| ScanError::DbError(e.into()))?;
-                let marked_spent = crate::db::resolve_spent_unconfirmed_with_inputs(&conn, target.account.id)
-                    .map_err(ScanError::DbError)?;
-                info!(
-                    account_id = target.account.id,
-                    marked_spent = marked_spent;
-                    "Resolved SpentUnconfirmed outputs with matching inputs"
-                );
-                // Before asking the node: it answers per hash, for the copy on chain now. In one transaction so an
-                // input is never left without its debit.
-                let tx = conn
-                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                    .map_err(|e| ScanError::DbError(WalletDbError::from(e)))?;
-                let superseded = crate::db::resolve_spent_unconfirmed_with_newer_copy(&tx, target.account.id)
-                    .map_err(ScanError::DbError)?;
-                tx.commit().map_err(|e| ScanError::DbError(WalletDbError::from(e)))?;
-                info!(
-                    account_id = target.account.id,
-                    marked_spent = superseded;
-                    "Resolved SpentUnconfirmed outputs re-created later on chain"
-                );
-                crate::db::get_unresolved_spent_unconfirmed_outputs(&conn, target.account.id)
-                    .map_err(ScanError::DbError)?
-            };
-
-            if !unresolved.is_empty() {
-                info!(
-                    account_id = target.account.id,
-                    count = unresolved.len();
-                    "Verifying remaining SpentUnconfirmed outputs against base node"
-                );
-                self.verify_spent_unconfirmed_outputs(target, &unresolved).await?;
-            }
+            self.resolve_spent_unconfirmed(target, false).await?;
 
             self.events
                 .send(ProcessingEvent::ScanStatus(ScanStatusEvent::FastSyncPhaseCompleted {
@@ -1488,7 +1477,7 @@ impl ScanCoordinator {
         // The end of the fast sync: settle pending transactions once, at the
         // height each account reached. Not when cancelled or out of time.
         if stop.runs_post_scan() {
-            all_events.extend(self.run_post_scan(targets).await?);
+            all_events.extend(self.run_post_scan(targets, stop == ScanStop::CaughtUp).await?);
         }
 
         Ok((all_events, stop, total_scanned))
@@ -1609,6 +1598,57 @@ impl ScanCoordinator {
         Ok((all_events, stop, total_scanned))
     }
 
+    /// Resolves the account's SpentUnconfirmed outputs (left by backfill, or by a
+    /// reorg that removed their spends):
+    /// 1. Mark outputs with matching inputs as Spent
+    /// 2. Mark older copies of a re-created output as Spent
+    /// 3. Verify remaining outputs against the base node
+    ///
+    /// With `only_unsettled_by_reorg`, steps 2 and 3 only take rows whose spend a
+    /// reorg removed, leaving an unfinished backfill's rows to the backfill.
+    async fn resolve_spent_unconfirmed(
+        &self,
+        target: &AccountSyncTarget,
+        only_unsettled_by_reorg: bool,
+    ) -> Result<(), ScanError> {
+        let unresolved = {
+            let mut conn = self.pool.get().map_err(|e| ScanError::DbError(e.into()))?;
+            let marked_spent = crate::db::resolve_spent_unconfirmed_with_inputs(&conn, target.account.id)
+                .map_err(ScanError::DbError)?;
+            info!(
+                account_id = target.account.id,
+                marked_spent = marked_spent;
+                "Resolved SpentUnconfirmed outputs with matching inputs"
+            );
+            // Before asking the node: it answers per hash, for the copy on chain now. In one transaction so an
+            // input is never left without its debit.
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| ScanError::DbError(WalletDbError::from(e)))?;
+            let superseded =
+                crate::db::resolve_spent_unconfirmed_with_newer_copy(&tx, target.account.id, only_unsettled_by_reorg)
+                    .map_err(ScanError::DbError)?;
+            tx.commit().map_err(|e| ScanError::DbError(WalletDbError::from(e)))?;
+            info!(
+                account_id = target.account.id,
+                marked_spent = superseded;
+                "Resolved SpentUnconfirmed outputs re-created later on chain"
+            );
+            crate::db::get_unresolved_spent_unconfirmed_outputs(&conn, target.account.id, only_unsettled_by_reorg)
+                .map_err(ScanError::DbError)?
+        };
+
+        if !unresolved.is_empty() {
+            info!(
+                account_id = target.account.id,
+                count = unresolved.len();
+                "Verifying remaining SpentUnconfirmed outputs against base node"
+            );
+            self.verify_spent_unconfirmed_outputs(target, &unresolved).await?;
+        }
+        Ok(())
+    }
+
     /// Verifies remaining SpentUnconfirmed outputs against the base node using
     /// the `get_utxos_deleted_info` endpoint. If `spent_in_header` is present,
     /// the output is confirmed Spent and an input record + debit balance change
@@ -1625,6 +1665,15 @@ impl ScanCoordinator {
             unresolved.iter().map(|o| (o.output_hash.clone(), o)).collect();
 
         let all_output_hashes: Vec<Vec<u8>> = unresolved.iter().map(|o| o.output_hash.clone()).collect();
+
+        // A spend above the account's scanned tip is left to the scan, which
+        // records it in the block it reads, with reorg detection.
+        let scanned_height = {
+            let conn = self.pool.get().map_err(|e| ScanError::DbError(e.into()))?;
+            crate::db::get_latest_scanned_tip_block_by_account(&conn, target.account.id)
+                .map_err(ScanError::DbError)?
+                .map_or(0, |tip| tip.height)
+        };
 
         // Phase 1: Collect all network results before touching the database
         enum VerifyAction {
@@ -1659,6 +1708,9 @@ impl ScanCoordinator {
                 }
 
                 if let Some((spent_height, spent_block_hash)) = &utxo_info.spent_in_header {
+                    if *spent_height > scanned_height {
+                        continue;
+                    }
                     actions.push(VerifyAction::ConfirmSpent {
                         output_id: output.output_id,
                         value: output.value,
@@ -3169,6 +3221,185 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("row")
+    }
+
+    /// A wallet output mined at 1400 and spent at 1450 by an earlier scan, with
+    /// that spend then removed by a reorg: the row is left `SpentUnconfirmed`.
+    fn output_unsettled_by_a_reorg(
+        pool: &SqlitePool,
+        account_id: i64,
+        output: &tari_transaction_components::transaction_components::WalletOutput,
+    ) -> i64 {
+        let mut conn = pool.get().expect("conn");
+        let view_key = KeyManager::new(WalletType::SeedWords(
+            SeedWordsWallet::construct_new(CipherSeed::random()).unwrap(),
+        ))
+        .unwrap()
+        .get_private_view_key();
+        let mut processor = BlockProcessor::new(vec![(account_id, view_key)], 3);
+        let scanned = |height: u64, outputs: Vec<_>, inputs: Vec<FixedHash>| minotari_scanning::BlockScanResult {
+            height,
+            block_hash: FixedHash::try_from(block_hash(height)).unwrap(),
+            wallet_outputs: outputs,
+            inputs,
+            mined_timestamp: 1_700_000_000,
+        };
+        processor
+            .process_block(
+                &conn,
+                &scanned(1400, vec![(output.output_hash(), output.clone(), 0)], Vec::new()),
+                account_id,
+            )
+            .expect("mined");
+        processor
+            .process_block(
+                &conn,
+                &scanned(1450, Vec::new(), vec![output.output_hash()]),
+                account_id,
+            )
+            .expect("spent");
+        let tx = conn.transaction().expect("tx");
+        crate::scan::reorg::rollback_from_height(&tx, account_id, 1450, None).expect("rollback");
+        tx.commit().expect("commit");
+        insert_scanned_tip_block(&conn, account_id, 1500, &block_hash(1500)).expect("tip");
+        conn.query_row(
+            "SELECT id FROM outputs WHERE output_hash = :hash AND status = 'SPENT_UNCONFIRMED'",
+            rusqlite::named_params! { ":hash": output.output_hash().as_slice() },
+            |row| row.get(0),
+        )
+        .expect("unsettled row")
+    }
+
+    fn spent_at(
+        output: &tari_transaction_components::transaction_components::WalletOutput,
+        height: u64,
+    ) -> GetUtxosDeletedInfoResponse {
+        GetUtxosDeletedInfoResponse {
+            utxos: vec![DeletedUtxoInfo {
+                utxo_hash: output.output_hash().to_vec(),
+                found_in_header: Some((1400, block_hash(1400))),
+                spent_in_header: Some((height, block_hash(height))),
+            }],
+            best_block_hash: block_hash(1505),
+            best_block_height: 1505,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_caught_up_scan_settles_an_output_a_reorg_left_spent_unconfirmed() {
+        let output = test_output(5_000);
+        let mut chain = MockChain::new(1505);
+        chain.deleted_info = Some(spent_at(&output, 1460));
+        let mut setup = setup_chain(1500, chain, 1_000).await;
+        let output_id = output_unsettled_by_a_reorg(&setup.pool, setup.account_id, &output);
+
+        setup
+            .coordinator
+            .run(vec![account(&setup.pool)], "password", ScanMode::Full, 0, None)
+            .await
+            .expect("scan");
+
+        assert_eq!(settlement(&setup.pool, output_id), ("SPENT".to_string(), 1));
+        assert_eq!(terminal_count(&drain(&mut setup.events)), 1);
+    }
+
+    #[tokio::test]
+    async fn a_scan_stopped_at_its_block_limit_leaves_the_output_for_later() {
+        let output = test_output(5_000);
+        let mut chain = MockChain::new(1600);
+        chain.deleted_info = Some(spent_at(&output, 1460));
+        let setup = setup_chain(1500, chain, 1_000).await;
+        let output_id = output_unsettled_by_a_reorg(&setup.pool, setup.account_id, &output);
+
+        setup
+            .coordinator
+            .run(
+                vec![account(&setup.pool)],
+                "password",
+                ScanMode::Partial { max_blocks: 10 },
+                0,
+                None,
+            )
+            .await
+            .expect("scan");
+
+        assert_eq!(count_requests(&setup.server, "/get_utxos_deleted_info").await, 0);
+        assert_eq!(settlement(&setup.pool, output_id), ("SPENT_UNCONFIRMED".to_string(), 0));
+    }
+
+    #[tokio::test]
+    async fn a_spend_the_node_reports_above_the_scanned_tip_is_left_to_the_scan() {
+        let output = test_output(5_000);
+        let mut chain = MockChain::new(1505);
+        chain.deleted_info = Some(spent_at(&output, 1600));
+        let setup = setup_chain(1500, chain, 1_000).await;
+        let output_id = output_unsettled_by_a_reorg(&setup.pool, setup.account_id, &output);
+
+        setup
+            .coordinator
+            .run(vec![account(&setup.pool)], "password", ScanMode::Full, 0, None)
+            .await
+            .expect("scan");
+
+        assert_eq!(count_requests(&setup.server, "/get_utxos_deleted_info").await, 1);
+        assert_eq!(settlement(&setup.pool, output_id), ("SPENT_UNCONFIRMED".to_string(), 0));
+    }
+
+    #[tokio::test]
+    async fn a_failed_spend_query_does_not_fail_the_scan() {
+        let output = test_output(5_000);
+        let mut setup = setup_chain(1500, MockChain::new(1505), 1_000).await;
+        let output_id = output_unsettled_by_a_reorg(&setup.pool, setup.account_id, &output);
+
+        setup
+            .coordinator
+            .run(vec![account(&setup.pool)], "password", ScanMode::Full, 0, None)
+            .await
+            .expect("the scan still completes");
+
+        let events = drain(&mut setup.events);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ProcessingEvent::ScanStatus(ScanStatusEvent::Completed { .. })))
+        );
+        assert_eq!(settlement(&setup.pool, output_id), ("SPENT_UNCONFIRMED".to_string(), 0));
+    }
+
+    #[tokio::test]
+    async fn a_caught_up_scan_leaves_an_unfinished_backfills_outputs_to_the_backfill() {
+        let output = test_output(5_000);
+        let mut chain = MockChain::new(1505);
+        chain.deleted_info = Some(spent_at(&output, 1460));
+        let setup = setup_chain(1500, chain, 1_000).await;
+        let output_id = {
+            let conn = setup.pool.get().expect("conn");
+            crate::db::insert_spent_output_if_not_exists(
+                &conn,
+                setup.account_id,
+                &tari_common_types::types::PrivateKey::default(),
+                &output.output_hash(),
+                &output,
+                1400,
+                &FixedHash::try_from(block_hash(1400)).unwrap(),
+                1_700_000_000,
+                None,
+                None,
+                FixedHash::zero(),
+                false,
+            )
+            .expect("insert")
+            .expect("new row")
+        };
+
+        setup
+            .coordinator
+            .run(vec![account(&setup.pool)], "password", ScanMode::Full, 0, None)
+            .await
+            .expect("scan");
+
+        assert_eq!(count_requests(&setup.server, "/get_utxos_deleted_info").await, 0);
+        assert_eq!(settlement(&setup.pool, output_id), ("SPENT_UNCONFIRMED".to_string(), 0));
     }
 
     #[tokio::test]

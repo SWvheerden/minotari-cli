@@ -322,6 +322,9 @@ pub fn rollback_from_height(
         );
     }
 
+    // After the sends are reset, so the inputs of one being rebroadcast stay spent.
+    db::unsettle_spent_outputs_without_input(tx, account_id)?;
+
     if let Some(config) = webhook_config {
         for (event_id, event) in generated_events {
             trigger_webhook_with_balance(tx, account_id, event_id, &event, &config)?;

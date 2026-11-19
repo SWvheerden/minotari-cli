@@ -1487,30 +1487,47 @@ pub fn resolve_spent_unconfirmed_with_inputs(conn: &Connection, account_id: i64)
 /// Marks as `Spent` the `SpentUnconfirmed` outputs that have a newer active copy of the same hash in the account,
 /// with an input and its debit. A hash is only on chain again once its earlier copy was spent; the node, asked about
 /// the hash, answers for the newer copy, so it is never asked about these. Returns the number resolved.
-pub fn resolve_spent_unconfirmed_with_newer_copy(conn: &Connection, account_id: i64) -> WalletDbResult<u64> {
+///
+/// The block it was spent in is unknown, so the input is recorded at the block of the next copy, the latest block
+/// the spend can be in: a reorg that removes that evidence removes the inferred spend too, and the rollback returns
+/// the row to `SpentUnconfirmed` (see [`unsettle_spent_outputs_without_input`]) to be settled again.
+///
+/// With `only_unsettled_by_reorg`, only rows whose spend a reorg removed (they have a soft-deleted input) are
+/// resolved; see [`get_unresolved_spent_unconfirmed_outputs`].
+pub fn resolve_spent_unconfirmed_with_newer_copy(
+    conn: &Connection,
+    account_id: i64,
+    only_unsettled_by_reorg: bool,
+) -> WalletDbResult<u64> {
     let superseded: Vec<(i64, i64, i64, Vec<u8>)> = {
         let mut stmt = conn.prepare_cached(
             r#"
-            SELECT o.id, o.value, o.mined_in_block_height, o.mined_in_block_hash
+            SELECT o.id, o.value, n.mined_in_block_height, n.mined_in_block_hash
             FROM outputs o
+            JOIN outputs n ON n.id = (
+                SELECT c.id FROM outputs c
+                WHERE c.account_id = o.account_id
+                  AND c.output_hash = o.output_hash
+                  AND c.deleted_at IS NULL
+                  AND (c.mined_in_block_height > o.mined_in_block_height
+                       OR (c.mined_in_block_height = o.mined_in_block_height AND c.id > o.id))
+                ORDER BY c.mined_in_block_height, c.id
+                LIMIT 1
+            )
             WHERE o.account_id = :account_id
               AND o.status = :spent_unconfirmed
               AND o.deleted_at IS NULL
               AND o.is_burn = 0
-              AND EXISTS (
-                  SELECT 1 FROM outputs n
-                  WHERE n.account_id = o.account_id
-                    AND n.output_hash = o.output_hash
-                    AND n.deleted_at IS NULL
-                    AND (n.mined_in_block_height > o.mined_in_block_height
-                         OR (n.mined_in_block_height = o.mined_in_block_height AND n.id > o.id))
-              )
+              AND (NOT :only_reorged OR EXISTS (
+                  SELECT 1 FROM inputs d WHERE d.output_id = o.id AND d.deleted_at IS NOT NULL
+              ))
             "#,
         )?;
         let rows = stmt.query_map(
             named_params! {
                 ":account_id": account_id,
                 ":spent_unconfirmed": OutputStatus::SpentUnconfirmed.to_string(),
+                ":only_reorged": only_unsettled_by_reorg,
             },
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
@@ -1518,9 +1535,6 @@ pub fn resolve_spent_unconfirmed_with_newer_copy(conn: &Connection, account_id: 
     };
 
     for (output_id, value, height, block_hash) in &superseded {
-        // The block it was spent in is unknown. Recording the spend at the copy's own block means only a reorg that
-        // also removes the copy can undo it: a fork between the two copies then under-reports the balance, where
-        // dating it at the newer copy's block would over-report it when the fork is above the real spend.
         let input_id = insert_input(conn, account_id, *output_id, height.cast_unsigned(), block_hash, 0)?;
         let change = BalanceChange {
             account_id,
@@ -1548,6 +1562,33 @@ pub fn resolve_spent_unconfirmed_with_newer_copy(conn: &Connection, account_id: 
     Ok(superseded.len() as u64)
 }
 
+/// After a reorg removed their spends, turns the account's surviving `SPENT` rows without an active input back into
+/// `SpentUnconfirmed`, so they are settled again instead of staying spent on evidence that is gone (such as an
+/// inferred spend, see [`resolve_spent_unconfirmed_with_newer_copy`]). The inputs of a send that can still land (reset
+/// to be rebroadcast) are left `SPENT`, as before: the scan spends them again when the send is re-mined.
+///
+/// Returns the number of rows changed.
+pub fn unsettle_spent_outputs_without_input(conn: &Connection, account_id: i64) -> WalletDbResult<u64> {
+    let live = lock_holder_is_live_sql("outputs.locked_by_request_id");
+    let changed = conn.execute(
+        &format!(
+            r#"
+            UPDATE outputs
+            SET status = :spent_unconfirmed
+            WHERE account_id = :account_id AND status = :spent AND deleted_at IS NULL
+              AND NOT EXISTS (SELECT 1 FROM inputs i WHERE i.output_id = outputs.id AND i.deleted_at IS NULL)
+              AND NOT (locked_by_request_id IS NOT NULL AND {live})
+            "#
+        ),
+        named_params! {
+            ":spent_unconfirmed": OutputStatus::SpentUnconfirmed.to_string(),
+            ":spent": OutputStatus::Spent.to_string(),
+            ":account_id": account_id,
+        },
+    )?;
+    Ok(changed as u64)
+}
+
 /// Returned data for an unresolved SpentUnconfirmed output.
 pub struct UnresolvedSpentOutput {
     pub output_id: i64,
@@ -1558,9 +1599,14 @@ pub struct UnresolvedSpentOutput {
 
 /// Returns info for remaining `SpentUnconfirmed` outputs that have no matching input.
 /// These need to be verified against the base node.
+///
+/// With `only_unsettled_by_reorg`, only rows whose spend a reorg removed (a soft-deleted input) are returned. A row a
+/// FastSync backfill stored has never had an input, so the scan's post-scan pass leaves an unfinished backfill's rows
+/// to the backfill, which reads their real spends.
 pub fn get_unresolved_spent_unconfirmed_outputs(
     conn: &Connection,
     account_id: i64,
+    only_unsettled_by_reorg: bool,
 ) -> WalletDbResult<Vec<UnresolvedSpentOutput>> {
     let spent_unconfirmed = OutputStatus::SpentUnconfirmed.to_string();
 
@@ -1572,6 +1618,9 @@ pub fn get_unresolved_spent_unconfirmed_outputs(
           AND status = :status
           AND deleted_at IS NULL
           AND is_burn = 0
+          AND (NOT :only_reorged OR EXISTS (
+              SELECT 1 FROM inputs d WHERE d.output_id = outputs.id AND d.deleted_at IS NOT NULL
+          ))
         ORDER BY mined_in_block_height, id
         "#,
     )?;
@@ -1580,6 +1629,7 @@ pub fn get_unresolved_spent_unconfirmed_outputs(
         named_params! {
             ":account_id": account_id,
             ":status": spent_unconfirmed,
+            ":only_reorged": only_unsettled_by_reorg,
         },
         |row| {
             Ok(UnresolvedSpentOutput {

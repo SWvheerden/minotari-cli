@@ -88,7 +88,8 @@ pub use outputs::{
     relock_inputs_for_revived_send, resolve_spent_unconfirmed_with_inputs, resolve_spent_unconfirmed_with_newer_copy,
     restore_change_of_rejected_send, revert_change_outputs_from_height, revert_rejected_change_output,
     soft_delete_outputs_from_height, soft_delete_unconfirmed_change_output, unlock_outputs_for_request,
-    unlock_outputs_for_request as unlock_outputs_for_pending_transaction, update_output_status,
+    unlock_outputs_for_request as unlock_outputs_for_pending_transaction, unsettle_spent_outputs_without_input,
+    update_output_status,
 };
 
 mod pending_transactions;
