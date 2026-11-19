@@ -1640,6 +1640,7 @@ impl ScanCoordinator {
         }
 
         let mut actions = Vec::new();
+        let mut answered = std::collections::HashSet::new();
 
         for output_hashes in all_output_hashes.chunks(50) {
             let response = self
@@ -1652,6 +1653,10 @@ impl ScanCoordinator {
                 let Some(output) = hash_to_output.get(&utxo_info.utxo_hash) else {
                     continue;
                 };
+                // One answer per output: a hash listed twice is settled by its first answer.
+                if !answered.insert(output.output_id) {
+                    continue;
+                }
 
                 if let Some((spent_height, spent_block_hash)) = &utxo_info.spent_in_header {
                     actions.push(VerifyAction::ConfirmSpent {
@@ -1816,11 +1821,12 @@ mod tests {
     use tari_common_types::types::FixedHash;
     use tari_script::script;
     use tari_transaction_components::MicroMinotari;
+    use tari_transaction_components::key_manager::KeyManager;
     use tari_transaction_components::key_manager::TransactionKeyManagerInterface;
     use tari_transaction_components::key_manager::wallet_types::{SeedWordsWallet, WalletType};
     use tari_transaction_components::rpc::models::{
-        BlockUtxoInfo, GetUtxosByBlockResponse, MinimalUtxoSyncInfo, SyncUtxosByBlockResponseV0,
-        SyncUtxosByBlockResponseV1,
+        BlockUtxoInfo, DeletedUtxoInfo, GetUtxosByBlockResponse, GetUtxosDeletedInfoResponse, MinimalUtxoSyncInfo,
+        SyncUtxosByBlockResponseV0, SyncUtxosByBlockResponseV1,
     };
     use tari_transaction_components::test_helpers::{TestParams, create_wallet_output_with_data};
     use tari_transaction_components::transaction_components::{
@@ -1922,6 +1928,8 @@ mod tests {
         /// The outputs and input hashes of the tip block.
         tip_utxos: Arc<std::sync::Mutex<TipUtxos>>,
         fork_tip_on_reread: Arc<AtomicBool>,
+        /// The answer to `/get_utxos_deleted_info`; the request fails without one.
+        deleted_info: Option<GetUtxosDeletedInfoResponse>,
     }
 
     type TipUtxos = (Vec<TransactionOutput>, Vec<Vec<u8>>);
@@ -1951,6 +1959,7 @@ mod tests {
                 forks: AtomicU64::new(0),
                 tip_utxos: Arc::default(),
                 fork_tip_on_reread: Arc::default(),
+                deleted_info: None,
             }
         }
 
@@ -2061,6 +2070,10 @@ mod tests {
                     ResponseTemplate::new(200)
                         .set_body_json(response)
                         .set_delay(self.download_delay)
+                },
+                "/get_utxos_deleted_info" => match &self.deleted_info {
+                    Some(info) => ResponseTemplate::new(200).set_body_json(info),
+                    None => ResponseTemplate::new(500),
                 },
                 "/get_utxos_by_block" => {
                     let height = height_of(&query_param(request, "header_hash"));
@@ -3126,6 +3139,86 @@ mod tests {
             .map(|t| t.hash)
             .collect();
         assert_eq!(tips, vec![forked_block_hash(1505)]);
+    }
+
+    /// A wallet output, not keyed to any account in the test database.
+    fn test_output(value: u64) -> tari_transaction_components::transaction_components::WalletOutput {
+        let key_manager = KeyManager::new(WalletType::SeedWords(
+            SeedWordsWallet::construct_new(CipherSeed::random()).unwrap(),
+        ))
+        .unwrap();
+        create_wallet_output_with_data(
+            script!(Nop).unwrap(),
+            OutputFeatures::default(),
+            &TestParams::new(&key_manager),
+            MicroMinotari(value),
+            &key_manager,
+        )
+        .expect("wallet output")
+    }
+
+    /// `(status, active debits)` of output row `output_id`.
+    fn settlement(pool: &SqlitePool, output_id: i64) -> (String, i64) {
+        let conn = pool.get().expect("conn");
+        conn.query_row(
+            "SELECT o.status, (SELECT COUNT(*) FROM balance_changes bc JOIN inputs i ON bc.caused_by_input_id = i.id
+                               WHERE i.output_id = o.id AND bc.balance_debit > 0
+                                 AND NOT bc.is_reversal AND NOT bc.is_reversed)
+             FROM outputs o WHERE o.id = :id",
+            rusqlite::named_params! { ":id": output_id },
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("row")
+    }
+
+    #[tokio::test]
+    async fn an_output_the_node_answers_for_twice_is_settled_by_the_first_answer() {
+        let output = test_output(5_000);
+        let mut chain = MockChain::new(1505);
+        chain.deleted_info = Some(GetUtxosDeletedInfoResponse {
+            utxos: vec![
+                DeletedUtxoInfo {
+                    utxo_hash: output.output_hash().to_vec(),
+                    found_in_header: Some((1455, block_hash(1455))),
+                    spent_in_header: Some((1458, block_hash(1458))),
+                },
+                DeletedUtxoInfo {
+                    utxo_hash: output.output_hash().to_vec(),
+                    found_in_header: Some((1455, block_hash(1455))),
+                    spent_in_header: None,
+                },
+            ],
+            best_block_hash: block_hash(1505),
+            best_block_height: 1505,
+        });
+        let setup = setup_chain(1500, chain, 1_000).await;
+        let output_id = {
+            let conn = setup.pool.get().expect("conn");
+            crate::db::insert_spent_output_if_not_exists(
+                &conn,
+                setup.account_id,
+                &tari_common_types::types::PrivateKey::default(),
+                &output.output_hash(),
+                &output,
+                1455,
+                &FixedHash::try_from(block_hash(1455)).unwrap(),
+                1_700_000_000,
+                None,
+                None,
+                FixedHash::zero(),
+                false,
+            )
+            .expect("insert")
+            .expect("new row")
+        };
+
+        setup
+            .coordinator
+            .run_backfill(vec![account(&setup.pool)], "password", 1460, 0, None)
+            .await
+            .expect("backfill");
+
+        assert_eq!(settlement(&setup.pool, output_id), ("SPENT".to_string(), 1));
     }
 
     #[tokio::test]
